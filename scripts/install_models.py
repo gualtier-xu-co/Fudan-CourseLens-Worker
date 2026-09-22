@@ -17,9 +17,10 @@ MODELS = {
         "archive": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2",
         "sha256": "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e",
     },
-    "firered": {
-        "archive": "sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25.tar.bz2",
-        "sha256": "1da8b737ecc5e29f36759a4460c754863e7c919a4ba325aea187331fbfc83274",
+    # M4 Paraformer（ASRBENCH-1 A5 立项，M4-ENABLE-1 U1 实测钉，234 MB tar.bz2）。
+    "paraformer": {
+        "archive": "sherpa-onnx-paraformer-zh-2023-09-14.tar.bz2",
+        "sha256": "9c49fd9c6fb63de8e18c1054cf3d100f804741b7e608e187923cd8ff09fa9f03",
     },
 }
 BASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
@@ -30,7 +31,11 @@ def _model_directories(root: Path, name: str) -> list[Path]:
         path for path in root.iterdir()
         if path.is_dir() and (path / "tokens.txt").is_file()
     ] if root.is_dir() else []
-    marker = "fire-red" if name == "firered" else "sense-voice"
+    markers = {
+        "sensevoice": "sense-voice",
+        "paraformer": "paraformer",
+    }
+    marker = markers[name]
     return sorted(path for path in candidates if marker in path.name)
 
 
@@ -95,11 +100,16 @@ def _install(name: str, spec: dict[str, str], root: Path) -> Path:
 
 def main() -> None:
     root = Path(os.environ.get("COURSELENS_MODEL_ROOT", ".models")).resolve()
-    installed = {name: _install(name, spec, root) for name, spec in MODELS.items()}
+    # 空 sha256 = 条目尚未实测钉，整条跳过。
+    installed = {
+        name: _install(name, spec, root)
+        for name, spec in MODELS.items()
+        if spec["sha256"]
+    }
     environment = Path(os.environ.get("GITHUB_ENV", root / "models.env"))
     with environment.open("a", encoding="utf-8") as output:
-        output.write(f"SENSEVOICE_MODEL_DIR={installed['sensevoice']}\n")
-        output.write(f"FIRERED_MODEL_DIR={installed['firered']}\n")
+        for name, directory in installed.items():
+            output.write(f"{name.upper()}_MODEL_DIR={directory}\n")
 
 
 if __name__ == "__main__":

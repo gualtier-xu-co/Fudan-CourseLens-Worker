@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import sys
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 with patch.dict(sys.modules, {"numpy": Mock(), "sherpa_onnx": Mock()}):
@@ -41,7 +42,6 @@ class ASRProxyLifecycleTests(unittest.TestCase):
                     },
                 },
                 sensevoice_dir=Mock(),
-                firered_dir=Mock(),
                 proofread=None,
                 progress=progress,
             )
@@ -105,7 +105,6 @@ class ASREvidenceIdentityTests(unittest.TestCase):
             return asr.transcribe(
                 {"payload": payload},
                 sensevoice_dir=Mock(),
-                firered_dir=Mock(),
                 proofread=proofread_fn,
                 progress=Mock(),
                 checkpoint=capture,
@@ -120,7 +119,7 @@ class ASREvidenceIdentityTests(unittest.TestCase):
             self.assertRegex(segment["segment_id"], r"^seg:[0-9a-f]{12}$")
             self.assertRegex(segment["source_hash"], r"^[0-9a-f]{64}$")
             self.assertEqual(segment["provenance"]["producer"], asr.PRODUCER_ID)
-            self.assertEqual(segment["provenance"]["model"], "firered")
+            self.assertEqual(segment["provenance"]["model"], "paraformer")
             self.assertRegex(segment["provenance"]["config_hash"], r"^[0-9a-f]{12,64}$")
         # 每个 chunk 的检查点都携带可续跑的非秘密指纹状态
         self.assertEqual(len(checkpoints), 3)
@@ -147,6 +146,19 @@ class ASREvidenceIdentityTests(unittest.TestCase):
             resumed["segments"][0]["source_hash"],
         )
 
+    def test_checkpoint_without_current_chain_raw_fails_explicitly(self):
+        # M4-ENABLE-1 U4：缺当前链精修 raw 的检查点（如退役链产物）续跑必须
+        # 显式失败——静默混链会丢前段输出。
+        pool = self._pool()
+        prior = {
+            "completed_chunks": 1,
+            "total_chunks": 3,
+            "mode": "automatic",
+            "raw_sensevoice": [{"start_ms": 0, "end_ms": 1000, "text": "legacy@0"}],
+        }
+        with self.assertRaises(asr.ASRError):
+            self._run(pool, prior=prior, proofread=None)
+
     def test_legacy_checkpoint_omits_unverifiable_provenance(self):
         pool = self._pool()
         checkpoints = []
@@ -155,7 +167,7 @@ class ASREvidenceIdentityTests(unittest.TestCase):
             "total_chunks": 3,
             "mode": "automatic",
             "raw_sensevoice": [{"start_ms": 0, "end_ms": 1000, "text": "legacy@0"}],
-            "raw_firered": [{"start_ms": 0, "end_ms": 1000, "text": "legacy-fire@0"}],
+            "raw_paraformer": [{"start_ms": 0, "end_ms": 1000, "text": "legacy-fire@0"}],
         }
         result = self._run(pool, prior=prior, capture=checkpoints.append, proofread=None)
         self.assertEqual(len(result["segments"]), 3)
@@ -173,17 +185,233 @@ class ASREvidenceIdentityTests(unittest.TestCase):
         self.assertEqual(result["segments"][0]["text"], "校对后")
         self.assertEqual(
             result["segments"][0]["provenance"]["model"],
-            "sensevoice+firered:proofread",
+            "sensevoice+paraformer:proofread",
         )
         self.assertEqual(result["raw_sensevoice"][0]["provenance"]["model"], "sensevoice")
-        self.assertEqual(result["raw_firered"][0]["provenance"]["model"], "firered")
+        self.assertEqual(result["raw_paraformer"][0]["provenance"]["model"], "paraformer")
         # 校对后的文本是独立证据：final ID 不与 raw ID 共享
         final_id = result["segments"][0]["segment_id"]
         raw_ids = {
             result["raw_sensevoice"][0]["segment_id"],
-            result["raw_firered"][0]["segment_id"],
+            result["raw_paraformer"][0]["segment_id"],
         }
         self.assertNotIn(final_id, raw_ids)
+
+
+class ASRMediaRetryTests(unittest.TestCase):
+    """第二十案：秒败族媒体获取先重取会话材料再重试当前块，界内不整单失败。"""
+
+    FORMAT_REJECTED = "authorized media format was rejected by ffmpeg"
+
+    def _pool(self):
+        pool = Mock()
+        pool.transcribe_pcm.side_effect = lambda _path, backend, *, offset_seconds: [{
+            "start_ms": int(offset_seconds * 1000),
+            "end_ms": int(offset_seconds * 1000) + 1000,
+            "text": backend,
+        }]
+        return pool
+
+    @contextmanager
+    def _media(self, decode_side_effect):
+        pool = self._pool()
+        with (
+            patch.object(asr, "RecognizerPool", return_value=pool),
+            patch.object(asr, "pinned_media_proxy") as media_proxy,
+            patch.object(asr, "_decode_chunk_from_url", side_effect=decode_side_effect) as decode,
+            patch.object(asr.time, "sleep") as sleep,
+        ):
+            proxy = media_proxy.return_value.__enter__.return_value
+            proxy.url = "http://127.0.0.1/session"
+
+            def invoke():
+                return asr.transcribe(
+                    {
+                        "payload": {
+                            "mode": "automatic",
+                            "media": {
+                                "url": "https://media.example.com/lecture.mp4",
+                                "duration_seconds": 1250,
+                            },
+                        },
+                    },
+                    sensevoice_dir=Mock(),
+                    proofread=None,
+                    progress=Mock(),
+                )
+
+            yield invoke, proxy, decode, sleep
+
+    def test_fast_fail_family_recovers_after_bounded_refresh(self):
+        # 块0 连续两败（0 字节/秒败签名），每次先刷新会话材料再重试同块
+        outcome = [
+            asr.ASRError(self.FORMAT_REJECTED),
+            asr.ASRError(self.FORMAT_REJECTED),
+        ]
+
+        def decode(_url, target, *, offset, duration):
+            if outcome:
+                raise outcome.pop(0)
+            target.write_bytes(b"pcm")
+
+        with self._media(decode) as (invoke, proxy, decode_mock, sleep):
+            result = invoke()
+        # 3 块全部完成；块0 额外解码 2 次
+        self.assertEqual(decode_mock.call_count, 5)
+        # 刷新 = 2 次重试 + 块间轮换 2 次
+        self.assertEqual(proxy.refresh_source.call_count, 4)
+        self.assertEqual(
+            [item.args[0] for item in sleep.call_args_list],
+            [2.0, 5.0],
+        )
+        self.assertEqual(result["metrics"]["chunks"], 3)
+
+    def test_retry_budget_exhaustion_keeps_closed_set_reason(self):
+        def decode(_url, target, *, offset, duration):
+            raise asr.ASRError(self.FORMAT_REJECTED)
+
+        with self._media(decode) as (invoke, proxy, decode_mock, sleep):
+            with self.assertRaises(asr.ASRError) as caught:
+                invoke()
+        # 穷尽后如实透传最后一个闭集原因，不改写码面
+        self.assertEqual(str(caught.exception), self.FORMAT_REJECTED)
+        self.assertEqual(decode_mock.call_count, 3)
+        self.assertEqual(proxy.refresh_source.call_count, 2)
+        self.assertEqual(
+            [item.args[0] for item in sleep.call_args_list],
+            [2.0, 5.0],
+        )
+
+    def test_deterministic_rejection_skips_retry_family(self):
+        deterministic = "authorized media is missing a readable MP4 index"
+
+        def decode(_url, target, *, offset, duration):
+            raise asr.ASRError(deterministic)
+
+        with self._media(decode) as (invoke, proxy, decode_mock, sleep):
+            with self.assertRaises(asr.ASRError) as caught:
+                invoke()
+        self.assertEqual(str(caught.exception), deterministic)
+        self.assertEqual(decode_mock.call_count, 1)
+        self.assertEqual(proxy.refresh_source.call_count, 0)
+        self.assertEqual(sleep.call_count, 0)
+
+
+class ProofreadDegradationTests(unittest.TestCase):
+    """G7（ASRBENCH P1）：AI 校对失败降级交付原始识别，不整单带崩。"""
+
+    def test_proofread_failure_degrades_to_raw_segments_with_warning(self):
+        pool = Mock()
+        pool.transcribe_pcm.side_effect = lambda _path, backend, *, offset_seconds: [{
+            "start_ms": int(offset_seconds * 1000),
+            "end_ms": int(offset_seconds * 1000) + 1000,
+            "text": backend,
+        }]
+        # 注意：用 asr.LLMError 保证与生产 except 引用同一类对象
+        # （双路径导入下 courselens_worker.llm 可能存在两个模块实例）。
+        flaky = Mock(side_effect=asr.LLMError("boom"))
+
+        def create_pcm(_url, target, *, offset, duration):
+            target.write_bytes(b"pcm")
+
+        with (
+            patch.object(asr, "RecognizerPool", return_value=pool),
+            patch.object(asr, "pinned_media_proxy"),
+            patch.object(asr, "_decode_chunk_from_url", side_effect=create_pcm),
+        ):
+            result = asr.transcribe(
+                {
+                    "payload": {
+                        "mode": "automatic",
+                        "media": {
+                            "url": "https://media.example.com/lecture.mp4",
+                            "duration_seconds": 1250,
+                        },
+                    },
+                },
+                sensevoice_dir=Mock(),
+                proofread=flaky,
+                progress=Mock(),
+            )
+        self.assertEqual(result["warnings"], ["proofread_degraded"])
+        # 交付的是原始精修识别结果（三条 chunk 段），不是空手而归
+        self.assertEqual(len(result["segments"]), 3)
+        self.assertNotIn(":proofread", str(result))
+
+    def test_proofread_success_has_no_warning(self):
+        pool = Mock()
+        pool.transcribe_pcm.side_effect = lambda _path, backend, *, offset_seconds: [{
+            "start_ms": int(offset_seconds * 1000),
+            "end_ms": int(offset_seconds * 1000) + 1000,
+            "text": backend,
+        }]
+        good = Mock(return_value=[{
+            "start_ms": 0, "end_ms": 1000, "text": "校对后",
+        }])
+
+        def create_pcm(_url, target, *, offset, duration):
+            target.write_bytes(b"pcm")
+
+        with (
+            patch.object(asr, "RecognizerPool", return_value=pool),
+            patch.object(asr, "pinned_media_proxy"),
+            patch.object(asr, "_decode_chunk_from_url", side_effect=create_pcm),
+        ):
+            result = asr.transcribe(
+                {
+                    "payload": {
+                        "mode": "automatic",
+                        "media": {
+                            "url": "https://media.example.com/lecture.mp4",
+                            "duration_seconds": 1250,
+                        },
+                    },
+                },
+                sensevoice_dir=Mock(),
+                proofread=good,
+                progress=Mock(),
+            )
+        self.assertNotIn("warnings", result)
+
+
+class DurationProbeRetryTests(unittest.TestCase):
+    """A5 邻接扫：时长探测与分块同族——秒败先重取会话材料再试一次。"""
+
+    def test_probe_recovers_after_one_refresh_retry(self):
+        calls = []
+
+        def fake_run(source, command, *, timeout, capture_stdout):
+            calls.append(dict(source))
+            if len(calls) == 1:
+                return 1, b"", b"err"
+            return 0, b"1250.5", b""
+
+        with patch.object(asr, "_run_media_proxy", side_effect=fake_run):
+            self.assertEqual(asr._probe_duration({"url": "https://media.example.com/l.mp4"}), 1250.5)
+        self.assertEqual(len(calls), 2)
+
+    def test_probe_fails_closed_after_bounded_budget(self):
+        with patch.object(asr, "_run_media_proxy", return_value=(1, b"", b"e")):
+            with self.assertRaises(asr.ASRError) as caught:
+                asr._probe_duration({"url": "https://media.example.com/l.mp4"})
+        self.assertEqual(
+            str(caught.exception),
+            "authorized media duration could not be determined",
+        )
+
+    def test_probe_timeout_fails_fast_without_second_attempt(self):
+        import subprocess
+
+        def fake_run(source, command, *, timeout, capture_stdout):
+            raise subprocess.TimeoutExpired(cmd="ffprobe", timeout=120)
+
+        with patch.object(asr, "_run_media_proxy", side_effect=fake_run):
+            with self.assertRaises(asr.ASRError) as caught:
+                asr._probe_duration({"url": "https://media.example.com/l.mp4"})
+        self.assertEqual(
+            str(caught.exception),
+            "authorized media duration probe timed out",
+        )
 
 
 if __name__ == "__main__":

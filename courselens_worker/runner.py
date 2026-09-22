@@ -75,7 +75,7 @@ _SUBTITLE_RESUME_KEYS = (
     "total_chunks",
     "mode",
     "raw_sensevoice",
-    "raw_firered",
+    "raw_paraformer",
     "pcm_fingerprint",
     "proofread_pairing",
     "proofread_completed_windows",
@@ -257,12 +257,12 @@ def _process_materialized_job(
         value = transcribe(
             job,
             sensevoice_dir=Path(_required("SENSEVOICE_MODEL_DIR")),
-            firered_dir=Path(_required("FIRERED_MODEL_DIR")),
+            paraformer_dir=Path(_required("PARAFORMER_MODEL_DIR")),
             proofread=(
-                (lambda sense, fire, prior, write: proofread_segments(
+                (lambda rough, refined, prior, write: proofread_segments(
                     api_key,
-                    sense,
-                    fire,
+                    rough,
+                    refined,
                     prior_checkpoint=prior,
                     checkpoint=write,
                 )) if api_key else None
@@ -276,8 +276,9 @@ def _process_materialized_job(
                 "segments": value["segments"],
                 "srt": to_srt(value["segments"]),
                 "vtt": to_vtt(value["segments"]),
-                "raw_sensevoice": value["raw_sensevoice"],
-                "raw_firered": value["raw_firered"],
+                # raw 段键随 SUBTITLE_BACKENDS 序列泛化（raw_<backend>），
+                # 默认链仍是 raw_sensevoice + raw_paraformer，客户端合同不变。
+                **{key: value[key] for key in value if key.startswith("raw_")},
             }
         }
         metrics = value["metrics"]
@@ -384,14 +385,14 @@ def _process_materialized_job(
                 if checkpoint_writer is not None:
                     checkpoint_writer({**ocr_fields, **value})
 
-            def proofread_with_slides(sense, fire, saved, write):
+            def proofread_with_slides(rough, refined, saved, write):
                 def write_with_ocr(proofread_value: dict[str, Any]) -> None:
                     write({**ocr_fields, **proofread_value})
 
                 return proofread_segments(
                     api_key,
-                    sense,
-                    fire,
+                    rough,
+                    refined,
                     ppt_pages=pages if wants_slides else None,
                     prior_checkpoint=saved,
                     checkpoint=write_with_ocr,
@@ -401,19 +402,23 @@ def _process_materialized_job(
             value = transcribe(
                 job,
                 sensevoice_dir=Path(_required("SENSEVOICE_MODEL_DIR")),
-                firered_dir=Path(_required("FIRERED_MODEL_DIR")),
+                paraformer_dir=Path(_required("PARAFORMER_MODEL_DIR")),
                 proofread=proofread_with_slides if api_key else None,
                 progress=progress,
                 checkpoint=subtitle_checkpoint,
             )
+            # G7：ASR 段产出的闭集警告（如 proofread_degraded）并入结果警告，
+            # 随既有 result_notices 通道上屏，绝不静默丢弃。
+            for _warning in value.get("warnings") or []:
+                if _warning not in warnings:
+                    warnings.append(_warning)
             transcript = value["segments"]
             outputs["subtitle"] = {
                 "mode": value["mode"],
                 "segments": transcript,
                 "srt": to_srt(transcript),
                 "vtt": to_vtt(transcript),
-                "raw_sensevoice": value["raw_sensevoice"],
-                "raw_firered": value["raw_firered"],
+                **{key: value[key] for key in value if key.startswith("raw_")},
             }
             metrics["subtitle"] = value["metrics"]
         if "answer" in requested:
