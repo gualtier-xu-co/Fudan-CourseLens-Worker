@@ -29,7 +29,8 @@ class ASRDiagnosticsTests(unittest.TestCase):
         self.assertEqual(safe_worker_error_detail(error), "media_http_403")
 
     def test_media_response_failures_are_reduced_to_closed_reason_codes(self):
-        from courselens_worker import asr  # 夜10-C：conftest 装桩，见 conftest.py
+        with patch.dict(sys.modules, {"numpy": Mock(), "sherpa_onnx": Mock()}):
+            from courselens_worker import asr
         cases = (
             (MediaResponseProfile("http_2xx", "content_html", "magic_html"), "media_content_html"),
             (MediaResponseProfile("http_2xx", "content_json", "magic_json"), "media_content_json"),
@@ -43,7 +44,8 @@ class ASRDiagnosticsTests(unittest.TestCase):
                 self.assertEqual(safe_worker_error_detail(error), expected)
 
     def test_slice_decode_uses_loopback_range_input_and_fast_seek(self):
-        from courselens_worker import asr  # 夜10-C：conftest 装桩，见 conftest.py
+        with patch.dict(sys.modules, {"numpy": Mock(), "sherpa_onnx": Mock()}):
+            from courselens_worker import asr
         command = asr._ffmpeg_proxy_command(
             Path("slice.f32le"),
             "http://127.0.0.1:4321/random",

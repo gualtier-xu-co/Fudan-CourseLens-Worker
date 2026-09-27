@@ -7,7 +7,6 @@ import unittest
 from unittest.mock import patch
 
 from courselens_worker.lecture_ir import build_lecture_ir
-from courselens_worker import llm as courselens_llm
 from courselens_worker.runner import _process_materialized_job
 from shared.evidence_contract import (
     CONTRACT_ID,
@@ -348,20 +347,6 @@ class RunnerSeamTests(unittest.TestCase):
         with patch("courselens_worker.ocr.process_slides", side_effect=fake_slides), \
                 patch("courselens_worker.llm.create_summary", side_effect=fake_summary):
             return _process_materialized_job(job), pages
-
-    def test_summary_llm_failure_returns_llm_pending_receipt(self):
-        """夜10-C 第七波②：远端 LLM 段闭集失败 → llm_pending 回执（非 LLM
-        产物随回执交还客户端领回），不再整单失败。"""
-        job = summary_job(kind="summary", transcript=[identified_segment(0, 60_000, "讲解")])
-        with patch("courselens_worker.ocr.process_slides", side_effect=lambda slides, **kw: ([], {})),                 patch("courselens_worker.llm.create_summary",
-                      side_effect=courselens_llm.LLMError("AI request failed: ConnectionError")):
-            result = _process_materialized_job(job)
-        self.assertEqual(result["status"], "llm_pending")
-        pending = result["outputs"]["llm_pending"]
-        self.assertEqual(pending["title"], "测试课程")
-        self.assertEqual(pending["transcript"], [identified_segment(0, 60_000, "讲解")])
-        self.assertEqual(pending["reason_code"], "llm_remote_failed")
-        self.assertIn("llm_pending_remote_failed", result["warnings"])
 
     def test_summary_job_attaches_the_additive_view(self):
         transcript = [identified_segment(0, 60_000, "讲解")]

@@ -289,7 +289,7 @@ def _process_materialized_job(
     elif kind in {"summary", "chapters"}:
         from .course_knowledge import normalize_evidence_packet
         from .lecture_ir import build_lecture_ir
-        from .llm import LLMError, create_summary
+        from .llm import create_summary
         from .ocr import process_slides
 
         payload = dict(job.get("payload") or {})
@@ -331,51 +331,15 @@ def _process_materialized_job(
             summary_args["evidence_packet"] = packet
         if payload.get("course_context") is not None:
             summary_args["course_context"] = payload.get("course_context")
-        try:
-            summary = create_summary(
-                str(dict(job.get("secrets") or {}).get("deepseek_api_key") or ""),
-                title=str(payload.get("title") or ""),
-                transcript=transcript,
-                ppt_pages=pages,
-                prior_checkpoint=prior,
-                checkpoint=summary_checkpoint,
-                **summary_args,
-            )
-        except LLMError:
-            # 夜10-C 第七波②：远端 LLM 段降级——runner 出口对 DeepSeek 不可达
-            # 等闭集失败不再整单失败，改回 llm_pending 回执；客户端凭本地可达
-            # 的 key 领回执行同一总结链后按同一导入面落库（UI/消耗计数一致）。
-            warnings.append("llm_pending_remote_failed")
-            print(f"task={job['task_id']} stage=summary-llm-pending", flush=True)
-            return {
-                "schema": RESULT_SCHEMA,
-                "protocol_version": PROTOCOL_VERSION,
-                "task_id": job["task_id"],
-                "job_kind": kind,
-                "input_hash": job["input_hash"],
-                "pipeline_fingerprint": (
-                    PROCESS_CANARY_PIPELINE if kind == "process_canary"
-                    else str(dict(job.get("pipeline") or {}).get("version") or "v2")
-                ),
-                "status": "llm_pending",
-                "outputs": {"llm_pending": {
-                    "title": str(payload.get("title") or ""),
-                    "transcript": transcript,
-                    "ppt_pages": pages,
-                    "evidence_packet": packet,
-                    "course_context": (
-                        payload.get("course_context")
-                        if isinstance(payload.get("course_context"), dict) else None
-                    ),
-                    "reason_code": "llm_remote_failed",
-                }},
-                "metrics": {
-                    "elapsed_seconds": round(time.monotonic() - started, 3),
-                    "transcript_segments": len(transcript),
-                    "ppt_pages": len(pages),
-                },
-                "warnings": warnings,
-            }
+        summary = create_summary(
+            str(dict(job.get("secrets") or {}).get("deepseek_api_key") or ""),
+            title=str(payload.get("title") or ""),
+            transcript=transcript,
+            ppt_pages=pages,
+            prior_checkpoint=prior,
+            checkpoint=summary_checkpoint,
+            **summary_args,
+        )
         outputs = {"ppt_pages": pages}
         if kind == "chapters":
             outputs["chapters"] = list(summary.get("chapters") or [])

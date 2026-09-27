@@ -45,13 +45,6 @@ def usage_snapshot() -> dict[str, int]:
         return dict(_USAGE)
 
 
-def _emit_telemetry(line: str) -> None:
-    # runner._progress discipline (same rule as asr.py): counters, seconds,
-    # and closed-set stage identifiers only — never prompts, responses,
-    # subtitles text, URLs, paths, or account values.
-    print(line, flush=True)
-
-
 def _chat(api_key: str, messages: list[dict[str, str]], *, max_tokens: int = 8192) -> str:
     if not api_key:
         raise LLMError("the encrypted job does not contain an AI API key")
@@ -376,7 +369,6 @@ def proofread_segments(
         if trusted
         else 0
     )
-    proofread_window_retries = 0
 
     def pairs_for(window_index: int) -> list[dict[str, Any]]:
         chunk: list[dict[str, Any]] = []
@@ -405,7 +397,6 @@ def proofread_segments(
         return chunk
 
     def request_window(chunk: list[dict[str, Any]]) -> Any:
-        nonlocal proofread_window_retries
         messages = [
             {"role": "system", "content": _PROOFREAD_INSTRUCTIONS},
             {"role": "user", "content": json.dumps(
@@ -418,12 +409,6 @@ def proofread_segments(
             except LLMError as exc:
                 last_error = exc
                 if attempt + 1 < _PROOFREAD_WINDOW_ATTEMPTS:
-                    # 夜10-C 可观测性：窗口级重试计数遥测（计数与闭集词，
-                    # 零提示词/响应文本——runner._progress 纪律同 asr.py）。
-                    proofread_window_retries += 1
-                    _emit_telemetry(
-                        f"stage=proofread-window-retry attempt={attempt + 1}"
-                    )
                     time.sleep(_PROOFREAD_WINDOW_RETRY_BACKOFF_SECONDS)
         raise last_error if last_error is not None else LLMError(
             "proofreading window request failed"
@@ -445,22 +430,7 @@ def proofread_segments(
                     "proofread_total_windows": total_windows,
                     "proofread_segments": normalize_segments(output),
                 })
-    result = apply_glossary(normalize_segments(output), glossary)  # N5A-P3 一行挂点
-    # 夜10-C 可观测性：校对链收口遥测（窗口数/重试数/闭集纠错态分布——
-    # 全部为计数与闭集词，零提示词、零响应文本、零字幕内容）。
-    correction_distribution: dict[str, int] = {}
-    for segment in result:
-        status = str(segment.get("correction") or "none")
-        correction_distribution[status] = correction_distribution.get(status, 0) + 1
-    distribution_text = " ".join(
-        f"{key}={value}" for key, value in sorted(correction_distribution.items())
-    ) or "none=0"
-    _emit_telemetry(
-        f"stage=proofread windows={total_windows}/{total_windows} "
-        f"resumed={completed} window_retries={proofread_window_retries} "
-        f"segments={len(result)} {distribution_text}"
-    )
-    return result
+    return apply_glossary(normalize_segments(output), glossary)  # N5A-P3 一行挂点
 
 
 _SUMMARY_MERGE_PROMPT = (
@@ -661,15 +631,6 @@ def create_summary(
     )
     topics = validate_topic_candidates(
         value.get("topic_candidates") if packet is not None else None
-    )
-    # 夜10-C 可观测性：摘要链收口遥测（与校对链同纪律：计数与闭集词，
-    # 零提示词、零响应文本、零字幕/笔记内容）。
-    _emit_telemetry(
-        f"stage=summary windows={len(sources)}/{len(sources)} "
-        f"resumed={completed} evidence_windows={len(evidence_windows)} "
-        f"events={len(events)} events_rejected={rejected} "
-        f"takeaways={len(takeaways)} knowledge_points={len(knowledge_points)} "
-        f"citations_rejected={int(point_meta.get('rejected') or 0)}"
     )
     return {
         "model": MODEL,
