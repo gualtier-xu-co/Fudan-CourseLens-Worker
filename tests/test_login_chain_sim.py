@@ -156,6 +156,68 @@ class LoginChainSimTests(unittest.TestCase):
             STATS["webvpn_entries"], 2, "首进入验证败 + 清态后全新一次"
         )
 
+    def test_challenge_at_course_raises_independent_code_without_retry(self):
+        """夜10-C 挑战页变体：webvpn 腿成功后课程入口撞人机确认墙 → 独立码 +
+        零重试（梯内 attempts=3 也只进入一次）；与 webvpn 腿 B3 同语义。"""
+        set_mode("challenge_at_course")
+        with self._endpoints():
+            connector = PlatformSession(transport="requests")
+            with self.assertRaises(PlatformSessionError) as captured:
+                connector._login_webvpn_full("account", "password", attempts=3)
+        self.assertEqual(str(captured.exception), "platform_challenge_required")
+        self.assertEqual(captured.exception.connection_stage, "course_context")
+        self.assertNotIn("platform_challenge_required", ps._RETRYABLE_LOGIN_ERRORS)
+        self.assertNotIn(
+            "platform_challenge_required", PlatformSession._RETRYABLE_WEBVPN_LEG_ERRORS
+        )
+        self.assertEqual(STATS["course_entries"], 1, "课程腿挑战页零重试")
+        self.assertEqual(STATS["webvpn_entries"], 1, "挑战页不触发任何全链重跑")
+
+    def test_direct_course_challenge_falls_back_to_webvpn_route(self):
+        """夜10-C 补令②b 语义落定：直连腿撞课程入口挑战页 → 独立码驱动
+        路线回落（换路线，非重试同一堵墙）→ webvpn 全梯接手；webvpn 路线
+        的课程入口同撞挑战墙 → 仍按挑战码零重试诚实直败（B3 语义不变）。"""
+        set_mode("challenge_at_course")
+        with self._endpoints():
+            connector = PlatformSession(transport="requests")
+            with self.assertRaises(PlatformSessionError) as captured:
+                connector.login("account", "password")
+        self.assertEqual(str(captured.exception), "platform_challenge_required")
+        self.assertEqual(captured.exception.connection_stage, "course_context")
+        self.assertEqual(STATS["course_entries"], 2, "直连腿+webvpn 腿各撞一次墙")
+        self.assertEqual(STATS["webvpn_entries"], 1, "挑战页驱动了路线回落")
+        self.assertNotIn(
+            "platform_challenge_required", ps._RETRYABLE_LOGIN_ERRORS,
+            "挑战码依旧不入任何重试闭集（同一面墙零重试）",
+        )
+        self.assertNotIn(
+            "platform_challenge_required", PlatformSession._RETRYABLE_WEBVPN_LEG_ERRORS
+        )
+
+    def test_midflow_course_expiry_recovers_via_full_relogin_ladder(self):
+        """夜10-C 半途过期：课程会话过期落在普通登录页（无 lck）→ 维持既有
+        可重试码 → 外层梯全链重跑（webvpn+course 全新票据，绝不重放）后恢复。"""
+        set_mode("expire_then_delivered")
+        codes = []
+        connector = None
+        with self._endpoints():
+            for attempt in range(_MATERIALIZE_LOGIN_ATTEMPTS):
+                connector = PlatformSession(transport="requests")
+                try:
+                    connector._login_webvpn_full("account", "password", attempts=1)
+                    break
+                except PlatformSessionError as exc:
+                    codes.append(str(exc))
+                    if (
+                        str(exc) not in ps._RETRYABLE_LOGIN_ERRORS
+                        or attempt == _MATERIALIZE_LOGIN_ATTEMPTS - 1
+                    ):
+                        raise
+        self.assertEqual(codes, ["platform_course_context_missing"])
+        self.assertTrue(connector._webvpn_ready)
+        self.assertEqual(STATS["course_entries"], 2, "首跑过期 + 重跑各进入一次")
+        self.assertEqual(STATS["webvpn_entries"], 2, "重跑含全新 webvpn 腿（零重放）")
+
 
 if __name__ == "__main__":
     unittest.main()
