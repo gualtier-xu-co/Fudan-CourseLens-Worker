@@ -17,8 +17,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-with patch.dict(sys.modules, {"sherpa_onnx": Mock()}):
-    from courselens_worker import asr
+from courselens_worker import asr
 
 _WORKER_ROOT = Path(__file__).resolve().parents[1]
 _INSTALL_MODELS_SPEC = importlib.util.spec_from_file_location(
@@ -227,7 +226,9 @@ class ParaformerChainTranscribeTests(unittest.TestCase):
         with (
             patch.object(asr, "RecognizerPool", return_value=pool),
             patch.object(asr, "pinned_media_proxy"),
-            patch.object(asr, "_decode_chunk_from_url", side_effect=create_pcm),
+            patch.object(asr, "_prefetch_media_pcm",
+                         side_effect=lambda _u, t, *, duration: t.write_bytes(b"")),
+            patch.object(asr, "_slice_pcm_chunk", side_effect=create_pcm),
             patch.dict(os.environ, {"SUBTITLE_BACKENDS": "sensevoice,paraformer"}),
         ):
             return asr.transcribe(
