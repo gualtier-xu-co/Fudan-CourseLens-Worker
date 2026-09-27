@@ -36,12 +36,12 @@ jobs:
         with:
           app-id: ${{ vars.WORKER_MIRROR_SOURCE_APP_ID }}
           private-key: ${{ secrets.WORKER_MIRROR_SOURCE_APP_PRIVATE_KEY }}
-          owner: gualtier-xu
+          owner: gualtier-xu-co
           repositories: Fudan-CourseLens-Private
       - name: Check out the approved private source commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          repository: gualtier-xu/Fudan-CourseLens-Private
+          repository: gualtier-xu-co/Fudan-CourseLens-Private
           ref: ${{ inputs.source_commit }}
           token: ${{ steps.source-token.outputs.token }}
           fetch-depth: 0
@@ -75,7 +75,7 @@ jobs:
         with:
           app-id: ${{ vars.WORKER_MIRROR_PUBLISHER_APP_ID }}
           private-key: ${{ secrets.WORKER_MIRROR_PUBLISHER_APP_PRIVATE_KEY }}
-          owner: gualtier-xu
+          owner: gualtier-xu-co
           repositories: Fudan-CourseLens
       - name: Publish generated branch and PR
         working-directory: private-source
@@ -87,8 +87,8 @@ jobs:
           gh auth setup-git
           python scripts/publish_worker_mirror.py \
             --snapshot "${RUNNER_TEMP}/worker-mirror" \
-            --public-url https://github.com/gualtier-xu/Fudan-CourseLens.git \
-            --public-repository gualtier-xu/Fudan-CourseLens \
+            --public-url https://github.com/gualtier-xu-co/Fudan-CourseLens.git \
+            --public-repository gualtier-xu-co/Fudan-CourseLens \
             --branch "${BRANCH_NAME}" \
             --source-commit "${SOURCE_COMMIT}" \
             --pr-title "Generate public Worker mirror from private monorepo"
