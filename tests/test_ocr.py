@@ -339,8 +339,6 @@ class RunnerSlideWarningTests(unittest.TestCase):
         llm_stub.create_summary = Mock(
             return_value={"markdown": "m", "chapters": [], "model": "deepseek-chat"}
         )
-        # 夜10-C 第七波②：runner 现从 llm 模块同源导入 LLMError（llm_pending 面）
-        llm_stub.LLMError = type("LLMError", (Exception,), {})
         with patch.dict(
             sys.modules,
             {"courselens_worker.ocr": ocr_stub, "courselens_worker.llm": llm_stub},

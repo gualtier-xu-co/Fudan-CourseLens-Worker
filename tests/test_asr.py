@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
 import sys
-import tempfile
 from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
-from courselens_worker import asr
+with patch.dict(sys.modules, {"numpy": Mock(), "sherpa_onnx": Mock()}):
+    from courselens_worker import asr
 
-# 夜10-C T23：可选依赖（sherpa_onnx/numpy）由 conftest 在收集前按需装桩。
-# 此前的 with patch.dict 整体还原会在退出时把窗口内导入的 numpy 一并逐出，
-# 下一个测试模块再导入即得第二实例（哨兵失配跨文件炸穿）；且 asr/platform_session
-# 被逐出后再 import 会二次执行出第二个类对象——梯的 except 咬不住测试抛的
-# 异常（P55 自检实测踩中）。现在全进程共享同一模块实例，此类问题整体消除。
+# 与 asr 同源取类，禁止跨模块直接 import platform_session：asr 是在
+# patch.dict 窗口内导入的，platform_session 若此前未加载会在窗口内首执行、
+# 窗口退出时被逐出，之后再 import 会二次执行出第二个类对象——梯的
+# except 咬不住测试抛的异常（P55 自检实测踩中）。
 PlatformSessionError = asr.PlatformSessionError
 
 
@@ -27,11 +25,7 @@ class ASRProxyLifecycleTests(unittest.TestCase):
         }]
         progress = Mock()
 
-        def prefetch(_url, target, *, duration):
-            self.assertGreater(duration, 0)
-            Path(target).write_bytes(b"")
-
-        def slice_pcm(_full, target, *, offset, duration):
+        def create_pcm(_url, target, *, offset, duration):
             self.assertGreaterEqual(offset, 0)
             self.assertGreater(duration, 0)
             target.write_bytes(b"pcm")
@@ -39,8 +33,7 @@ class ASRProxyLifecycleTests(unittest.TestCase):
         with (
             patch.object(asr, "RecognizerPool", return_value=pool),
             patch.object(asr, "pinned_media_proxy") as media_proxy,
-            patch.object(asr, "_prefetch_media_pcm", side_effect=prefetch) as prefetch_mock,
-            patch.object(asr, "_slice_pcm_chunk", side_effect=slice_pcm) as materialize,
+            patch.object(asr, "_decode_chunk_from_url", side_effect=create_pcm) as decode,
         ):
             proxy = media_proxy.return_value.__enter__.return_value
             proxy.url = "http://127.0.0.1/session"
@@ -60,12 +53,14 @@ class ASRProxyLifecycleTests(unittest.TestCase):
             )
 
         media_proxy.assert_called_once()
-        # 夜10-C 第七波①：预取恰一次，之后任务中段零校方请求（refresh 恒 0）
-        self.assertEqual(prefetch_mock.call_count, 1)
-        self.assertEqual(proxy.refresh_source.call_count, 0)
-        self.assertEqual(materialize.call_count, 3)
+        self.assertEqual(proxy.refresh_source.call_count, 2)
+        self.assertEqual(decode.call_count, 3)
         self.assertEqual(
-            [item.kwargs["offset"] for item in materialize.call_args_list],
+            [item.args[0] for item in decode.call_args_list],
+            ["http://127.0.0.1/session"] * 3,
+        )
+        self.assertEqual(
+            [item.kwargs["offset"] for item in decode.call_args_list],
             [0.0, 600.0, 1200.0],
         )
         self.assertEqual([item.args for item in progress.call_args_list], [
@@ -89,6 +84,10 @@ class ASREvidenceIdentityTests(unittest.TestCase):
         return pool
 
     def _run(self, pool, *, mode="automatic", prior=None, capture=None, media_seconds=1250, proofread="mock"):
+        def create_pcm(_url, target, *, offset, duration):
+            self.assertGreaterEqual(offset, 0)
+            target.write_bytes(b"pcm-bytes")
+
         payload = {
             "mode": mode,
             "media": {
@@ -107,10 +106,7 @@ class ASREvidenceIdentityTests(unittest.TestCase):
         with (
             patch.object(asr, "RecognizerPool", return_value=pool),
             patch.object(asr, "pinned_media_proxy"),
-            patch.object(asr, "_prefetch_media_pcm",
-                         side_effect=lambda _url, target, *, duration: Path(target).write_bytes(b"")),
-            patch.object(asr, "_slice_pcm_chunk",
-                         side_effect=lambda _full, target, *, offset, duration: target.write_bytes(b"pcm")),
+            patch.object(asr, "_decode_chunk_from_url", side_effect=create_pcm),
         ):
             return asr.transcribe(
                 {"payload": payload},
@@ -208,11 +204,10 @@ class ASREvidenceIdentityTests(unittest.TestCase):
         self.assertNotIn(final_id, raw_ids)
 
 
-class MediaPrefetchPins(unittest.TestCase):
-    """夜10-C 第七波①：媒体开局预取——任务中段零校方请求（跨期 runner
-    再认证墙根修）。预取失败按既有闭集媒体码如实失败；预取后的分块全部
-    本地切片，块界授权刷新不再进入循环（梯函数保留为库语义，单测见下组）。
-    """
+class ASRMediaRetryTests(unittest.TestCase):
+    """第二十案：秒败族媒体获取先重取会话材料再重试当前块，界内不整单失败。"""
+
+    FORMAT_REJECTED = "authorized media format was rejected by ffmpeg"
 
     def _pool(self):
         pool = Mock()
@@ -223,58 +218,20 @@ class MediaPrefetchPins(unittest.TestCase):
         }]
         return pool
 
-    def _run_with(self, prefetch_side_effect):
+    @contextmanager
+    def _media(self, decode_side_effect):
         pool = self._pool()
         with (
             patch.object(asr, "RecognizerPool", return_value=pool),
             patch.object(asr, "pinned_media_proxy") as media_proxy,
-            patch.object(asr, "_prefetch_media_pcm", side_effect=prefetch_side_effect) as prefetch,
-            patch.object(asr, "_slice_pcm_chunk",
-                         side_effect=lambda _full, target, *, offset, duration: target.write_bytes(b"pcm")),
+            patch.object(asr, "_decode_chunk_from_url", side_effect=decode_side_effect) as decode,
+            patch.object(asr.time, "sleep") as sleep,
         ):
             proxy = media_proxy.return_value.__enter__.return_value
             proxy.url = "http://127.0.0.1/session"
-            result = asr.transcribe(
-                {
-                    "payload": {
-                        "mode": "automatic",
-                        "media": {
-                            "url": "https://media.example.com/lecture.mp4",
-                            "duration_seconds": 1250,
-                        },
-                    },
-                },
-                sensevoice_dir=Mock(),
-                proofread=None,
-                progress=Mock(),
-            )
-        return result, proxy, prefetch
 
-    def test_prefetch_runs_once_and_boundaries_never_touch_the_school(self):
-        calls = {"count": 0}
-
-        def prefetch(_url, target, *, duration):
-            calls["count"] += 1
-            Path(target).write_bytes(b"")
-
-        result, proxy, prefetch_mock = self._run_with(prefetch)
-        self.assertEqual(result["metrics"]["chunks"], 3)
-        self.assertEqual(calls["count"], 1, "预取恰一次")
-        self.assertEqual(proxy.refresh_source.call_count, 0,
-                         "ASR 主循环零校方请求（墙已根修）")
-
-    def test_prefetch_failure_fails_closed_with_media_code_without_refresh(self):
-        pool = self._pool()
-        with (
-            patch.object(asr, "RecognizerPool", return_value=pool),
-            patch.object(asr, "pinned_media_proxy") as media_proxy,
-            patch.object(asr, "_prefetch_media_pcm",
-                         side_effect=lambda _u, _t, *, duration: (_ for _ in ()).throw(
-                             asr.ASRError("authorized media upstream connection failed"))),
-        ):
-            proxy = media_proxy.return_value.__enter__.return_value
-            with self.assertRaises(asr.ASRError) as caught:
-                asr.transcribe(
+            def invoke():
+                return asr.transcribe(
                     {
                         "payload": {
                             "mode": "automatic",
@@ -288,65 +245,212 @@ class MediaPrefetchPins(unittest.TestCase):
                     proofread=None,
                     progress=Mock(),
                 )
+
+            yield invoke, proxy, decode, sleep
+
+    def test_fast_fail_family_recovers_after_bounded_refresh(self):
+        # 块0 连续两败（0 字节/秒败签名），每次先刷新会话材料再重试同块
+        outcome = [
+            asr.ASRError(self.FORMAT_REJECTED),
+            asr.ASRError(self.FORMAT_REJECTED),
+        ]
+
+        def decode(_url, target, *, offset, duration):
+            if outcome:
+                raise outcome.pop(0)
+            target.write_bytes(b"pcm")
+
+        with self._media(decode) as (invoke, proxy, decode_mock, sleep):
+            result = invoke()
+        # 3 块全部完成；块0 额外解码 2 次
+        self.assertEqual(decode_mock.call_count, 5)
+        # 刷新 = 2 次重试 + 块间轮换 2 次
+        self.assertEqual(proxy.refresh_source.call_count, 4)
         self.assertEqual(
-            str(caught.exception),
-            "authorized media upstream connection failed",
-            "预取失败按既有闭集媒体码如实失败",
+            [item.args[0] for item in sleep.call_args_list],
+            [2.0, 5.0],
         )
-        self.assertEqual(proxy.refresh_source.call_count, 0,
-                         "预取期失败不触发任何块界刷新（一次性授权边界）")
+        self.assertEqual(result["metrics"]["chunks"], 3)
 
-    def test_slice_pcm_chunk_zero_byte_mid_media_fails_closed(self):
-        # 预取截断（中段切片为空且请求时长为正）→ 闭集媒体码，绝不静默空段
-        with tempfile.TemporaryDirectory() as folder:
-            full = Path(folder) / "full.f32le"
-            full.write_bytes(b"")
-            target = Path(folder) / "chunk.f32le"
+    def test_retry_budget_exhaustion_keeps_closed_set_reason(self):
+        def decode(_url, target, *, offset, duration):
+            raise asr.ASRError(self.FORMAT_REJECTED)
+
+        with self._media(decode) as (invoke, proxy, decode_mock, sleep):
             with self.assertRaises(asr.ASRError) as caught:
-                asr._slice_pcm_chunk(full, target, offset=600.0, duration=600.0)
-            self.assertEqual(
-                str(caught.exception),
-                "ffmpeg could not decode the authorized media stream",
-            )
-            self.assertFalse(target.exists())
-
-
-class RefreshLadderLibraryPins(unittest.TestCase):
-    """P55 有界梯语义保留为库钉（夜10-C 第七波①后主循环不再进入，
-    梯本身仍是媒体授权路径的守卫面——直接以 mock proxy 单测梯语义）。"""
-
-    def _ladder(self, proxy, *, chunk=1):
-        lines = []
-        with patch.object(asr.time, "sleep"):
-            asr._refresh_media_authorization(proxy, chunk=chunk, elapsed=lambda: 0)
-        return lines
-
-    def test_transient_failure_retries_then_succeeds(self):
-        proxy = Mock()
-        outcomes = [PlatformSessionError("platform_auth_context_missing"), None]
-        def refresh():
-            outcome = outcomes.pop(0)
-            if outcome is not None:
-                raise outcome
-        proxy.refresh_source.side_effect = refresh
-        asr._refresh_media_authorization(proxy, chunk=1, elapsed=lambda: 0)
+                invoke()
+        # 穷尽后如实透传最后一个闭集原因，不改写码面
+        self.assertEqual(str(caught.exception), self.FORMAT_REJECTED)
+        self.assertEqual(decode_mock.call_count, 3)
         self.assertEqual(proxy.refresh_source.call_count, 2)
+        self.assertEqual(
+            [item.args[0] for item in sleep.call_args_list],
+            [2.0, 5.0],
+        )
 
-    def test_ladder_exhaustion_raises_last_closed_set_code(self):
-        proxy = Mock()
-        proxy.refresh_source.side_effect = PlatformSessionError("platform_auth_context_missing")
-        with self.assertRaises(PlatformSessionError) as caught:
-            asr._refresh_media_authorization(proxy, chunk=1, elapsed=lambda: 0)
-        self.assertEqual(str(caught.exception), "platform_auth_context_missing")
-        self.assertEqual(proxy.refresh_source.call_count, 3, "有界梯恰 3 次")
+    def test_deterministic_rejection_skips_retry_family(self):
+        deterministic = "authorized media is missing a readable MP4 index"
 
-    def test_deterministic_code_never_enters_the_ladder(self):
-        proxy = Mock()
-        proxy.refresh_source.side_effect = PlatformSessionError("platform_media_missing")
-        with self.assertRaises(PlatformSessionError) as caught:
-            asr._refresh_media_authorization(proxy, chunk=1, elapsed=lambda: 0)
+        def decode(_url, target, *, offset, duration):
+            raise asr.ASRError(deterministic)
+
+        with self._media(decode) as (invoke, proxy, decode_mock, sleep):
+            with self.assertRaises(asr.ASRError) as caught:
+                invoke()
+        self.assertEqual(str(caught.exception), deterministic)
+        self.assertEqual(decode_mock.call_count, 1)
+        self.assertEqual(proxy.refresh_source.call_count, 0)
+        self.assertEqual(sleep.call_count, 0)
+
+
+class P55ChunkBoundaryRefreshLadderTests(unittest.TestCase):
+    """P55：块边界授权刷新从裸死变有界梯（真机事故 2026-09-24：117s 死窗无痕）。
+
+    事故链：chunk 边界 refresh 抛 platform_auth_context_missing 在 decode-start
+    遥测之前裸传播——本组钉「瞬态入梯重试、梯尽闭集诚实失败、逐次遥测留痕」。
+    """
+
+    @contextmanager
+    def _media(self, decode_side_effect, telemetry_lines):
+        pool = Mock()
+        pool.transcribe_pcm.side_effect = lambda _path, backend, *, offset_seconds: [{
+            "start_ms": int(offset_seconds * 1000),
+            "end_ms": int(offset_seconds * 1000) + 1000,
+            "text": backend,
+        }]
+        with (
+            patch.object(asr, "RecognizerPool", return_value=pool),
+            patch.object(asr, "pinned_media_proxy") as media_proxy,
+            patch.object(asr, "_decode_chunk_from_url", side_effect=decode_side_effect),
+            patch.object(asr, "_emit_telemetry", side_effect=telemetry_lines.append),
+            patch.object(asr.time, "sleep"),
+        ):
+            proxy = media_proxy.return_value.__enter__.return_value
+            proxy.url = "http://127.0.0.1/session"
+
+            def invoke():
+                return asr.transcribe(
+                    {
+                        "payload": {
+                            "mode": "automatic",
+                            "media": {
+                                "url": "https://media.example.com/lecture.mp4",
+                                "duration_seconds": 1250,
+                            },
+                        },
+                    },
+                    sensevoice_dir=Mock(),
+                    proofread=None,
+                    progress=Mock(),
+                )
+
+            yield invoke, proxy
+
+    def test_boundary_refresh_recovers_after_transient_platform_error(self):
+        refreshes = {"count": 0}
+
+        def refresh():
+            refreshes["count"] += 1
+            if refreshes["count"] == 1:
+                raise PlatformSessionError("platform_auth_context_missing")
+
+        def decode(_url, target, *, offset, duration):
+            target.write_bytes(b"pcm")
+
+        lines = []
+        with self._media(decode, lines) as (invoke, proxy):
+            proxy.refresh_source.side_effect = refresh
+            result = invoke()
+        self.assertEqual(result["metrics"]["chunks"], 3)
+        # 块1 边界首发1败+梯内重试1胜；块2 边界轮换1胜
+        self.assertEqual(refreshes["count"], 3)
+        retry_lines = [
+            line for line in lines if line.startswith("stage=source-refresh-retry")
+        ]
+        self.assertEqual(len(retry_lines), 1)
+        self.assertTrue(retry_lines[0].startswith(
+            "stage=source-refresh-retry chunk=1 attempt=1 "
+            "reason=platform_auth_context_missing"
+        ), retry_lines[0])
+
+    def test_boundary_refresh_exhausts_ladder_and_fails_closed_set(self):
+        calls = {"count": 0}
+
+        def refresh():
+            calls["count"] += 1
+            raise PlatformSessionError("platform_session_rejected")
+
+        def decode(_url, target, *, offset, duration):
+            target.write_bytes(b"pcm")
+
+        lines = []
+        with self._media(decode, lines) as (invoke, proxy):
+            proxy.refresh_source.side_effect = refresh
+            with self.assertRaises(PlatformSessionError) as caught:
+                invoke()
+        # 梯尽（3 次尝试）按最后闭集码如实失败，worker_failed 语义不变
+        self.assertEqual(str(caught.exception), "platform_session_rejected")
+        self.assertEqual(calls["count"], 3)
+        refresh_lines = [
+            line for line in lines if line.startswith("stage=source-refresh-")
+        ]
+        self.assertEqual(len(refresh_lines), 3)
+        self.assertTrue(refresh_lines[0].startswith(
+            "stage=source-refresh-retry chunk=1 attempt=1 reason=platform_session_rejected"))
+        self.assertTrue(refresh_lines[1].startswith(
+            "stage=source-refresh-retry chunk=1 attempt=2 reason=platform_session_rejected"))
+        self.assertTrue(refresh_lines[2].startswith(
+            "stage=source-refresh-failed chunk=1 attempt=3 reason=platform_session_rejected"))
+
+    def test_boundary_refresh_deterministic_error_fails_without_ladder(self):
+        def refresh():
+            raise PlatformSessionError("platform_media_missing")
+
+        def decode(_url, target, *, offset, duration):
+            target.write_bytes(b"pcm")
+
+        lines = []
+        with self._media(decode, lines) as (invoke, proxy):
+            proxy.refresh_source.side_effect = refresh
+            with self.assertRaises(PlatformSessionError) as caught:
+                invoke()
+        # 确定性拒绝不进梯：一次即败，无重试遥测、无退避放大
         self.assertEqual(str(caught.exception), "platform_media_missing")
         self.assertEqual(proxy.refresh_source.call_count, 1)
+        self.assertEqual(
+            [line for line in lines if line.startswith("stage=source-refresh-")],
+            [],
+        )
+
+    def test_media_retry_refresh_also_walks_the_ladder(self):
+        """P55 邻面：媒体重取路径内的刷新动作同一梯，不留第二个裸抛缺口。"""
+        outcome = [asr.ASRError("authorized media request returned HTTP 5xx")]
+        refreshes = {"count": 0}
+
+        def refresh():
+            refreshes["count"] += 1
+            if refreshes["count"] == 1:
+                raise PlatformSessionError("platform_connection_failed")
+
+        def decode(_url, target, *, offset, duration):
+            if outcome:
+                raise outcome.pop(0)
+            target.write_bytes(b"pcm")
+
+        lines = []
+        with self._media(decode, lines) as (invoke, proxy):
+            proxy.refresh_source.side_effect = refresh
+            result = invoke()
+        self.assertEqual(result["metrics"]["chunks"], 3)
+        self.assertTrue(any(
+            line.startswith(
+                "stage=source-refresh-retry chunk=0 attempt=1 reason=platform_connection_failed"
+            )
+            for line in lines
+        ))
+        self.assertTrue(any(
+            line.startswith("stage=media-retry chunk=0") for line in lines
+        ))
 
 
 class ProofreadDegradationTests(unittest.TestCase):
@@ -369,10 +473,7 @@ class ProofreadDegradationTests(unittest.TestCase):
         with (
             patch.object(asr, "RecognizerPool", return_value=pool),
             patch.object(asr, "pinned_media_proxy"),
-            patch.object(asr, "_prefetch_media_pcm",
-                         side_effect=lambda _url, target, *, duration: Path(target).write_bytes(b"")),
-            patch.object(asr, "_slice_pcm_chunk",
-                         side_effect=lambda _full, target, *, offset, duration: target.write_bytes(b"pcm")),
+            patch.object(asr, "_decode_chunk_from_url", side_effect=create_pcm),
         ):
             result = asr.transcribe(
                 {
@@ -410,10 +511,7 @@ class ProofreadDegradationTests(unittest.TestCase):
         with (
             patch.object(asr, "RecognizerPool", return_value=pool),
             patch.object(asr, "pinned_media_proxy"),
-            patch.object(asr, "_prefetch_media_pcm",
-                         side_effect=lambda _url, target, *, duration: Path(target).write_bytes(b"")),
-            patch.object(asr, "_slice_pcm_chunk",
-                         side_effect=lambda _full, target, *, offset, duration: target.write_bytes(b"pcm")),
+            patch.object(asr, "_decode_chunk_from_url", side_effect=create_pcm),
         ):
             result = asr.transcribe(
                 {

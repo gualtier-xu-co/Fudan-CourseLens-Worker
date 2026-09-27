@@ -24,11 +24,6 @@ Failure modes (one roll per webvpn context entry):
                  lck anywhere in the chain (already-authed variant)
   sso_then_delivered  P65: first entry serves a stale (rejected) ticket, the
                  fresh-cookie retry lands on the delivered chain
-  challenge_at_course  夜10-C: webvpn leg delivered, course entry serves the
-                 risk-check interstitial (no lck) — independent zero-retry code
-  expire_then_delivered  夜10-C: webvpn leg delivered, first course entry
-                 lands on a plain login page (mid-flow expiry, no lck); the
-                 outer ladder's full relogin recovers on the second entry
 """
 
 import json
@@ -47,12 +42,11 @@ from Crypto.PublicKey import RSA
 VPN_KEY = b"wrdvpnisthebest!"
 VPN_IV = b"wrdvpnisthebest!"
 MODES = ("delivered", "not_delivered", "challenge",
-         "sso_direct", "sso_then_delivered",
-         "challenge_at_course", "expire_then_delivered")
+         "sso_direct", "sso_then_delivered")
 
 _lock = threading.Lock()
 _mode = {"mode": "delivered"}
-STATS = {"webvpn_entries": 0, "requests": 0, "course_entries": 0}
+STATS = {"webvpn_entries": 0, "requests": 0}
 SERVER = None
 
 _key = RSA.generate(2048)
@@ -79,7 +73,7 @@ def set_mode(mode):
     assert mode in MODES, mode
     with _lock:
         _mode["mode"] = mode
-        STATS.update(webvpn_entries=0, requests=0, course_entries=0)
+        STATS.update(webvpn_entries=0, requests=0)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -181,13 +175,10 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/icourse/portal":
             self._send(200, "<html>icourse-ok</html>")
             return
-        # 夜10-C：直连拓扑别名（真实直连腿打 ICOURSE_BASE 根级路径，不经
-        # /icourse 前缀也不经 vpn 包裹）——没有这两条别名时 _login_course_direct
-        # 在模拟器上永远 404，直连腿整体不可测。
-        if path in ("/icourse/casapi/index.php", "/casapi/index.php"):
+        if path == "/icourse/casapi/index.php":
             self._entry_chain("course")
             return
-        if path in ("/icourse/userapi/v1/infosimple", "/userapi/v1/infosimple"):
+        if path == "/icourse/userapi/v1/infosimple":
             self._json({"code": 200, "params": _USER})
             return
         if path == "/webvpn/login":
@@ -218,20 +209,6 @@ class _Handler(BaseHTTPRequestHandler):
             if mode in ("not_delivered", "challenge"):
                 self._send(200, _CHALLENGE_HTML if mode == "challenge"
                            else _PLAIN_LOGIN_HTML)
-                return
-        if leg == "course":
-            with _lock:
-                STATS["course_entries"] += 1
-                mode = _mode["mode"]
-            if mode == "challenge_at_course":
-                # 夜10-C：课程腿挑战页变体——webvpn 腿已成功，课程入口撞
-                # 人机确认墙（无 lck），检验独立码零重试语义。
-                self._send(200, _CHALLENGE_HTML)
-                return
-            if mode == "expire_then_delivered" and STATS["course_entries"] == 1:
-                # 夜10-C：半途过期——webvpn 腿已成功，课程会话过期落在
-                # 普通登录页（无 lck），外层梯全链重跑后应恢复。
-                self._send(200, _PLAIN_LOGIN_HTML)
                 return
         lck = "LCK-" + uuid.uuid4().hex
         with _lock:

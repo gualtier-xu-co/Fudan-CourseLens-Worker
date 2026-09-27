@@ -15,9 +15,10 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from courselens_worker import asr
-from courselens_worker.formats import normalize_segments, to_srt, to_vtt
-from shared.evidence_contract import NAMESPACE_SEGMENT, compute_id
+with patch.dict(sys.modules, {"sherpa_onnx": Mock()}):
+    from courselens_worker import asr
+    from courselens_worker.formats import normalize_segments, to_srt, to_vtt
+    from shared.evidence_contract import NAMESPACE_SEGMENT, compute_id
 
 
 SAMPLE_RATE = asr.SAMPLE_RATE
