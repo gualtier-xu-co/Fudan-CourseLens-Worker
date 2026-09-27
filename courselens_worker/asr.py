@@ -557,6 +557,78 @@ def _refresh_media_authorization(proxy: Any, *, chunk: int, elapsed: Callable[[]
     raise AssertionError("unreachable")
 
 
+def _prefetch_media_pcm(
+    media_url: str,
+    target: Path,
+    *,
+    duration: float,
+) -> None:
+    """夜10-C 第七波①：媒体开局预取——新鲜授权窗口内单趟拉全量 PCM。
+
+    一条 ffmpeg 流式命令从 loopback 授权代理读完整媒体并解码为与分块文件
+    同格式的 PCM（f32le/单声道/SAMPLE_RATE）；此后 ASR 全程离线本地切片，
+    任务中段零校方请求（跨期 runner 再认证墙根修）。预取失败按既有闭集
+    媒体码如实失败；代理内的单次 401/403 刷新（如有）发生在预取早期，
+    满足「续登仅限一次且尽量早」的授权边界。
+    """
+    command = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", media_url,
+        "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-y", str(target),
+    ]
+    try:
+        returncode, _, ffmpeg_stderr = _run_bounded_process(
+            command,
+            timeout=max(900, min(7200, int(duration) * 2)),
+            capture_stdout=False,
+        )
+    except subprocess.TimeoutExpired:
+        target.unlink(missing_ok=True)
+        raise ASRError("authorized media decode timed out")
+    except OSError:
+        target.unlink(missing_ok=True)
+        raise ASRError("authorized media upstream connection failed")
+    if returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+        target.unlink(missing_ok=True)
+        raise _decode_failure(ffmpeg_stderr.decode("utf-8", errors="replace"))
+
+
+_PCM_SAMPLE_BYTES = 4  # f32le
+
+
+def _slice_pcm_chunk(
+    full_pcm: Path,
+    target: Path,
+    *,
+    offset: float,
+    duration: float,
+) -> None:
+    """夜10-C 第七波①：从预取全量 PCM 按字节切片一个分块（纯本地 I/O）。
+
+    字节地址 = 秒 × SAMPLE_RATE × 4（f32le）；越界尾部按实际剩余字节截断
+    （与解码越界的截断行为一致）。切片为空且请求时长为正 = 预取不足，
+    按既有闭集媒体码如实失败。
+    """
+    start = int(max(0.0, offset) * SAMPLE_RATE) * _PCM_SAMPLE_BYTES
+    length = int(max(0.0, duration) * SAMPLE_RATE) * _PCM_SAMPLE_BYTES
+    written = 0
+    try:
+        with full_pcm.open("rb") as source, target.open("wb") as destination:
+            source.seek(start)
+            while written < length:
+                block = source.read(min(1 << 20, length - written))
+                if not block:
+                    break
+                destination.write(block)
+                written += len(block)
+    except OSError:
+        target.unlink(missing_ok=True)
+        raise ASRError("authorized media upstream connection failed")
+    if duration > 0 and written == 0:
+        target.unlink(missing_ok=True)
+        raise ASRError("ffmpeg could not decode the authorized media stream")
+
+
 def _decode_chunk_from_url(
     media_url: str,
     target: Path,
@@ -646,11 +718,19 @@ def platform_transcript_coverage(
     """
     if duration_ms <= 0 or not segments:
         return 0.0
-    intervals = sorted(
-        (max(0, int(item.get("start_ms") or 0)), max(0, int(item.get("end_ms") or 0)))
-        for item in segments
-        if str(item.get("text") or "").strip()
-    )
+    intervals: list[tuple[int, int]] = []
+    for item in segments:
+        # 夜10-C 边界加固：非 dict/时间戳不可解析的畸形行跳过（覆盖度只在
+        # 合法行上计算），链裁决永不因异常文稿形态崩溃——低覆盖走闭集回落。
+        if not isinstance(item, dict) or not str(item.get("text") or "").strip():
+            continue
+        try:
+            start = max(0, int(item.get("start_ms") or 0))
+            end = max(0, int(item.get("end_ms") or 0))
+        except (TypeError, ValueError):
+            continue
+        intervals.append((start, end))
+    intervals.sort()
     merged: list[list[int]] = []
     for start, end in intervals:
         if end <= start:
@@ -926,13 +1006,21 @@ def transcribe(
         ticker = _ChunkTicker(telemetry_state)
         try:
             _emit_telemetry(f"stage=proxy-resolved elapsed={_elapsed_ticks()}")
+            # 夜10-C 第七波①：媒体开局预取——新鲜授权窗口内单趟拉全量 PCM，
+            # 此后分块全部本地切片：任务中段零校方请求，块界授权刷新梯与
+            # 媒体重试梯退出主循环（闭集码与有界梯语义在预取路径保留）。
+            full_pcm = root / "media-full.f32le"
+            prefetch_started = time.monotonic()
+            _emit_telemetry(f"stage=media-prefetch-start elapsed={_elapsed_ticks()}")
+            _prefetch_media_pcm(proxy.url, full_pcm, duration=duration)
+            _emit_telemetry(
+                f"stage=media-prefetch-done bytes={full_pcm.stat().st_size} "
+                f"seconds={round(time.monotonic() - prefetch_started, 3)} "
+                f"elapsed={_elapsed_ticks()}"
+            )
             ticker.start()
             for index in range(completed_chunks, total_chunks):
                 telemetry_state["chunk"] = index
-                if index > completed_chunks:
-                    # P55：块边界刷新走有界梯——不再在 decode-start 前裸抛
-                    # 未重试的 PlatformSessionError（真机 117s 死窗根因）。
-                    _refresh_media_authorization(proxy, chunk=index, elapsed=_elapsed_ticks)
                 relative_offset = index * PCM_CHUNK_SECONDS
                 absolute_offset = start_seconds + relative_offset
                 chunk_duration = min(PCM_CHUNK_SECONDS, duration - relative_offset)
@@ -940,27 +1028,12 @@ def transcribe(
                 telemetry_state["pcm"] = pcm
                 _emit_telemetry(f"stage=decode-start chunk={index} elapsed={_elapsed_ticks()}")
                 decode_started = time.monotonic()
-                for media_attempt in range(len(_MEDIA_RETRY_BACKOFF_SECONDS) + 1):
-                    try:
-                        _decode_chunk_from_url(
-                            proxy.url,
-                            pcm,
-                            offset=absolute_offset,
-                            duration=chunk_duration,
-                        )
-                        break
-                    except ASRError as exc:
-                        last_attempt = media_attempt == len(_MEDIA_RETRY_BACKOFF_SECONDS)
-                        if last_attempt or str(exc) not in _MEDIA_RETRY_MESSAGES:
-                            raise
-                        # P55：重取动作本身也走同一有界梯，媒体重取路径不留
-                        # 第二个裸抛 PlatformSessionError 的缺口。
-                        _refresh_media_authorization(proxy, chunk=index, elapsed=_elapsed_ticks)
-                        _emit_telemetry(
-                            f"stage=media-retry chunk={index} "
-                            f"attempt={media_attempt + 1} elapsed={_elapsed_ticks()}"
-                        )
-                        time.sleep(_MEDIA_RETRY_BACKOFF_SECONDS[media_attempt])
+                _slice_pcm_chunk(
+                    full_pcm,
+                    pcm,
+                    offset=absolute_offset,
+                    duration=chunk_duration,
+                )
                 _emit_telemetry(
                     f"stage=decode-done chunk={index} bytes={pcm.stat().st_size} "
                     f"seconds={round(time.monotonic() - decode_started, 3)} "
