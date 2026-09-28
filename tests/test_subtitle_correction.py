@@ -296,5 +296,53 @@ class CorrectionTests(unittest.TestCase):
         self.assertIn("WEBVTT", to_vtt(result))
 
 
+class ProofreadTelemetryTests(unittest.TestCase):
+    """夜10-C T10：校对链收口遥测钉——计数与闭集词，零内容泄漏。"""
+
+    def test_final_stage_line_carries_counters_without_content(self):
+        lines = []
+        primary = [seg(0, 1000, "温度是25摄氐度"), seg(3000, 4000, "第二句原文")]
+        sensevoice = [seg(0, 1000, "温度是25摄氏度")]
+        response = json.dumps([{"id": "p0", "old": "摄氐", "new": "摄氏"}])
+        with patch("courselens_worker.llm._emit_telemetry", side_effect=lines.append):
+            result, _, _ = run_proofread(sensevoice, primary, response)
+        finals = [line for line in lines if line.startswith("stage=proofread ")]
+        self.assertEqual(len(finals), 1, "恰一行收口遥测")
+        final = finals[0]
+        self.assertIn("windows=1/1", final)
+        self.assertIn("window_retries=0", final)
+        self.assertIn("applied=1", final)
+        self.assertIn("none=1", final, "未提案段归入 none 桶")
+        for segment in result:
+            self.assertNotIn(str(segment["text"]), final, "字幕内容绝不进遥测行")
+            evidence = str(segment.get("evidence_id") or "")
+            if evidence:
+                self.assertNotIn(evidence, final)
+        self.assertNotIn("secret", final)
+
+    def test_window_retry_emits_counter_line(self):
+        lines = []
+        calls = {"count": 0}
+        primary = [seg(0, 1000, "原文")]
+        sensevoice = [seg(0, 1000, "参考")]
+
+        def flaky_chat(api_key, messages, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise LLMError("transient provider error")
+            return json.dumps([])
+
+        with (
+            patch("courselens_worker.llm._chat", side_effect=flaky_chat),
+            patch("courselens_worker.llm._emit_telemetry", side_effect=lines.append),
+            patch("courselens_worker.llm.time.sleep"),
+        ):
+            result = proofread_segments("secret", sensevoice, primary)
+        self.assertNotIn("correction", result[0])
+        retries = [line for line in lines if line.startswith("stage=proofread-window-retry ")]
+        self.assertEqual(retries, ["stage=proofread-window-retry attempt=1"])
+        self.assertTrue(any("window_retries=1" in line for line in lines))
+
+
 if __name__ == "__main__":
     unittest.main()
