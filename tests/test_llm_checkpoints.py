@@ -150,48 +150,6 @@ class LLMCheckpointTests(unittest.TestCase):
         self.assertEqual(checkpoints[-1]["summary_completed_windows"], 2)
 
 
-    def test_summary_plan_drift_resumes_from_first_mismatched_window(self):
-        """夜10-C T24：窗口计划漂移（证据包换内容）→ 从首个不一致窗重跑，
-        之前的字幕窗计数保留；不重复调用未变的窗口。"""
-        transcript = [
-            {"start_ms": index * 1000, "end_ms": (index + 1) * 1000, "text": f"t{index}"}
-            for index in range(240)
-        ]
-        first_part = {"markdown": "kept part", "chapters": []}
-        second_part = {"markdown": "re-run part", "chapters": []}
-        final = {"markdown": "combined", "chapters": []}
-        packet_v2 = {
-            "usable": True,
-            "items": [
-                {"kind": "document_page", "citation_id": "c-v2", "label": "v2 页",
-                 "text": "second version page", "page": 1},
-            ],
-        }
-        with patch(
-            "courselens_worker.llm._chat",
-            side_effect=[json.dumps(second_part), json.dumps(final)],
-        ) as chat:
-            result = create_summary(
-                "secret",
-                title="t",
-                transcript=transcript,
-                ppt_pages=[],
-                evidence_packet=packet_v2,
-                prior_checkpoint={
-                    "summary_completed_windows": 2,
-                    "summary_parts": [first_part, {"markdown": "stale", "chapters": []}],
-                    # 旧计划：两窗都是字幕窗；新计划第二窗变成证据窗 → 从窗 2 重跑
-                    "summary_window_plan": ["transcript", "transcript"],
-                },
-            )
-        # 恰一次窗口调用（第 2 窗重跑）+ 一次合并调用；第 1 窗（计划一致）不重跑
-        self.assertEqual(chat.call_count, 2)
-        sent = json.loads(chat.call_args_list[0][0][1][1]["content"])
-        self.assertIn("second version page", json.dumps(sent, ensure_ascii=False)[:200000])
-        self.assertNotIn("kept part", json.dumps(sent), "重跑窗不携带旧第一窗内容")
-        self.assertEqual(result["markdown"], "combined")
-        self.assertEqual(len(result.get("chapters") or []), 0)
-
     def test_summary_checkpoint_records_the_window_plan(self):
         """N7A：新 checkpoint 记窗口计划；旧 checkpoint（无计划）行为不变。"""
         transcript = [

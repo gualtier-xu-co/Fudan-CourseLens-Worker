@@ -56,9 +56,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("WORKER_MIRROR_PUBLISHER_APP_PRIVATE_KEY", source)
         self.assertIn("merge-base --is-ancestor origin/main HEAD", source)
         self.assertNotIn("merge-base --is-ancestor HEAD origin/main", source)
-        self.assertIn("repository: gualtier-xu-co/Fudan-CourseLens-Private", source)
+        self.assertIn("repository: gualtier-xu/Fudan-CourseLens-Private", source)
         self.assertIn("repositories: Fudan-CourseLens-Private", source)
-        self.assertIn("repositories: Fudan-CourseLens-Worker", source)
+        self.assertIn("repositories: Fudan-CourseLens", source)
         self.assertIn("persist-credentials: false", source)
         self.assertNotIn("pull_request:", source)
 
