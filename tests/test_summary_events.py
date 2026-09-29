@@ -37,6 +37,36 @@ def test_merge_prompt_carries_closed_enumeration_and_stays_bounded():
     assert len(_SUMMARY_MERGE_PROMPT) <= 300
 
 
+def test_summary_chain_emits_final_telemetry_without_content():
+    """夜10-C T10 对称补强：摘要链收口遥测（计数与闭集词，零内容泄漏）。"""
+    merge_payload = {
+        "markdown": "# 笔记",
+        "chapters": [],
+        "key_takeaways": ["要点一"],
+        "assessment_events": [
+            {"category": "exam", "title": "期中考试", "due_hint": "下周三", "quote": "第一窗口笔记"},
+        ],
+    }
+    _chat, calls = _chat_responder([_base_window(), merge_payload])
+    lines = []
+    with (
+        patch("courselens_worker.llm._chat", _chat),
+        patch("courselens_worker.llm._emit_telemetry", side_effect=lines.append),
+    ):
+        value = create_summary("key", title="t", transcript=[], ppt_pages=[{"created_sec": 0}])
+    assert len(value["assessment_events"]) == 1
+    finals = [line for line in lines if line.startswith("stage=summary ")]
+    assert len(finals) == 1, lines
+    final = finals[0]
+    assert "windows=1/1" in final
+    assert "events=1" in final
+    assert "events_rejected=0" in final
+    assert "takeaways=1" in final
+    # 内容绝不进遥测：笔记文本/标题/quote 不出现。
+    for leaked in ("第一窗口笔记", "# 笔记", "期中考试", "要点一", "key"):
+        assert leaked not in final
+
+
 def test_valid_events_and_takeaways_pass_through():
     merge_payload = {
         "markdown": "# 笔记",

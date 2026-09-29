@@ -27,6 +27,7 @@ _EVIDENCE_KEYS = (
     "tokens",
     "lang",
     "correction",
+    "term_revision",
 )
 
 
@@ -35,14 +36,30 @@ def normalize_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Valid overlaps between segments are preserved (evidence.v1 §4): one
     segment is never clamped to the previous segment's end.
+    夜10-C 边界加固：非 dict 行与不可解析起始时间戳的行整行跳过；结束时间戳
+    不可解析时按缺省修复（start+1000），绝不因异常文稿形态崩溃。
     """
     output: list[dict[str, Any]] = []
-    for item in sorted(segments, key=lambda value: int(value.get("start_ms") or 0)):
+    keyed: list[tuple[int, dict[str, Any]]] = []
+    for item in segments:
+        if not isinstance(item, dict):
+            continue
+        try:
+            order_key = int(item.get("start_ms") or 0)
+        except (TypeError, ValueError):
+            continue
+        keyed.append((order_key, item))
+    keyed.sort(key=lambda pair: pair[0])
+    for order_key, item in keyed:
         text = " ".join(str(item.get("text") or "").split()).strip()
         if not text:
             continue
-        start = max(0, int(item.get("start_ms") or 0))
-        end = max(start + 200, int(item.get("end_ms") or start + 1000))
+        start = max(0, order_key)
+        try:
+            raw_end = int(item.get("end_ms") or start + 1000)
+        except (TypeError, ValueError):
+            raw_end = start + 1000
+        end = max(start + 200, raw_end)
         cleaned = {"start_ms": start, "end_ms": end, "text": text}
         for key in _EVIDENCE_KEYS:
             value = item.get(key)

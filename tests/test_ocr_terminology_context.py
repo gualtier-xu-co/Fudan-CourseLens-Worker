@@ -129,7 +129,9 @@ class RunnerOrderTests(unittest.TestCase):
         result, events, payloads = run_pack(job, checkpoints)
         self.assertEqual(events[:2], ["ocr", "asr"])
         self.assertEqual(events.count("ocr"), 1)
-        self.assertEqual(len(payloads), 1)
+        # SUBTITLE-DEEP-1 v3：词级校对后术语/深校对层无条件跟进——第二次 chat
+        # 属 term 窗口（id 空间 t0..），复用的 p0 提案在那里被忽略。
+        self.assertEqual(len(payloads), 2)
         self.assertEqual(payloads[0][0]["slide"], "幻灯片0术语")
         self.assertEqual(result["outputs"]["subtitle"]["segments"][0]["text"], "这个决策树算法很经典")
         self.assertEqual(result["outputs"]["ppt_pages"][0]["text"], "幻灯片0术语")
@@ -257,7 +259,11 @@ class RunnerOrderTests(unittest.TestCase):
             result = _process_materialized_job(job, checkpoint_writer=checkpoints.append)
         transcribe_mock.assert_called_once()
         self.assertEqual(result["outputs"]["subtitle"]["mode"], "automatic")
-        self.assertEqual(len(checkpoints), 0)
+        # SUBTITLE-DEEP-1 v3：深校对层无条件跟进，term 检查点替代「零检查点」
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(checkpoints[0]["stage"], "term_proofread")
+        self.assertNotIn("ppt_pages", checkpoints[0])
+        self.assertNotIn("ocr_completed_items", checkpoints[0])
         self.assertNotIn("ppt_pages", result["outputs"])
 
     def test_standalone_subtitle_checkpoints_stay_unwrapped(self):
@@ -271,10 +277,14 @@ class RunnerOrderTests(unittest.TestCase):
                 ), \
                 patch("courselens_worker.llm._chat", return_value="[]"):
             _process_materialized_job(job, checkpoint_writer=checkpoints.append)
-        self.assertEqual(len(checkpoints), 1)
+        # SUBTITLE-DEEP-1 v3：asr 块检查点之后多一条 term 深校对检查点，
+        # 两者都不携带 OCR 字段（unwrapped 语义保持）。
+        self.assertEqual(len(checkpoints), 2)
         self.assertEqual(checkpoints[0]["completed_chunks"], 1)
-        self.assertNotIn("ppt_pages", checkpoints[0])
-        self.assertNotIn("ocr_completed_items", checkpoints[0])
+        self.assertEqual(checkpoints[1]["stage"], "term_proofread")
+        for checkpoint in checkpoints:
+            self.assertNotIn("ppt_pages", checkpoint)
+            self.assertNotIn("ocr_completed_items", checkpoint)
 
     def test_fallback_proofread_path_runs_ocr_once_without_proofread_context(self):
         checkpoints = []

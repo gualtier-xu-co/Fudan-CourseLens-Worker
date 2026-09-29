@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .mailbox import IssueMailbox
+from .punct import apply_ct_punc, ct_punc_mode
 from .protocol import (
     CONTROL_SCHEMA,
     PROTOCOL_VERSION,
@@ -85,7 +86,132 @@ _SUBTITLE_RESUME_KEYS = (
     "proofread_completed_windows",
     "proofread_total_windows",
     "proofread_segments",
+    # SUBTITLE-DEEP-1：术语位深校对状态随检查点携带（跨段重排与续跑都
+    # 零重复计费；信任门在 term_proofread_segments 内按词级校对完成度判定）。
+    "term_proofread_revision",
+    "term_proofread_completed_windows",
+    "term_proofread_total_windows",
+    "term_proofread_terms",
+    "term_proofread_segments",
 )
+
+
+# SUBTITLE-DEEP-1：术语位深校对的运行时开关（缺省开启；无术语源时自然跳过）。
+_TERM_PROOFREAD_ENV = "COURSELENS_TERM_PROOFREAD"
+
+
+def _optional_model_dir(name: str) -> Path | None:
+    """Optional model directory env (zipformer leg is opt-in)."""
+    value = os.environ.get(name, "").strip()
+    return Path(value) if value else None
+
+
+def _merged_course_terms(
+    payload: dict[str, Any],
+    extra: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """payload ``glossary`` ∪ env 术语文件 ∪ 调用方增补（OCR 词表），去重保序。"""
+    from .glossary import resolve_course_terms
+
+    return tuple(dict.fromkeys(
+        str(term).strip()
+        for term in (*resolve_course_terms(payload), *extra)
+        if str(term).strip()
+    ))
+
+
+def _apply_term_stage(
+    value: dict[str, Any],
+    *,
+    api_key: str,
+    payload: dict[str, Any],
+    checkpoint_writer: Any,
+    warnings: list[str],
+    ppt_pages: list[dict[str, Any]] | None = None,
+    extra_terms: tuple[str, ...] = (),
+) -> None:
+    """Term-position deep correction chained after the word-level proofread.
+
+    术语源 = payload 可选 ``glossary``（客户端接线留桩，缺席=旧行为）∪ 环境变量
+    术语文件 ∪ OCR 词表（learning_pack）。示例源 = payload 可选 ``examples``
+    （课程记忆桩，包B 沉淀后接入）。分歧跨度 = transcribe 返回的
+    ``proofread_alternates``（rough 槽位原文）。整层在无术语/无 Key/开关关闭时
+    零开销跳过；LLM 失败降级并记闭集警告，词级校对结果绝不因此丢失。检查点
+    续跑保留底层 ASR/词级校对状态，术语段零重复计费。
+    """
+    if not api_key or os.environ.get(_TERM_PROOFREAD_ENV, "").strip() == "0":
+        return
+    from .glossary import resolve_course_examples
+    from .llm import LLMError, term_proofread_segments
+
+    # v3（总控补充行 2026-09-29）：任意误识位修正+句读标点。无术语表时照跑
+    # （标点/常用词路径），terms 缺省为空即可。
+    ordered = _merged_course_terms(payload, extra_terms)
+    prior = dict(payload.get("checkpoint") or {})
+    preserved = {key: item for key, item in prior.items() if key != "stage"}
+    audit: list[dict[str, Any]] = []
+    usage: list[dict[str, Any]] = []
+
+    def term_checkpoint(term_value: dict[str, Any]) -> None:
+        if checkpoint_writer is not None:
+            checkpoint_writer({**preserved, **term_value})
+
+    try:
+        corrected = term_proofread_segments(
+            api_key,
+            list(value.get("segments") or []),
+            terms=ordered,
+            ppt_pages=ppt_pages,
+            prior_checkpoint=prior,
+            checkpoint=term_checkpoint,
+            audit_sink=audit,
+            usage_sink=usage,
+            alt_segments=value.get("proofread_alternates"),
+            course_examples=resolve_course_examples(payload),
+        )
+    except LLMError:
+        warnings.append("term_proofread_degraded")
+        return
+    value["segments"] = corrected
+    if audit:
+        # 深校对 diff 审计账（总控补充行 2026-09-29）：位置+改前+改后随结果
+        # 透传（result 合同自由键；客户端导入面只读具名键，忽略未知键）。
+        value["deep_audit"] = audit
+    if usage:
+        # SUP3 顺带①：每讲 LLM 成本落账（计数器，零内容）——completion 与
+        # reasoning tokens 拆分、缓存命中、总时延。
+        value["deep_usage"] = {
+            "calls": len(usage),
+            "prompt_tokens": sum(int(item.get("prompt_tokens") or 0) for item in usage),
+            "completion_tokens": sum(int(item.get("completion_tokens") or 0) for item in usage),
+            "reasoning_tokens": sum(int(item.get("reasoning_tokens") or 0) for item in usage),
+            "prompt_cache_hit_tokens": sum(
+                int(item.get("prompt_cache_hit_tokens") or 0) for item in usage
+            ),
+            "latency_seconds": round(
+                sum(float(item.get("latency_ms") or 0) for item in usage) / 1000, 1
+            ),
+        }
+
+
+def _apply_ct_punc_stage(value: dict[str, Any], *, warnings: list[str]) -> None:
+    """V4NONTHINK-1 件7：ct-punc 本地标点恢复（env 门控，CTPUNC-DEF-1 起缺省 fill）。
+
+    A 序 fill=仅补无标点 cue 缺口；B 序 full=全部 cue 重标点；off 显式退回。
+    内容不等值逐段 fail-closed 保留原文；模型缺席/引擎不可用整讲一次闭集
+    回落记账后安静跳过；遥测仅计数。
+    """
+    if ct_punc_mode() == "off":
+        return
+    telemetry: list[str] = []
+    stats = apply_ct_punc(list(value.get("segments") or []), telemetry=telemetry)
+    for line in telemetry:
+        print(line, flush=True)
+    print(
+        f"stage=ct-punc mode={ct_punc_mode()} applied={stats.get('applied', 0)} "
+        f"kept={stats.get('kept', 0)}",
+        flush=True,
+    )
 
 
 def safe_worker_error_detail(error: BaseException) -> str:
@@ -254,6 +380,7 @@ def _process_materialized_job(
         from .formats import to_srt, to_vtt
         from .llm import proofread_segments
 
+        payload = dict(job.get("payload") or {})
         secrets = dict(job.get("secrets") or {})
         api_key = str(secrets.get("deepseek_api_key") or "")
         # automatic 策略：仅在配置了 DeepSeek Key 时提供校对提供方；
@@ -262,6 +389,8 @@ def _process_materialized_job(
             job,
             sensevoice_dir=Path(_required("SENSEVOICE_MODEL_DIR")),
             paraformer_dir=Path(_required("PARAFORMER_MODEL_DIR")),
+            zipformer_dir=_optional_model_dir("ZIPFORMER_MODEL_DIR"),
+            hotwords=_merged_course_terms(payload),
             proofread=(
                 (lambda rough, refined, prior, write: proofread_segments(
                     api_key,
@@ -274,6 +403,14 @@ def _process_materialized_job(
             progress=progress,
             checkpoint=checkpoint_writer,
         )
+        _apply_term_stage(
+            value,
+            api_key=api_key,
+            payload=payload,
+            checkpoint_writer=checkpoint_writer,
+            warnings=warnings,
+        )
+        _apply_ct_punc_stage(value, warnings=warnings)
         outputs = {
             "subtitle": {
                 "mode": value["mode"],
@@ -283,13 +420,15 @@ def _process_materialized_job(
                 # raw 段键随 SUBTITLE_BACKENDS 序列泛化（raw_<backend>），
                 # 默认链仍是 raw_sensevoice + raw_paraformer，客户端合同不变。
                 **{key: value[key] for key in value if key.startswith("raw_")},
+                **({"deep_audit": value["deep_audit"]} if value.get("deep_audit") else {}),
+                **({"deep_usage": value["deep_usage"]} if value.get("deep_usage") else {}),
             }
         }
         metrics = value["metrics"]
     elif kind in {"summary", "chapters"}:
         from .course_knowledge import normalize_evidence_packet
         from .lecture_ir import build_lecture_ir
-        from .llm import create_summary
+        from .llm import LLMError, create_summary
         from .ocr import process_slides
 
         payload = dict(job.get("payload") or {})
@@ -331,15 +470,54 @@ def _process_materialized_job(
             summary_args["evidence_packet"] = packet
         if payload.get("course_context") is not None:
             summary_args["course_context"] = payload.get("course_context")
-        summary = create_summary(
-            str(dict(job.get("secrets") or {}).get("deepseek_api_key") or ""),
-            title=str(payload.get("title") or ""),
-            transcript=transcript,
-            ppt_pages=pages,
-            prior_checkpoint=prior,
-            checkpoint=summary_checkpoint,
-            **summary_args,
-        )
+        if _merged_course_terms(payload):
+            # V4NONTHINK-1 件6：摘要窗口/合并输入携带课程术语表（笔记写法保险）。
+            summary_args["glossary"] = _merged_course_terms(payload)
+        try:
+            summary = create_summary(
+                str(dict(job.get("secrets") or {}).get("deepseek_api_key") or ""),
+                title=str(payload.get("title") or ""),
+                transcript=transcript,
+                ppt_pages=pages,
+                prior_checkpoint=prior,
+                checkpoint=summary_checkpoint,
+                **summary_args,
+            )
+        except LLMError:
+            # 夜10-C 第七波②：远端 LLM 段降级——runner 出口对 DeepSeek 不可达
+            # 等闭集失败不再整单失败，改回 llm_pending 回执；客户端凭本地可达
+            # 的 key 领回执行同一总结链后按同一导入面落库（UI/消耗计数一致）。
+            warnings.append("llm_pending_remote_failed")
+            print(f"task={job['task_id']} stage=summary-llm-pending", flush=True)
+            return {
+                "schema": RESULT_SCHEMA,
+                "protocol_version": PROTOCOL_VERSION,
+                "task_id": job["task_id"],
+                "job_kind": kind,
+                "input_hash": job["input_hash"],
+                "pipeline_fingerprint": (
+                    PROCESS_CANARY_PIPELINE if kind == "process_canary"
+                    else str(dict(job.get("pipeline") or {}).get("version") or "v2")
+                ),
+                "status": "llm_pending",
+                "outputs": {"llm_pending": {
+                    "title": str(payload.get("title") or ""),
+                    "transcript": transcript,
+                    "ppt_pages": pages,
+                    "evidence_packet": packet,
+                    "course_context": (
+                        payload.get("course_context")
+                        if isinstance(payload.get("course_context"), dict) else None
+                    ),
+                    "reason_code": "llm_remote_failed",
+                }},
+                "metrics": {
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "transcript_segments": len(transcript),
+                    "ppt_pages": len(pages),
+                },
+                "warnings": warnings,
+            }
         outputs = {"ppt_pages": pages}
         if kind == "chapters":
             outputs["chapters"] = list(summary.get("chapters") or [])
@@ -372,7 +550,7 @@ def _process_materialized_job(
         from .formats import to_srt, to_vtt
         from .lecture_ir import build_lecture_ir
         from .glossary import build_glossary
-        from .llm import answer_question, create_summary, proofread_segments
+        from .llm import LLMError, answer_question, create_summary, proofread_segments
         from .ocr import process_slides
 
         payload = dict(job.get("payload") or {})
@@ -435,6 +613,10 @@ def _process_materialized_job(
                 job,
                 sensevoice_dir=Path(_required("SENSEVOICE_MODEL_DIR")),
                 paraformer_dir=Path(_required("PARAFORMER_MODEL_DIR")),
+                zipformer_dir=_optional_model_dir("ZIPFORMER_MODEL_DIR"),
+                hotwords=_merged_course_terms(
+                    payload, build_glossary(pages, str(payload.get("title") or "")),
+                ) if wants_slides else _merged_course_terms(payload),
                 proofread=proofread_with_slides if api_key else None,
                 progress=progress,
                 checkpoint=subtitle_checkpoint,
@@ -444,6 +626,16 @@ def _process_materialized_job(
             for _warning in value.get("warnings") or []:
                 if _warning not in warnings:
                     warnings.append(_warning)
+            _apply_term_stage(
+                value,
+                api_key=api_key,
+                payload=payload,
+                checkpoint_writer=checkpoint_writer,
+                warnings=warnings,
+                ppt_pages=pages if wants_slides else None,
+                extra_terms=build_glossary(pages, str(payload.get("title") or "")),
+            )
+            _apply_ct_punc_stage(value, warnings=warnings)
             transcript = value["segments"]
             outputs["subtitle"] = {
                 "mode": value["mode"],
@@ -451,6 +643,8 @@ def _process_materialized_job(
                 "srt": to_srt(transcript),
                 "vtt": to_vtt(transcript),
                 **{key: value[key] for key in value if key.startswith("raw_")},
+                **({"deep_audit": value["deep_audit"]} if value.get("deep_audit") else {}),
+                **({"deep_usage": value["deep_usage"]} if value.get("deep_usage") else {}),
             }
             metrics["subtitle"] = value["metrics"]
         if "answer" in requested:
@@ -492,15 +686,60 @@ def _process_materialized_job(
                 summary_args["evidence_packet"] = packet
             if payload.get("course_context") is not None:
                 summary_args["course_context"] = payload.get("course_context")
-            summary = create_summary(
-                api_key,
-                title=str(payload.get("title") or ""),
-                transcript=transcript,
-                ppt_pages=pages,
-                prior_checkpoint=prior,
-                checkpoint=summary_checkpoint,
-                **summary_args,
+            pack_terms = (
+                _merged_course_terms(
+                    payload, build_glossary(pages, str(payload.get("title") or ""))
+                )
+                if wants_slides else _merged_course_terms(payload)
             )
+            if pack_terms:
+                # V4NONTHINK-1 件6：learning_pack 摘要同享术语表注入（含 OCR 词表）。
+                summary_args["glossary"] = pack_terms
+            try:
+                summary = create_summary(
+                    api_key,
+                    title=str(payload.get("title") or ""),
+                    transcript=transcript,
+                    ppt_pages=pages,
+                    prior_checkpoint=prior,
+                    checkpoint=summary_checkpoint,
+                    **summary_args,
+                )
+            except LLMError:
+                # 夜10-C 第九波任务2：learning_pack 分支与 summary 分支同享
+                # llm_pending 降级——LLM 段失败不再整单失败，OCR/转写产物
+                # 随 llm_pending 回执交还客户端领回执行。
+                warnings.append("llm_pending_remote_failed")
+                print(f"task={job['task_id']} stage=summary-llm-pending", flush=True)
+                return {
+                    "schema": RESULT_SCHEMA,
+                    "protocol_version": PROTOCOL_VERSION,
+                    "task_id": job["task_id"],
+                    "job_kind": kind,
+                    "input_hash": job["input_hash"],
+                    "pipeline_fingerprint": str(
+                        dict(job.get("pipeline") or {}).get("version") or "v2"
+                    ),
+                    "status": "llm_pending",
+                    "outputs": {"llm_pending": {
+                        "title": str(payload.get("title") or ""),
+                        "transcript": transcript,
+                        "ppt_pages": pages,
+                        "evidence_packet": packet,
+                        "course_context": (
+                            payload.get("course_context")
+                            if isinstance(payload.get("course_context"), dict) else None
+                        ),
+                        "reason_code": "llm_remote_failed",
+                        "job_kind": kind,
+                    }},
+                    "metrics": {
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        "transcript_segments": len(transcript),
+                        "ppt_pages": len(pages),
+                    },
+                    "warnings": warnings,
+                }
             if "summary" in requested:
                 outputs["summary"] = summary
             if "chapters" in requested:

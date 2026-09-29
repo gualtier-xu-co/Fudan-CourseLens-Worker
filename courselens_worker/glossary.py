@@ -8,13 +8,19 @@ OCR 缺席时只退课程名。字幕里与词表词编辑距离≤1 的错拼�
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 GLOSSARY_MAX_TERMS = 200
 GLOSSARY_MIN_FREQ = 3
 GLOSSARY_APPLIED_STATUS = "applied-glossary"
+# SUBTITLE-DEEP-1：术语闭集的运行时注入面。课程术语表可经 job payload 的可选
+# ``glossary`` 键（客户端接线留桩，缺省缺席=旧行为）或操作员环境变量文件
+# （每行一词）进入术语位深校对与热词文件；两者都缺席时术语层整体跳过。
+TERM_GLOSSARY_ENV = "COURSELENS_TERM_GLOSSARY_FILE"
 _MIN_TERM_CHARS = 2
 _MAX_TERM_CHARS = 8
 _EDIT_RADIUS = 1
@@ -95,6 +101,72 @@ def _candidate_variants(segment_text: str, glossary: tuple[str, ...]):
                         continue
                     if _MIN_TERM_CHARS <= len(piece) <= _MAX_TERM_CHARS + 1 and _within_edit_distance(piece, term):
                         yield piece, term
+
+
+def resolve_course_terms(payload: dict[str, Any] | None = None) -> tuple[str, ...]:
+    """Resolve the course term closed set: payload ``glossary`` + env file.
+
+    去重保序、去空、封顶 GLOSSARY_MAX_TERMS；两个来源都缺席返回空元组，
+    调用方据此跳过术语层（零行为变化的缺省路径）。
+    """
+    values: list[str] = []
+    raw = (payload or {}).get("glossary")
+    if isinstance(raw, list):
+        values.extend(str(item).strip() for item in raw)
+    env_path = os.environ.get(TERM_GLOSSARY_ENV, "").strip()
+    if env_path:
+        try:
+            lines = Path(env_path).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        values.extend(line.strip() for line in lines)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            deduped.append(value)
+    return tuple(deduped[:GLOSSARY_MAX_TERMS])
+
+
+# V4NONTHINK-1 件2：课程记忆示例 payload 桩（SUBTITLE-DEEP-1 包B 沉淀后接入的
+# 读侧合同）。形状=与通用示例库同构的最小单元：{"input": [{"id","text"}...],
+# "ops": [{"id","old","new"}...]}。conforming-only fail-closed：任一条目不成形
+# 即整条丢弃（坏示例进不了提示词）；缺席=空元组=零行为变化。
+def resolve_course_examples(payload: dict[str, Any] | None = None) -> tuple[dict[str, Any], ...]:
+    raw = (payload or {}).get("examples")
+    if not isinstance(raw, list):
+        return ()
+    resolved: list[dict[str, Any]] = []
+    for item in raw[:GLOSSARY_MAX_TERMS]:
+        if not isinstance(item, dict):
+            continue
+        raw_input = item.get("input")
+        raw_ops = item.get("ops")
+        if not isinstance(raw_input, list) or not raw_input or not isinstance(raw_ops, list):
+            continue
+        shaped_input: list[dict[str, str]] = []
+        shaped_ops: list[dict[str, str]] = []
+        valid = True
+        for entry in raw_input:
+            entry_id = str(entry.get("id") or "").strip() if isinstance(entry, dict) else ""
+            entry_text = str(entry.get("text") or "").strip() if isinstance(entry, dict) else ""
+            if not entry_id or not entry_text:
+                valid = False
+                break
+            shaped_input.append({"id": entry_id, "text": entry_text})
+        if valid:
+            for op in raw_ops:
+                op_id = str(op.get("id") or "").strip() if isinstance(op, dict) else ""
+                op_old = str(op.get("old") or "") if isinstance(op, dict) else ""
+                op_new = str(op.get("new") or "") if isinstance(op, dict) else ""
+                if not op_id or not op_old or not op_new:
+                    valid = False
+                    break
+                shaped_ops.append({"id": op_id, "old": op_old, "new": op_new})
+        if valid:
+            resolved.append({"input": shaped_input, "ops": shaped_ops})
+    return tuple(resolved)
 
 
 def apply_glossary(segments: list[dict[str, Any]], glossary: tuple[str, ...]) -> list[dict[str, Any]]:
