@@ -15,13 +15,12 @@ from unittest.mock import Mock, patch
 
 import numpy as np  # noqa: F401  (must precede the patch.dict block below)
 
-with patch.dict(sys.modules, {"sherpa_onnx": Mock()}):
-    from courselens_worker import asr
-    from courselens_worker.asr import (
-        _ChunkTicker,
-        _mem_available_kb,
-        _mem_available_kb_from,
-    )
+from courselens_worker import asr
+from courselens_worker.asr import (
+    _ChunkTicker,
+    _mem_available_kb,
+    _mem_available_kb_from,
+)
 
 
 TICK_LINE_RE = re.compile(
