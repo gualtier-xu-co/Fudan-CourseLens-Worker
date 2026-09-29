@@ -488,6 +488,11 @@ class PlatformSession:
                     "platform_ticket_missing",
                     "platform_ticket_rejected",
                     "platform_session_rejected",
+                    # 夜10-C：挑战页属路线级风控而非账号级墙——直连腿撞墙后
+                    # 换 webvpn 路线是学生可感知的可达性收益；回落是换路线，
+                    # 不是对同一挑战墙重试（webvpn 腿自己的挑战墙仍零重试，
+                    # B3 语义不变）。
+                    "platform_challenge_required",
                 }:
                     raise
                 if not allow_webvpn_fallback:
@@ -724,6 +729,7 @@ class PlatformSession:
             "GET", cas, connection_stage="course_context_direct", direct=True
         )
         lck = ""
+        body_prefix = ""
         try:
             for candidate in trace + [response.url]:
                 match = re.search(r'lck=([^&#"\s]+)', str(candidate or ""))
@@ -731,12 +737,16 @@ class PlatformSession:
                     lck = match.group(1)
                     break
             if not lck:
+                body_prefix = _challenge_page_sniff(response)
                 match = re.search(r'lck=([^&#"\s]+)', response.text[:5000])
                 if match:
                     lck = match.group(1)
         finally:
             response.close()
         if not lck:
+            # 夜10-C 直连课程腿挑战页解耦（上侧 wrapped 腿同款）。
+            if _looks_like_challenge_page(body_prefix):
+                raise _fail("platform_challenge_required", connection_stage="course_context_direct")
             raise _fail("platform_course_context_missing")
 
         method_data = _json(self._direct_once(
@@ -824,6 +834,7 @@ class PlatformSession:
             "GET", _vpn_url(cas), connection_stage="course_context"
         )
         lck = ""
+        body_prefix = ""
         try:
             for candidate in trace + [response.url]:
                 match = re.search(r'lck=([^&#"]+)', candidate)
@@ -831,12 +842,20 @@ class PlatformSession:
                     lck = match.group(1)
                     break
             if not lck:
+                body_prefix = _challenge_page_sniff(response)
                 match = re.search(r'lck=([^&#"]+)', response.text[:5000])
                 if match:
                     lck = match.group(1)
         finally:
             response.close()
         if not lck:
+            # 夜10-C 课程腿挑战页变体（webvpn 腿 B3 同族解耦）：挑战页需要
+            # 人工完成一次人机确认，独立码且不入任何重试闭集——课程腿此前
+            # 塌缩成 platform_course_context_missing（登录重试闭集内），梯内
+            # 重试只会连续撞上同一挑战页。普通无 lck 页维持既有码（外层梯
+            # 全链重跑后可恢复）。
+            if _looks_like_challenge_page(body_prefix):
+                raise _fail("platform_challenge_required", connection_stage="course_context")
             raise _fail("platform_course_context_missing")
 
         idp_vpn = _vpn_url(IDP_BASE)
