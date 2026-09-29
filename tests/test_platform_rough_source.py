@@ -7,20 +7,18 @@ contact, no media, no model download.
 from __future__ import annotations
 
 import os
-import sys
 import unittest
 from unittest.mock import Mock, patch
 
-with patch.dict(sys.modules, {"sherpa_onnx": Mock()}):
-    from courselens_worker import asr
-    from courselens_worker.platform_session import (
-        TRANSCRIPT_RESPONSE_MAX_BYTES,
-        TRANSCRIPT_RECORD_STORM_LIMIT,
-        PlatformSession,
-        PlatformSessionError,
-        _job_needs_rough_transcript,
-        materialize_job_sources,
-    )
+from courselens_worker import asr
+from courselens_worker.platform_session import (
+    TRANSCRIPT_RESPONSE_MAX_BYTES,
+    TRANSCRIPT_RECORD_STORM_LIMIT,
+    PlatformSession,
+    PlatformSessionError,
+    _job_needs_rough_transcript,
+    materialize_job_sources,
+)
 
 
 def _transcript_row(index: int, span_ms: int = 60_000) -> dict:
@@ -202,6 +200,49 @@ class MaterializeRoughTranscriptTests(unittest.TestCase):
         self.assertFalse(_job_needs_rough_transcript({}))
 
 
+class PlatformTranscriptMalformedRowTests(unittest.TestCase):
+    """夜10-C T4：异常文稿形态的覆盖度/归一化免疫（低覆盖走闭集回落，绝不崩溃）。"""
+
+    def test_coverage_skips_malformed_rows_instead_of_crashing(self):
+        rows = [
+            None,
+            "not-a-row",
+            {"start_ms": "bad", "end_ms": 100, "text": "坏形状"},
+            {"start_ms": 0, "end_ms": 500, "text": "好段"},
+        ]
+        self.assertEqual(asr.platform_transcript_coverage(rows, 1000), 0.5)
+
+    def test_coverage_treats_numeric_strings_as_valid(self):
+        rows = [{"start_ms": "0", "end_ms": "400", "text": "字符串秒"}]
+        self.assertEqual(asr.platform_transcript_coverage(rows, 1000), 0.4)
+
+    def test_normalize_segments_skips_malformed_rows_and_repairs_end(self):
+        from courselens_worker.formats import normalize_segments
+
+        rows = [
+            None,
+            {"start_ms": "bad", "end_ms": 900, "text": "坏起始"},
+            {"start_ms": 0, "end_ms": "bad", "text": "坏结束"},
+            {"start_ms": 1000, "end_ms": 2000, "text": "  好段  "},
+        ]
+        cleaned = normalize_segments(rows)
+        self.assertEqual([row["text"] for row in cleaned], ["坏结束", "好段"])
+        self.assertEqual(cleaned[0]["start_ms"], 0)
+        self.assertEqual(cleaned[0]["end_ms"], 1000, "结束时间戳不可解析按缺省修复")
+        self.assertEqual(cleaned[0]["start_ms"] <= cleaned[0]["end_ms"], True)
+
+    def test_normalize_segments_sorting_unchanged_for_valid_rows(self):
+        from courselens_worker.formats import normalize_segments
+
+        rows = [
+            {"start_ms": 2000, "end_ms": 3000, "text": "乙"},
+            {"start_ms": 0, "end_ms": 1000, "text": "甲"},
+        ]
+        self.assertEqual(
+            [row["text"] for row in normalize_segments(rows)], ["甲", "乙"]
+        )
+
+
 class _FakeStream:
     def __init__(self) -> None:
         self.waveform = None
@@ -236,7 +277,10 @@ class PlatformRoughSourceChainTests(unittest.TestCase):
         proofread="mock",
         telemetry=None,
     ):
-        def create_pcm(_url, target, *, offset, duration):
+        def prefetch(_url, target, *, duration):
+            target.write_bytes(b"")
+
+        def create_pcm(_full, target, *, offset, duration):
             target.write_bytes(b"pcm-bytes")
 
         payload = {
@@ -259,7 +303,8 @@ class PlatformRoughSourceChainTests(unittest.TestCase):
         with (
             patch.object(asr, "RecognizerPool", return_value=pool),
             patch.object(asr, "pinned_media_proxy"),
-            patch.object(asr, "_decode_chunk_from_url", side_effect=create_pcm),
+            patch.object(asr, "_prefetch_media_pcm", side_effect=prefetch),
+            patch.object(asr, "_slice_pcm_chunk", side_effect=create_pcm),
             patch.object(asr, "_emit_telemetry", side_effect=lambda line: emit.append(line)),
             patch.dict(os.environ, environment),
         ):
@@ -346,6 +391,40 @@ class PlatformRoughSourceChainTests(unittest.TestCase):
             any("reason=coverage_low" in line for line in telemetry)
         )
 
+    def test_coverage_threshold_boundary_is_inclusive(self):
+        # 夜10-C：裁决边界含等号（>=0.8 恰好达标走平台链）；用 0.5/0.5 精确验证
+        ran: list = []
+        with patch.object(asr, "PLATFORM_TRANSCRIPT_MIN_COVERAGE", 0.5):
+            result = self._run(
+                self._pool(ran),
+                payload_extra={
+                    "platform_transcript": [
+                        {"start_ms": 0, "end_ms": 625_000, "text": "恰好半讲"},
+                    ],
+                    "platform_transcript_state": "transcript_fetched",
+                },
+            )
+        self.assertEqual(result["metrics"]["rough_source"], "platform")
+        self.assertNotIn("rough_source_fallback_reason", result["metrics"])
+
+    def test_resume_rejects_platform_chain_when_rows_are_lost(self):
+        # 夜10-C 反向失配：平台链检查点 + 平台行在续跑时丢失 → 拒绝混链
+        prior = {
+            "completed_chunks": 1,
+            "total_chunks": 3,
+            "mode": "automatic",
+            "backends": ["sensevoice", "paraformer"],
+            "rough_source": "platform",
+            "raw_sensevoice": [{"start_ms": 0, "end_ms": 1000, "text": "粗"}],
+            "raw_paraformer": [{"start_ms": 0, "end_ms": 1000, "text": "精"}],
+        }
+        with self.assertRaises(asr.ASRError):
+            self._run(
+                self._pool([]),
+                payload_extra={"platform_transcript_state": "transcript_fetch_failed"},
+                prior=prior,
+            )
+
     def test_kill_switch_env_forces_legacy_chain(self):
         ran: list = []
         telemetry: list[str] = []
@@ -413,8 +492,10 @@ class PlatformRoughSourceChainTests(unittest.TestCase):
         with (
             patch.object(asr, "RecognizerPool", return_value=pool),
             patch.object(asr, "pinned_media_proxy"),
-            patch.object(asr, "_decode_chunk_from_url",
-                         side_effect=lambda _u, t, *, offset, duration: t.write_bytes(b"p")),
+            patch.object(asr, "_prefetch_media_pcm",
+                         side_effect=lambda _u, t, *, duration: t.write_bytes(b"")),
+            patch.object(asr, "_slice_pcm_chunk",
+                         side_effect=lambda _f, t, *, offset, duration: t.write_bytes(b"p")),
             patch.dict(os.environ, {"SUBTITLE_BACKENDS": "sensevoice,paraformer"}),
         ):
             asr.transcribe(

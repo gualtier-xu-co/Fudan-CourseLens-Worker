@@ -57,8 +57,17 @@ ASR_DECODE_BATCH_SECONDS = 30
 # 精修管线 backend 序列策略（ASRBENCH-1 A5 立项，M4-ENABLE-1 U3 翻默认）：
 # 「粗识别, 精识别」两元序列默认即 M4（sensevoice 主识别 + paraformer 精修），
 # 环境变量可覆写；旧链如需回退走 git revert，不留运行时后门。
-SUPPORTED_ASR_BACKENDS = ("sensevoice", "paraformer")
+# SUBTITLE-DEEP-1 Phase B：``zipformer``（zipformer-transducer + 术语热词文件，
+# BENCH-ASR-1 实证热词 -35% 术语错）加入可选精修腿；默认序列不变，热词路径
+# 仅由 SUBTITLE_BACKENDS 显式启用。
+SUPPORTED_ASR_BACKENDS = ("sensevoice", "paraformer", "zipformer")
 DEFAULT_SUBTITLE_BACKENDS = "sensevoice,paraformer"
+# BENCH-ASR-1 热词腿配方钉：hotwords_score=2.0 + modified_beam_search（ziptrans
+# 冷→热唯一变量对照 0.207→0.135）。热词文件缺失时按冷腿默认解码。
+ZIPFORMER_HOTWORDS_SCORE = 2.0
+ZIPFORMER_HOTWORD_DECODING = "modified_beam_search"
+# 热词文件条目上限：课程词表（OCR 高频候选）可能含上下文短语，按频序截断。
+ASR_HOTWORD_LIMIT = 100
 
 # AS12（第五十二案）：平台原生文稿可代 SenseVoice 粗识别腿——只当校对交替
 # 源，绝不直接成为字幕输出（用户拍板 2026-09-23：平台文稿差，质量由精识别
@@ -99,6 +108,35 @@ ASR_ENERGY_RATIO_ENV = "COURSELENS_ASR_ENERGY_RATIO"
 ASR_ENERGY_RATIO_DEFAULT = 3.0
 ASR_ENERGY_RATIO_MIN = 1.5
 ASR_ENERGY_RATIO_MAX = 10.0
+
+# V4NONTHINK-1 件7：silero-vad 段界（默认关）。攻「跨段词中断裂」根因家族
+# （能量 VAD 在弱音节处断界，如「考试方|面」）。env=COURSELENS_ASR_VAD_ENGINE:
+#   energy（缺省）=现役帧能量 VAD，行为逐位不变；silero=SileroVadModelConfig，
+#   模型经 SILERO_MODEL_DIR 注入（install_models 钉）。模型缺席/引擎名未知一律
+#   回落能量 VAD（失败=降级，绝不失败任务），闭集遥测记账。
+VAD_ENGINE_ENV = "COURSELENS_ASR_VAD_ENGINE"
+VAD_ENGINE_ENERGY = "energy"
+VAD_ENGINE_SILERO = "silero"
+SILERO_MODEL_DIR_ENV = "SILERO_MODEL_DIR"
+SILERO_VAD_THRESHOLD = 0.5
+SILERO_VAD_MIN_SPEECH_SECONDS = VAD_MIN_REGION_SECONDS
+SILERO_VAD_MIN_SILENCE_SECONDS = VAD_MERGE_GAP_SECONDS
+SILERO_VAD_WINDOW_SAMPLES = 512  # 官方 release silero_vad.onnx（v5，643KB）实窗
+
+
+def vad_engine() -> str:
+    raw = os.environ.get(VAD_ENGINE_ENV, "").strip().lower()
+    return raw if raw in {VAD_ENGINE_ENERGY, VAD_ENGINE_SILERO} else VAD_ENGINE_ENERGY
+
+
+def silero_model_path() -> Path | None:
+    value = os.environ.get(SILERO_MODEL_DIR_ENV, "").strip()
+    if not value:
+        return None
+    candidate = Path(value)
+    if candidate.is_dir():
+        candidate = candidate / "silero_vad.onnx"
+    return candidate if candidate.is_file() else None
 
 # Evidence provenance stamped on complete-run output.  The fingerprint hashes
 # only the decoded PCM representation; URLs, secrets, and course identifiers
@@ -194,6 +232,45 @@ def detect_voiced_regions(
     for position, (start, end) in enumerate(bounded):
         previous_end = padded[-1][1] if padded else 0
         next_start = bounded[position + 1][0] if position + 1 < len(bounded) else total
+        region_start = max(previous_end, start - min(pad_samples, (start - previous_end) // 2))
+        region_end = min(next_start, end + min(pad_samples, (next_start - end) // 2))
+        padded.append((region_start, max(region_start, region_end)))
+    return padded
+
+
+def _finalize_regions(
+    regions: list[list[int]],
+    total: int,
+    *,
+    min_region_samples: int,
+    merge_gap_samples: int,
+    max_region_samples: int,
+    pad_samples: int,
+    sample_rate: int,
+) -> list[tuple[int, int]]:
+    """Shared bounded-region discipline (min filter → merge → max split → pad).
+
+    与 detect_voiced_regions 的后段纪律逐位同构（min/merge/max/pad 帽与邻界
+    对半收缩），供 silero 路径复用；能量路径保留自身内联实现零回归。
+    """
+    bounded = [region for region in regions if region[1] - region[0] >= min_region_samples]
+    merged: list[list[int]] = []
+    for region in bounded:
+        if merged and region[0] - merged[-1][1] < merge_gap_samples:
+            merged[-1][1] = max(merged[-1][1], region[1])
+        else:
+            merged.append(region)
+    split: list[list[int]] = []
+    for start, end in merged:
+        cursor = start
+        while end - cursor > max_region_samples:
+            split.append([cursor, cursor + max_region_samples])
+            cursor += max_region_samples
+        split.append([cursor, end])
+    padded: list[tuple[int, int]] = []
+    for position, (start, end) in enumerate(split):
+        previous_end = padded[-1][1] if padded else 0
+        next_start = split[position + 1][0] if position + 1 < len(split) else total
         region_start = max(previous_end, start - min(pad_samples, (start - previous_end) // 2))
         region_end = min(next_start, end + min(pad_samples, (next_start - end) // 2))
         padded.append((region_start, max(region_start, region_end)))
@@ -394,11 +471,75 @@ class RecognizerPool:
         paraformer_dir: Path | None = None,
         *,
         threads: int = 4,
+        zipformer_dir: Path | None = None,
     ):
         self.sensevoice_dir = sensevoice_dir
         self.paraformer_dir = paraformer_dir
+        self.zipformer_dir = zipformer_dir
         self.threads = max(1, min(4, int(threads)))
         self._recognizers: dict[str, Any] = {}
+        # 术语热词文件由 transcribe 在任务临时目录内落盘后挂上（懒加载语义：
+        # 只在 zipformer 腿首次构建 recognizer 时被读取）。
+        self.hotwords_file: Path | None = None
+
+        self.silero_model_path: Path | None = None
+        self._silero_vad: Any = None
+
+    def silero_ready(self) -> bool:
+        return vad_engine() == VAD_ENGINE_SILERO and self.silero_model_path is not None
+
+    def _voiced_regions(
+        self,
+        window: "np.ndarray",
+        *,
+        energy_ratio: float,
+    ) -> list[tuple[int, int]]:
+        """Dispatch per configured engine; silero falls back to energy fail-closed."""
+        if not self.silero_ready():
+            return detect_voiced_regions(window, energy_ratio=energy_ratio)
+        try:
+            return self._silero_regions(window)
+        except Exception as exc:  # noqa: BLE001 - 模型/推理任何异常都回落能量 VAD
+            _emit_telemetry(f"stage=silero-vad-fallback reason={type(exc).__name__}")
+            self._silero_vad = None
+            return detect_voiced_regions(window, energy_ratio=energy_ratio)
+
+    def _silero_regions(self, window: "np.ndarray") -> list[tuple[int, int]]:
+        if self._silero_vad is None:
+            config = sherpa_onnx.VadModelConfig()
+            config.silero_vad.model = str(self.silero_model_path)
+            config.silero_vad.threshold = SILERO_VAD_THRESHOLD
+            config.silero_vad.min_speech_duration = SILERO_VAD_MIN_SPEECH_SECONDS
+            config.silero_vad.min_silence_duration = SILERO_VAD_MIN_SILENCE_SECONDS
+            config.silero_vad.window_size = SILERO_VAD_WINDOW_SAMPLES
+            config.sample_rate = SAMPLE_RATE
+            self._silero_vad = sherpa_onnx.VoiceActivityDetector(
+                config, buffer_size_in_seconds=120,
+            )
+        vad = self._silero_vad
+        samples = np.asarray(window, dtype=np.float32)
+        step = SILERO_VAD_WINDOW_SAMPLES
+        for start in range(0, len(samples), step):
+            vad.accept_waveform(samples[start:start + step])
+        vad.flush()
+        regions: list[list[int]] = []
+        while not vad.empty():
+            segment = vad.front
+            start = int(segment.start)
+            end = start + len(segment.samples)
+            if end > start:
+                regions.append([start, min(end, len(samples))])
+            vad.pop()
+        vad.reset()
+        return _finalize_regions(
+            regions,
+            len(samples),
+            min_region_samples=max(1, int(VAD_MIN_REGION_SECONDS * SAMPLE_RATE)),
+            merge_gap_samples=int(VAD_MERGE_GAP_SECONDS * SAMPLE_RATE),
+            max_region_samples=max(1, int(VAD_MAX_REGION_SECONDS * SAMPLE_RATE)),
+            pad_samples=int(VAD_PAD_SECONDS * SAMPLE_RATE),
+            sample_rate=SAMPLE_RATE,
+        )
 
     @staticmethod
     def _model(directory: Path) -> Path:
@@ -408,20 +549,47 @@ class RecognizerPool:
                 return path
         raise ASRError("configured ASR model directory is incomplete")
 
+    @staticmethod
+    def _transducer_files(directory: Path) -> tuple[Path, Path, Path]:
+        """Resolve (encoder, decoder, joiner), preferring int8 variants."""
+        chosen: list[Path] = []
+        for role in ("encoder", "decoder", "joiner"):
+            candidates = sorted(directory.glob(f"{role}-*.onnx"))
+            int8 = [path for path in candidates if ".int8." in path.name]
+            pool = int8 or candidates
+            if not pool:
+                raise ASRError("configured ASR model directory is incomplete")
+            chosen.append(pool[0])
+        return chosen[0], chosen[1], chosen[2]
+
+    def zipformer_ready(self) -> bool:
+        if self.zipformer_dir is None or not self.zipformer_dir.is_dir():
+            return False
+        try:
+            self._transducer_files(self.zipformer_dir)
+        except ASRError:
+            return False
+        return (self.zipformer_dir / "tokens.txt").is_file()
+
     def get(self, backend: str):
         if backend in self._recognizers:
             return self._recognizers[backend]
         directories = {
             "sensevoice": self.sensevoice_dir,
             "paraformer": self.paraformer_dir,
+            "zipformer": self.zipformer_dir,
         }
         directory = directories.get(backend)
         if directory is None:
             if backend not in SUPPORTED_ASR_BACKENDS:
                 raise ASRError("unsupported ASR backend")
             raise ASRError(f"{backend} model directory is not configured")
-        model = self._model(directory)
-        tokens = directory / "tokens.txt"
+        if backend == "zipformer":
+            encoder, decoder, joiner = self._transducer_files(directory)
+            tokens = directory / "tokens.txt"
+        else:
+            model = self._model(directory)
+            tokens = directory / "tokens.txt"
         if not tokens.is_file():
             raise ASRError("configured ASR token file is missing")
         if backend == "sensevoice":
@@ -434,6 +602,19 @@ class RecognizerPool:
             recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
                 paraformer=str(model), tokens=str(tokens), num_threads=self.threads,
                 debug=False, provider="cpu",
+            )
+        elif backend == "zipformer":
+            # SUBTITLE-DEEP-1 Phase B：热词经 from_transducer 公开工厂参数注入
+            # （公开工厂直接支持热词参数；BENCH 证实的 pybind 直构造配方只属于
+            # paraformer 静默忽略热词的死路，不再需要）。
+            hotwords_file = self.hotwords_file
+            recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+                encoder=str(encoder), decoder=str(decoder), joiner=str(joiner),
+                tokens=str(tokens), num_threads=self.threads,
+                debug=False, provider="cpu",
+                hotwords_file=str(hotwords_file) if hotwords_file else "",
+                hotwords_score=ZIPFORMER_HOTWORDS_SCORE if hotwords_file else 1.0,
+                decoding_method=ZIPFORMER_HOTWORD_DECODING if hotwords_file else "default",
             )
         else:
             raise ASRError("unsupported ASR backend")
@@ -452,7 +633,7 @@ class RecognizerPool:
             if end - start < SAMPLE_RATE // 2:
                 continue
             window = samples[start:end]
-            for region_start, region_end in detect_voiced_regions(
+            for region_start, region_end in self._voiced_regions(
                 window, energy_ratio=energy_ratio,
             ):
                 stream = recognizer.create_stream()
@@ -557,6 +738,324 @@ def _refresh_media_authorization(proxy: Any, *, chunk: int, elapsed: Callable[[]
     raise AssertionError("unreachable")
 
 
+def _prefetch_media_pcm(
+    media_url: str,
+    target: Path,
+    *,
+    duration: float,
+) -> None:
+    """夜10-C 第七波①：媒体开局预取——新鲜授权窗口内单趟拉全量 PCM。
+
+    一条 ffmpeg 流式命令从 loopback 授权代理读完整媒体并解码为与分块文件
+    同格式的 PCM（f32le/单声道/SAMPLE_RATE）；此后 ASR 全程离线本地切片，
+    任务中段零校方请求（跨期 runner 再认证墙根修）。预取失败按既有闭集
+    媒体码如实失败；代理内的单次 401/403 刷新（如有）发生在预取早期，
+    满足「续登仅限一次且尽量早」的授权边界。
+    """
+    command = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", media_url,
+        "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-y", str(target),
+    ]
+    try:
+        returncode, _, ffmpeg_stderr = _run_bounded_process(
+            command,
+            timeout=max(900, min(7200, int(duration) * 2)),
+            capture_stdout=False,
+        )
+    except subprocess.TimeoutExpired:
+        target.unlink(missing_ok=True)
+        raise ASRError("authorized media decode timed out")
+    except OSError:
+        target.unlink(missing_ok=True)
+        raise ASRError("authorized media upstream connection failed")
+    if returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+        target.unlink(missing_ok=True)
+        raise _decode_failure(ffmpeg_stderr.decode("utf-8", errors="replace"))
+
+
+_PCM_SAMPLE_BYTES = 4  # f32le
+
+
+def _slice_pcm_chunk(
+    full_pcm: Path,
+    target: Path,
+    *,
+    offset: float,
+    duration: float,
+) -> None:
+    """夜10-C 第七波①：从预取全量 PCM 按字节切片一个分块（纯本地 I/O）。
+
+    字节地址 = 秒 × SAMPLE_RATE × 4（f32le）；越界尾部按实际剩余字节截断
+    （与解码越界的截断行为一致）。切片为空且请求时长为正 = 预取不足，
+    按既有闭集媒体码如实失败。
+    """
+    start = int(max(0.0, offset) * SAMPLE_RATE) * _PCM_SAMPLE_BYTES
+    length = int(max(0.0, duration) * SAMPLE_RATE) * _PCM_SAMPLE_BYTES
+    written = 0
+    try:
+        with full_pcm.open("rb") as source, target.open("wb") as destination:
+            source.seek(start)
+            while written < length:
+                block = source.read(min(1 << 20, length - written))
+                if not block:
+                    break
+                destination.write(block)
+                written += len(block)
+    except OSError:
+        target.unlink(missing_ok=True)
+        raise ASRError("authorized media upstream connection failed")
+    if duration > 0 and written == 0:
+        target.unlink(missing_ok=True)
+        raise ASRError("ffmpeg could not decode the authorized media stream")
+
+
+# ---- 夜10-C 第九波任务1：邻接重复折叠（口齿不清的 ASR 连续重复字词） ----
+_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9]+")
+# 合法叠词白名单：单字 run==2 时的常见实词叠形，保留不折叠。
+_LEGIT_REDUP = frozenset("""慢慢 刚刚 天天 人人 常常 往往 渐渐 仅仅 统统 恰恰 微微 轻轻 深深 久久 缓缓 悄悄 匆匆 淡淡 默默 徐徐 频频 高高 远远 好好 多多 早早 爸爸 妈妈 哥哥 姐姐 弟弟 妹妹 爷爷 奶奶 叔叔 星星""".split())
+_ADJACENT_FOLD_WINDOW_MS = 5000
+
+
+_ADJACENT_FOLD_PUNCT_RUN = re.compile(r"([，。？！、；：,.!?;:])[，。？！、；：,.!?;:]+")
+_ADJACENT_FOLD_LEADING_PUNCT = re.compile(r"^[，。？！、；：,.!?;:]+")
+
+
+def collapse_repeated_tokens(text: str) -> tuple[str, int]:
+    """折叠一段转写文本内的 ASR 连续重复字词（确定性、零增字）。
+
+    R3=单字残叠 X+XY（X 为 XY 首字）→XY；R1=立即同字串 run≥2→1（合法叠词
+    run==2 保留）；R2=块级重复——连续两个及以上的等长块（2/3/4/6/8 字，
+    词级 ABAB 在字面即 4 字块 ABCDABCD）→保留首块。迭代到不动点。
+    """
+    matches = list(_TOKEN_RE.finditer(text))
+    if len(matches) < 2:
+        return text, 0
+    values = [m.group(0) for m in matches]
+    drop = [False] * len(values)
+    folds = 0
+    changed = True
+    while changed:
+        changed = False
+        live = [i for i, d in enumerate(drop) if not d]
+        vals = [values[i] for i in live]
+        # R3：单字残叠
+        for k in range(len(vals) - 1):
+            a, b = vals[k], vals[k + 1]
+            if len(a) == 1 and len(b) >= 2 and b.startswith(a):
+                drop[live[k]] = True
+                folds += 1
+                changed = True
+                break
+        if changed:
+            continue
+        # R1：立即同字串
+        for k in range(len(vals)):
+            run = 1
+            while k + run < len(vals) and vals[k + run] == vals[k]:
+                run += 1
+            if run >= 2:
+                tok = vals[k]
+                if not (len(tok) == 1 and run == 2 and (tok + tok) in _LEGIT_REDUP):
+                    for j in range(k + 1, k + run):
+                        drop[live[j]] = True
+                    folds += 1
+                    changed = True
+                    break
+        if changed:
+            continue
+        # R2：块级重复（块长 2/3/4/6/8 字；词级口吃在字面即 4 字块 ABCDABCD）
+        for length in (2, 3, 4, 6, 8):
+            limit = len(vals) - length
+            for k in range(limit + 1):
+                block = vals[k:k + length]
+                if len(set(block)) == 1:
+                    continue  # 单字重复串归 R1 管
+                j = k + length
+                reps = 1
+                while j + length <= len(vals) and vals[j:j + length] == block:
+                    reps += 1
+                    j += length
+                if reps < 2:
+                    continue
+                # 尾部残叠仅当其为块前缀时收敛（我我也我也→我也）；
+                # 非前缀的后续正文（这个这个这样）原样保留。
+                # 尾部残叠仅当其为块前缀时收敛（我我也我也→我也）；
+                # 非前缀的后续正文（这个这个这样）原样保留。
+                partial = vals[j:len(vals)]
+                if partial and len(partial) < length and partial == block[:len(partial)]:
+                    j += len(partial)
+                for t in range(k + length, j):
+                    drop[live[t]] = True
+                folds += reps - 1
+                changed = True
+                break
+            if changed:
+                break
+    pieces = []
+    last = 0
+    for m, d in zip(matches, drop):
+        if d:
+            pieces.append(text[last:m.start()])
+            last = m.end()
+    pieces.append(text[last:])
+    joined = "".join(pieces)
+    # SUBTITLE-DEEP-1 Phase C：折叠删掉叠用词后，其各自尾标点会在接缝处连用
+    # （所以，所以，→折叠→，，，）——挤压同族标点串并剥句首标点。无标点输入
+    # 逐位不变。
+    joined = _ADJACENT_FOLD_PUNCT_RUN.sub(r"\1", joined)
+    joined = _ADJACENT_FOLD_LEADING_PUNCT.sub("", joined)
+    return joined, folds
+
+def fold_transcript_repetitions(segments: list[dict[str, Any]]) -> dict[str, int]:
+    """就地对转写段列表做重复折叠（段内 token 折叠+相邻同文段合并）。
+
+    相邻同文合并窗口=5s 且要求文本完全一致；合并保留首段并延展末时。
+    返回遥测计数（仅计数，零内容）。
+    """
+    folded_tokens = 0
+    merged_adjacent = 0
+    ordered = sorted(
+        segments,
+        key=lambda s: (int(s.get("start_ms") or 0), int(s.get("end_ms") or 0)),
+    )
+    kept: list[dict[str, Any]] = []
+    for seg in ordered:
+        text, folds = collapse_repeated_tokens(str(seg.get("text") or ""))
+        if folds:
+            seg["text"] = text
+        folded_tokens += folds
+        if kept:
+            prev = kept[-1]
+            gap = int(seg.get("start_ms") or 0) - int(prev.get("end_ms") or 0)
+            if (
+                str(prev.get("text") or "").strip()
+                and prev.get("text") == seg.get("text")
+                and 0 <= gap <= _ADJACENT_FOLD_WINDOW_MS
+            ):
+                prev["end_ms"] = max(
+                    int(prev.get("end_ms") or 0), int(seg.get("end_ms") or 0)
+                )
+                merged_adjacent += 1
+                continue
+        kept.append(seg)
+    # 就地收敛：保留段写回调用方列表
+    segments[:] = kept
+    return {
+        "folded_tokens": folded_tokens,
+        "merged_adjacent": merged_adjacent,
+        "segments": len(kept),
+    }
+
+
+# ---- SUBTITLE-DEEP-1 Phase C：双时间戳锚校正 --------------------------------
+# 平台官方文稿（payload.platform_transcript，即 AS12 的交替源行）的 cue 时刻来自
+# 校方播放器，可作 Paraformer 识别锚漂移的校正基准（BENCH timing 实测中位偏差
+# 12-18s）。校正确定性：官方 cue 与识别段窗口重叠最优者配对，段中点向官方中点
+# 平移（时长保持），位移有帽；未命中段在相邻已校正段之间线性插值。
+TIME_ANCHOR_ENV = "COURSELENS_SUBTITLE_TIME_ANCHOR"
+TIME_ANCHOR_MATCH_GAP_MS = 3000
+TIME_ANCHOR_MATCH_MIN_OVERLAP_MS = 800
+TIME_ANCHOR_MAX_SHIFT_MS = 8000
+TIME_ANCHOR_SNAP_MS = 800
+
+
+def _anchor_correct_timing(
+    segments: list[dict[str, Any]],
+    official_rows: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Anchor-correct refined segment timing toward official cue midpoints, in place.
+
+    配对：官方行与识别段在 ±TIME_ANCHOR_MATCH_GAP_MS 窗口内重叠最大者；重叠
+    <TIME_ANCHOR_MATCH_MIN_OVERLAP_MS 不配对。位移=官方中点−识别中点，帽
+    ±TIME_ANCHOR_MAX_SHIFT_MS，|位移|≤TIME_ANCHOR_SNAP_MS 视为零漂移不动。
+    未配对段取左右已配对邻位的位移线性插值（按中点距离加权），同样受帽。
+    返回遥测计数（仅计数，零内容）。
+    """
+    rows: list[tuple[int, int]] = []
+    for row in official_rows or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            start = max(0, int(row.get("start_ms") or 0))
+            end = max(0, int(row.get("end_ms") or 0))
+        except (TypeError, ValueError):
+            continue
+        if end > start:
+            rows.append((start, end))
+    rows.sort()
+    if not rows or not segments:
+        return {"official_rows": len(rows), "matched": 0, "shifted": 0, "max_shift_ms": 0}
+
+    ordered = sorted(
+        range(len(segments)),
+        key=lambda index: (int(segments[index].get("start_ms") or 0), index),
+    )
+    direct: dict[int, int] = {}
+    for index in ordered:
+        segment = segments[index]
+        start = int(segment.get("start_ms") or 0)
+        end = int(segment.get("end_ms") or start)
+        best_overlap = 0
+        best_mid = 0
+        for row_start, row_end in rows:
+            if row_end < start - TIME_ANCHOR_MATCH_GAP_MS:
+                continue
+            if row_start > end + TIME_ANCHOR_MATCH_GAP_MS:
+                break
+            overlap = min(end, row_end) - max(start, row_start)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_mid = (row_start + row_end) // 2
+        if best_overlap < TIME_ANCHOR_MATCH_MIN_OVERLAP_MS:
+            continue
+        mid = (start + end) // 2
+        delta = best_mid - mid
+        if abs(delta) > TIME_ANCHOR_MAX_SHIFT_MS:
+            delta = TIME_ANCHOR_MAX_SHIFT_MS if delta > 0 else -TIME_ANCHOR_MAX_SHIFT_MS
+        direct[index] = delta
+
+    matched = len(direct)
+    max_shift = max((abs(value) for value in direct.values()), default=0)
+    # 位移应用：直配段用自身位移（|位移|≤snap 视为零漂移不动）；仅无官方
+    # 重叠的段取左右直配邻位插值（已对齐的直配段绝不被邻居位移）。
+    shifted = 0
+    for position, index in enumerate(ordered):
+        if index in direct:
+            delta = direct[index]
+        else:
+            left = next(
+                (direct[prior] for prior in reversed(ordered[:position]) if prior in direct),
+                None,
+            )
+            right = next(
+                (direct[later] for later in ordered[position + 1:] if later in direct),
+                None,
+            )
+            if left is None and right is None:
+                continue
+            if left is None:
+                delta = right
+            elif right is None:
+                delta = left
+            else:
+                delta = (left + right) // 2
+            if abs(delta) > TIME_ANCHOR_MAX_SHIFT_MS:
+                delta = TIME_ANCHOR_MAX_SHIFT_MS if delta > 0 else -TIME_ANCHOR_MAX_SHIFT_MS
+        if abs(delta) <= TIME_ANCHOR_SNAP_MS:
+            continue
+        segment = segments[index]
+        segment["start_ms"] = max(0, int(segment.get("start_ms") or 0) + delta)
+        segment["end_ms"] = max(
+            int(segment["start_ms"]), int(segment.get("end_ms") or 0) + delta
+        )
+        shifted += 1
+    return {
+        "official_rows": len(rows), "matched": matched,
+        "shifted": shifted, "max_shift_ms": max_shift,
+    }
+
+
 def _decode_chunk_from_url(
     media_url: str,
     target: Path,
@@ -646,11 +1145,19 @@ def platform_transcript_coverage(
     """
     if duration_ms <= 0 or not segments:
         return 0.0
-    intervals = sorted(
-        (max(0, int(item.get("start_ms") or 0)), max(0, int(item.get("end_ms") or 0)))
-        for item in segments
-        if str(item.get("text") or "").strip()
-    )
+    intervals: list[tuple[int, int]] = []
+    for item in segments:
+        # 夜10-C 边界加固：非 dict/时间戳不可解析的畸形行跳过（覆盖度只在
+        # 合法行上计算），链裁决永不因异常文稿形态崩溃——低覆盖走闭集回落。
+        if not isinstance(item, dict) or not str(item.get("text") or "").strip():
+            continue
+        try:
+            start = max(0, int(item.get("start_ms") or 0))
+            end = max(0, int(item.get("end_ms") or 0))
+        except (TypeError, ValueError):
+            continue
+        intervals.append((start, end))
+    intervals.sort()
     merged: list[list[int]] = []
     for start, end in intervals:
         if end <= start:
@@ -783,6 +1290,8 @@ def transcribe(
     *,
     sensevoice_dir: Path,
     paraformer_dir: Path | None = None,
+    zipformer_dir: Path | None = None,
+    hotwords: tuple[str, ...] = (),
     proofread: Callable[..., list[dict[str, Any]]] | None,
     progress: Callable[[str, int, int], None],
     checkpoint: Callable[[dict[str, Any]], None] | None = None,
@@ -855,9 +1364,40 @@ def transcribe(
     )
     backends = subtitle_backend_sequence()
     rough, refined = backends
+    # SUBTITLE-DEEP-1 Phase B：zipformer 模型缺席时整讲回退原链（失败=降级，
+    # 绝不失败任务）。回退只发生在任何块解码与检查点写入之前，检查点链身份
+    # （backends/raw_* 键）始终与实际生效序列一致；已装但损坏的模型文件在
+    # 预暖处按既有闭集码如实失败，不做静默混链。
+    zipformer_requested = zipformer_dir if "zipformer" in (rough, refined) else None
+    if zipformer_requested is not None:
+        probe = RecognizerPool(
+            sensevoice_dir, paraformer_dir, threads=recognizer_threads,
+            zipformer_dir=zipformer_requested,
+        )
+        if not probe.zipformer_ready():
+            replacement = "paraformer" if "paraformer" not in (rough, refined) else "sensevoice"
+            _emit_telemetry(
+                f"stage=zipformer-fallback "
+                f"backend={'refined' if refined == 'zipformer' else 'rough'} "
+                f"replacement={replacement}"
+            )
+            if refined == "zipformer":
+                refined = replacement
+            if rough == "zipformer":
+                rough = "sensevoice" if refined != "sensevoice" else "paraformer"
+            zipformer_requested = None
+            backends = [rough, refined]
     pool = RecognizerPool(
-        sensevoice_dir, paraformer_dir, threads=recognizer_threads
+        sensevoice_dir, paraformer_dir, threads=recognizer_threads,
+        zipformer_dir=zipformer_requested,
     )
+    # V4NONTHINK-1 件7：silero-vad 模型注入（env 请求时解析；缺席回落能量 VAD）。
+    if vad_engine() == VAD_ENGINE_SILERO:
+        pool.silero_model_path = silero_model_path()
+        _emit_telemetry(
+            f"stage=vad-engine engine=silero model="
+            f"{'ready' if pool.silero_model_path else 'missing'}"
+        )
     prior = dict(payload.get("checkpoint") or {})
     if prior and str(prior.get("mode") or "") != mode:
         raise ASRError("checkpoint subtitle mode does not match the job")
@@ -926,13 +1466,35 @@ def transcribe(
         ticker = _ChunkTicker(telemetry_state)
         try:
             _emit_telemetry(f"stage=proxy-resolved elapsed={_elapsed_ticks()}")
+            # 夜10-C 第七波①：媒体开局预取——新鲜授权窗口内单趟拉全量 PCM，
+            # 此后分块全部本地切片：任务中段零校方请求，块界授权刷新梯与
+            # 媒体重试梯退出主循环（闭集码与有界梯语义在预取路径保留）。
+            full_pcm = root / "media-full.f32le"
+            prefetch_started = time.monotonic()
+            _emit_telemetry(f"stage=media-prefetch-start elapsed={_elapsed_ticks()}")
+            _prefetch_media_pcm(proxy.url, full_pcm, duration=duration)
+            _emit_telemetry(
+                f"stage=media-prefetch-done bytes={full_pcm.stat().st_size} "
+                f"seconds={round(time.monotonic() - prefetch_started, 3)} "
+                f"elapsed={_elapsed_ticks()}"
+            )
+            if pool.zipformer_dir is not None:
+                # 热词文件落盘在任务自有临时目录内（零新持久化路径），懒加载
+                # 语义：只被 zipformer 腿首次构建时读取。预暖在任何块解码前
+                # 完成——加载失败按闭集码如实失败，绝不半链混跑。
+                if hotwords:
+                    pool.hotwords_file = root / "hotwords.txt"
+                    pool.hotwords_file.write_text(
+                        "\n".join(str(term).strip() for term in hotwords[:ASR_HOTWORD_LIMIT] if str(term).strip()) + "\n",
+                        encoding="utf-8",
+                    )
+                pool.get("zipformer")
+                _emit_telemetry(
+                    f"stage=zipformer-ready hotwords={min(len(hotwords), ASR_HOTWORD_LIMIT) if hotwords else 0}"
+                )
             ticker.start()
             for index in range(completed_chunks, total_chunks):
                 telemetry_state["chunk"] = index
-                if index > completed_chunks:
-                    # P55：块边界刷新走有界梯——不再在 decode-start 前裸抛
-                    # 未重试的 PlatformSessionError（真机 117s 死窗根因）。
-                    _refresh_media_authorization(proxy, chunk=index, elapsed=_elapsed_ticks)
                 relative_offset = index * PCM_CHUNK_SECONDS
                 absolute_offset = start_seconds + relative_offset
                 chunk_duration = min(PCM_CHUNK_SECONDS, duration - relative_offset)
@@ -940,27 +1502,12 @@ def transcribe(
                 telemetry_state["pcm"] = pcm
                 _emit_telemetry(f"stage=decode-start chunk={index} elapsed={_elapsed_ticks()}")
                 decode_started = time.monotonic()
-                for media_attempt in range(len(_MEDIA_RETRY_BACKOFF_SECONDS) + 1):
-                    try:
-                        _decode_chunk_from_url(
-                            proxy.url,
-                            pcm,
-                            offset=absolute_offset,
-                            duration=chunk_duration,
-                        )
-                        break
-                    except ASRError as exc:
-                        last_attempt = media_attempt == len(_MEDIA_RETRY_BACKOFF_SECONDS)
-                        if last_attempt or str(exc) not in _MEDIA_RETRY_MESSAGES:
-                            raise
-                        # P55：重取动作本身也走同一有界梯，媒体重取路径不留
-                        # 第二个裸抛 PlatformSessionError 的缺口。
-                        _refresh_media_authorization(proxy, chunk=index, elapsed=_elapsed_ticks)
-                        _emit_telemetry(
-                            f"stage=media-retry chunk={index} "
-                            f"attempt={media_attempt + 1} elapsed={_elapsed_ticks()}"
-                        )
-                        time.sleep(_MEDIA_RETRY_BACKOFF_SECONDS[media_attempt])
+                _slice_pcm_chunk(
+                    full_pcm,
+                    pcm,
+                    offset=absolute_offset,
+                    duration=chunk_duration,
+                )
                 _emit_telemetry(
                     f"stage=decode-done chunk={index} bytes={pcm.stat().st_size} "
                     f"seconds={round(time.monotonic() - decode_started, 3)} "
@@ -1013,6 +1560,27 @@ def transcribe(
                     checkpoint(state)
         finally:
             ticker.stop()
+    # 夜10-C 第九波任务1：邻接重复折叠——口齿不清的 ASR 连续重复字词在
+    # 校对/落库前折叠（校对与摘要拿到干净文本；遥测仅计数）。
+    refined_segments_fold = fold_transcript_repetitions(refined_segments)
+    fold_transcript_repetitions(rough_segments)
+    _emit_telemetry(
+        f"stage=token-fold tokens={refined_segments_fold['folded_tokens']} "
+        f"adjacent={refined_segments_fold['merged_adjacent']} "
+        f"segments={refined_segments_fold['segments']}"
+    )
+    # SUBTITLE-DEEP-1 Phase C：双时间戳锚校正——平台官方 cue 时刻为锚校识别
+    # 段漂移（确定性配对+有帽平移+插值平滑）。平台行缺席/杀开关时整段跳过；
+    # 遥测仅计数。校正在检查点循环之后确定性执行，续跑同果。
+    timing_anchor_stats: dict[str, int] = {}
+    if platform_rows and os.environ.get(TIME_ANCHOR_ENV, "").strip() != "0":
+        timing_anchor_stats = _anchor_correct_timing(refined_segments, platform_rows)
+        _emit_telemetry(
+            f"stage=time-anchor official_rows={timing_anchor_stats.get('official_rows', 0)} "
+            f"matched={timing_anchor_stats.get('matched', 0)} "
+            f"shifted={timing_anchor_stats.get('shifted', 0)} "
+            f"max_shift_ms={timing_anchor_stats.get('max_shift_ms', 0)}"
+        )
     proofread_degraded = False
     if not proofread_enabled:
         final = refined_segments
@@ -1097,6 +1665,10 @@ def transcribe(
         "segments": final_segments,
         f"raw_{rough}": raw_rough,
         f"raw_{refined}": raw_refined,
+        # V4NONTHINK-1 件4：分歧跨度裁决的交替源（与词级校对同一 rough 槽位）。
+        # 只进 worker 内部术语层（suspects wire），不随 outputs 上行（键名不以
+        # raw_ 开头，runner 转发面零变化）。
+        "proofread_alternates": raw_rough,
         **({"warnings": ["proofread_degraded"]} if proofread_degraded else {}),
         "metrics": {
             "duration_seconds": duration,
@@ -1110,5 +1682,6 @@ def transcribe(
                 {"rough_source_fallback_reason": rough_fallback_reason}
                 if rough_fallback_reason else {}
             ),
+            **({"timing_anchor": timing_anchor_stats} if timing_anchor_stats else {}),
         },
     }
