@@ -2051,48 +2051,17 @@ def create_summary(
         progress("summary", len(sources) + 1, len(sources) + 1)
     valid_anchors = {int(item.get("start_ms") or 0) for item in transcript}
     valid_anchors.update(int(item.get("created_sec") or 0) * 1000 for item in ppt_pages)
-    # QSCOREFIX-1④（D-QS-9）：章节零锚根修。实测评分卡 65/65 全零锚——根因=
-    # 首段 0ms 使 0 ∈ valid_anchors，LLM 全零/缺省发射 start_ms 整批过白名单，
-    # 学生拿到的章节全部不可跳转。修法=本地锚拯救（与 RR-QWIN-1 takeaway 锚
-    # 同源同阈 Dice 相似度，fail-closed：阈值不达宁可留 0 绝不编锚）：
-    #   白名单外或「非首章的 0 锚」→ 用 title+summary 对转写原文派生真锚；
-    #   白名单外且派生失败 → 维持既有 fail-closed 丢项；
-    #   0 ∈ 白名单但派生失败（首章或后续章）→ 保留 0（内容不丢，不可跳转）。
-    anchor_text_pool = [
-        (int(item.get("start_ms") or 0), str(item.get("text") or "")) for item in transcript
-    ]
-    chapters: list[dict[str, Any]] = []
-    seen_chapter_titles: set[str] = set()
-    chapters_anchor_derived = 0
-    chapters_dup_dropped = 0
+    chapters = []
     for item in value["chapters"]:
         if not isinstance(item, dict):
             continue
-        title = str(item.get("title") or "").strip()
-        summary = str(item.get("summary") or "").strip()
         start_ms = int(item.get("start_ms") or 0)
-        if start_ms not in valid_anchors or (start_ms == 0 and chapters):
-            derived = _takeaway_anchor_ms(f"{title} {summary}", anchor_text_pool)
-            if derived is not None:
-                start_ms = int(derived)
-                chapters_anchor_derived += 1
-            elif start_ms not in valid_anchors:
-                continue
-        # QSCOREFIX-1④（D-QS-12）：重复章节去重（实测 ≥3 对：微积分历史×2/
-        # 课程安排×2/习题×2）。归一化标题（空白/标点剥离+小写）精确同键保留
-        # 首现、丢后现——确定性规则不猜语义相似，宁漏勿错删。
-        dedupe_key = "".join(
-            char for char in title.lower() if char.isalnum() or "\u4e00" <= char <= "\u9fff"
-        )
-        if dedupe_key:
-            if dedupe_key in seen_chapter_titles:
-                chapters_dup_dropped += 1
-                continue
-            seen_chapter_titles.add(dedupe_key)
+        if start_ms not in valid_anchors:
+            continue
         chapters.append({
-            "title": title,
+            "title": str(item.get("title") or "").strip(),
             "start_ms": start_ms,
-            "summary": summary,
+            "summary": str(item.get("summary") or "").strip(),
         })
     # N5A-P2 顺风车校验（fail-closed 丢项，不失败摘要）：events 闭集+quote
     # 必须是 parts 拼接原文子串；takeaways 截断到 6 条、每条≤60 字。
@@ -2235,8 +2204,6 @@ def create_summary(
         f"events={len(events)} events_rejected={rejected} "
         f"takeaways={len(takeaways)} "
         f"takeaway_anchors={sum(1 for item in takeaway_anchors if item is not None)} "
-        f"chapters={len(chapters)} chapter_anchors_derived={chapters_anchor_derived} "
-        f"chapter_dup_dropped={chapters_dup_dropped} "
         f"knowledge_points={len(knowledge_points)} "
         f"citations_rejected={int(point_meta.get('rejected') or 0)} "
         f"thinking={deep_usage['thinking']} window_retries={window_retries} "

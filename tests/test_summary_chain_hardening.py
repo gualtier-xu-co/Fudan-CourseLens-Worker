@@ -9,7 +9,6 @@ thinking=提供商默认 enabled/high、窗口帽默认 8192、合并帽 12000�
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import unittest
@@ -256,89 +255,6 @@ class MergeRetryTests(unittest.TestCase):
                     create_summary("k", title="t", transcript=_transcript(10), ppt_pages=[])
         self.assertIn("merge response has an invalid shape", str(raised.exception))
         self.assertEqual(chat.call_count, 3)
-
-
-class ChapterAnchorRescueTests(unittest.TestCase):
-    """QSCOREFIX-1④（D-QS-9/12）：章节零锚本地拯救 + 重复标题去重。
-
-    评分卡实测 65/65 全零锚——根因=首段 0ms 使 0 ∈ start_ms 白名单，LLM
-    全零/缺省发射整批过门；重复章节 ≥3 对。钉四条：①后续章零锚走 Dice 派生
-    （同 takeaway 锚源与阈值，fail-closed：派生不出留 0 绝不编锚）；②白名单
-    外且派生失败维持既有丢项；③归一化标题同键保首现丢后现；④遥测计数。
-    首章 0 ∈ 白名单时保守保留（0 可能是合法讲首锚，不可凭空改写）。"""
-
-    @staticmethod
-    def _run(merge_payload, transcript=None, lines=None):
-        def fake_chat(api_key, messages, **kwargs):
-            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT:
-                return json.dumps(merge_payload)
-            return json.dumps(_part("part"))
-
-        with patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False):
-            with patch("courselens_worker.llm._chat", side_effect=fake_chat):
-                with contextlib.nullcontext() if lines is None else patch(
-                    "courselens_worker.llm._emit_telemetry", side_effect=lines.append
-                ):
-                    return create_summary(
-                        "k", title="t",
-                        transcript=_transcript(10) if transcript is None else transcript,
-                        ppt_pages=[],
-                    )
-
-    def test_later_zero_anchors_are_rescued_by_text_similarity(self):
-        lines: list[str] = []
-        merge = {
-            "markdown": "combined",
-            "chapters": [
-                {"title": "开场章", "summary": "起点", "start_ms": 0},
-                {"title": "第三章", "summary": "text-3 讲透了一个概念", "start_ms": 0},
-                {"title": "第五章", "summary": "text-5 的延伸", "start_ms": 0},
-            ],
-        }
-        result = self._run(merge, lines=lines)
-        self.assertEqual(
-            [item["start_ms"] for item in result["chapters"]],
-            [0, 3000, 5000],
-            "首章 0 保守保留；后续章零锚由转写原文相似度派生真锚",
-        )
-        final = [line for line in lines if line.startswith("stage=summary ")][0]
-        self.assertIn("chapters=3", final)
-        self.assertIn("chapter_anchors_derived=2", final)
-        self.assertIn("chapter_dup_dropped=0", final)
-
-    def test_out_of_whitelist_without_derivation_is_dropped(self):
-        transcript = [{"start_ms": 5_000, "end_ms": 6_000, "text": "text-5"}]
-        merge = {
-            "markdown": "combined",
-            "chapters": [
-                {"title": "有救章", "summary": "text-5 扩展", "start_ms": 999},
-                {"title": "无救章", "summary": "风马牛不相及的叙述", "start_ms": 999},
-            ],
-        }
-        result = self._run(merge, transcript=transcript)
-        self.assertEqual(
-            [item["title"] for item in result["chapters"]],
-            ["有救章"],
-            "白名单外派生成功→真锚；派生失败→维持 fail-closed 丢项",
-        )
-        self.assertEqual(result["chapters"][0]["start_ms"], 5_000)
-
-    def test_duplicate_normalized_titles_keep_first(self):
-        merge = {
-            "markdown": "combined",
-            "chapters": [
-                {"title": "微积分的历史", "summary": "text-1", "start_ms": 1_000},
-                {"title": "微积分 的 历史！", "summary": "text-2", "start_ms": 2_000},
-                {"title": "习题讲解", "summary": "text-3", "start_ms": 3_000},
-                {"title": "习题讲解。", "summary": "text-4", "start_ms": 4_000},
-            ],
-        }
-        result = self._run(merge)
-        self.assertEqual(
-            [item["title"] for item in result["chapters"]],
-            ["微积分的历史", "习题讲解"],
-            "归一化（空白/标点剥离）同键保留首现、丢后现",
-        )
 
 
 class UsageSinkTests(unittest.TestCase):
