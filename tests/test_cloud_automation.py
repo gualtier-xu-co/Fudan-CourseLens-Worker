@@ -277,7 +277,8 @@ class ScheduleGateTests(unittest.TestCase):
     """SMART-SCHED 智能门单元钉：激活矩阵/伪造时刻 fail-closed/窗匹配/fail-open/账面预检。
 
     门是预过滤器不是裁决器：秒退必须持肯定性空证据，一切不确定一律过门
-    （fail-open）；账面预检只读 completed/pending/baseline，恰一次语义零弱化。
+    （fail-open）；账面预检只读 completed/pending 台账（V010-SUBFIX-1 起
+    baseline 不再构成「已知」），恰一次语义零弱化。
     """
 
     def _moment(self, hour, minute):
@@ -402,12 +403,13 @@ class ScheduleGateTests(unittest.TestCase):
         connector = FakeConnector([], schedule_rows=[{**hit, "sub_id": ""}])
         gate_pass, _ = cloud_automation._gate_decision(connector, rules, self._state(), moment)
         self.assertTrue(gate_pass)
-        # 基线排除 → 已知 → 秒退。
+        # V010-SUBFIX-1：baseline 内但未完成/未在途 → 正是本窗要处理的工作 →
+        # 过门（基线不再是「已知」，存量讲次不因启用时刻被门吞掉）。
         baseline_rules = self._rules(baseline=["s-1"])
         connector = FakeConnector([], schedule_rows=[hit])
         gate_pass, stats = cloud_automation._gate_decision(connector, baseline_rules, self._state(), moment)
-        self.assertFalse(gate_pass)
-        self.assertEqual(stats["known"], 1)
+        self.assertTrue(gate_pass)
+        self.assertEqual(stats["known"], 0)
         # 已完成 → 已知 → 秒退。
         connector = FakeConnector([], schedule_rows=[hit])
         gate_pass, stats = cloud_automation._gate_decision(
@@ -782,13 +784,22 @@ class CloudAutomationTests(WorkerEnvTestCase):
         self.assertEqual(state["last_run"]["code"], "cloud_gate_time_invalid")
         self.assertEqual(state["last_run"]["counts"]["failed"], 1)
 
-    def test_selection_baseline_excludes_playable_and_releases_later_lectures(self):
-        """基线语义：选择时刻已可播放的讲次被排除；未列出/新讲次可播即合格。"""
+    def test_existing_playable_lectures_join_queue_then_stay_idempotent(self):
+        """V010-SUBFIX-1 存量语义：启用时已可播放的讲次（baseline 内）入队处
+        理一次；恰一次由 completed/pending 台账保证，与基线无关。"""
+        class EchoConnector(FakeConnector):
+            def media_source(self, course_id, sub_id):
+                super().media_source(course_id, sub_id)
+                return {"kind": "synthetic", "sub_id": sub_id}
+
         def run_with(courses, baseline):
             os.environ["COURSELENS_CLOUD_STATE_KEY"] = self.state_key
             os.environ["COURSELENS_CLOUD_DEEPSEEK_API_KEY"] = "sk-synthetic"
-            self.set_rules(make_rules(rules=[make_course_rule("36941", baseline=baseline)]))
-            connector = FakeConnector(courses)
+            self.set_rules(make_rules(
+                rules=[make_course_rule("36941", baseline=baseline)],
+                budget={"max_lectures": 5, "max_runner_minutes": 300, "max_deepseek_tokens": 100000},
+            ))
+            connector = EchoConnector(courses)
             processed = []
             def process(job, *, checkpoint_writer=None):
                 processed.append(job)
@@ -812,14 +823,26 @@ class CloudAutomationTests(WorkerEnvTestCase):
             {"sub_id": "l-new", "has_playback": True},
             {"sub_id": "l-future", "has_playback": False},
         ]}]
+        # ① 存量入队：启用时刻已可播放的 l-old（baseline 内）与 l-new 同权处理，
+        #    且拿完整无人值守包；l-future 不可播放不入队。
         code, processed = run_with(courses, baseline=["l-old"])
         self.assertEqual(code, 0)
-        # l-old excluded by the baseline; l-new processed; l-future unplayable.
-        self.assertEqual(len(processed), 1)
+        self.assertEqual(sorted(
+            str((job["payload"].get("media") or {}).get("sub_id") or "") for job in processed
+        ), ["l-new", "l-old"])
+        old_job = next(job for job in processed if (job["payload"]["media"] or {}).get("sub_id") == "l-old")
+        self.assertEqual(old_job["requested_outputs"], list(OUTPUT_BUNDLE))
 
-        # A listed lecture that could not play becomes eligible when it can:
-        # the next window discovers l-future now playable, and it is not in
-        # the baseline, so it runs.
+        # ② 幂等跳过：同样的目录再扫一遍，两个讲次都已在 completed 台账里，
+        #    绝不重跑（skipped_pending=2、discovered=0）。
+        code, processed = run_with(courses, baseline=["l-old"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(processed), 0)
+        state = self.read_persisted_state()
+        self.assertEqual(state["last_run"]["counts"]["skipped_pending"], 2)
+        self.assertEqual(state["last_run"]["counts"]["discovered"], 0)
+
+        # ③ 播放门保留：不可播放讲次在可播放出现的窗口变为合格并处理。
         courses_later = [{"course_id": "36941", "lectures": [
             {"sub_id": "l-future", "has_playback": True},
         ]}]
@@ -827,10 +850,60 @@ class CloudAutomationTests(WorkerEnvTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(processed), 1)
 
-        # A fresh generation that lists everything playable excludes all of it.
-        code, processed = run_with(courses_later, baseline=["l-future"])
+    def test_long_lecture_duration_cap_fits_run_window_not_old_default(self):
+        """V010-SUBFIX-1 长讲三分支：真实连堂课型（270min）入队；异常超长
+        defer；规则上限仍是下限（小单窗预算下更小规则值被尊重）。"""
+        def run_once(duration_seconds, *, max_minutes=240, budget=None):
+            os.environ["COURSELENS_CLOUD_STATE_KEY"] = self.state_key
+            os.environ["COURSELENS_CLOUD_DEEPSEEK_API_KEY"] = "sk-synthetic"
+            rule = make_course_rule("36941")
+            rule["max_lecture_minutes"] = max_minutes
+            self.set_rules(make_rules(
+                rules=[rule],
+                budget=budget or {"max_lectures": 2, "max_runner_minutes": 300, "max_deepseek_tokens": 100000},
+            ))
+            courses = [{"course_id": "36941", "lectures": [
+                {"sub_id": "l-long", "has_playback": True, "duration_seconds": duration_seconds},
+            ]}]
+            processed = []
+            def process(job, *, checkpoint_writer=None):
+                processed.append(job)
+                return {"outputs": {}, "metrics": {}}
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(unittest.mock.patch.object(
+                    cloud_automation, "cloud_session_from_environment",
+                    return_value=FakeConnector(courses),
+                ))
+                stack.enter_context(unittest.mock.patch.object(cloud_automation, "process_job", process))
+                stack.enter_context(unittest.mock.patch.object(
+                    cloud_automation, "usage_snapshot", return_value={"total_tokens": 0},
+                ))
+                code = cloud_automation.run_daily()
+            state = self.read_persisted_state()
+            return code, processed, state["last_run"]["counts"]
+
+        # ① 真实连堂课型：16219s=270.3min（SUBDIAG-1 实测课型），默认规则 240
+        #    + 默认单窗预算 300 → 有效上限 300 → 正常入队处理。
+        code, processed, counts = run_once(16219)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(processed), 1)
+        self.assertEqual(counts["deferred"], 0)
+
+        # ② 异常超长（720min，疑似未停止的全天流）：超出闭集顶 600 → defer。
+        code, processed, counts = run_once(43200)
         self.assertEqual(code, 0)
         self.assertEqual(len(processed), 0)
+        self.assertEqual(counts["deferred"], 1)
+
+        # ③ 规则上限=下限：小单窗预算（120min）下有效上限=max(240,120)=240，
+        #    250min 讲 defer、240min 整讲处理——更小规则值不被预算架空。
+        small_budget = {"max_lectures": 2, "max_runner_minutes": 120, "max_deepseek_tokens": 100000}
+        code, processed, counts = run_once(15000, budget=small_budget)
+        self.assertEqual(len(processed), 0)
+        self.assertEqual(counts["deferred"], 1)
+        code, processed, counts = run_once(14400, budget=small_budget)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(processed), 1)
 
     def test_fixed_bundle_outputs_and_checkpoint_resume(self):
         courses = [{"course_id": "36941", "lectures": [{"sub_id": "l-1", "has_playback": True}]}]

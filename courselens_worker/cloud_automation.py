@@ -15,10 +15,11 @@ only the exact signed rules envelope and its config hash.  Every run is bound
 to the exact expected protocol and verified config values before any school
 login; manual dispatch stays closed while automation is paused.  One selected
 course is one fixed output bundle (subtitle ASR, slide OCR, AI summary and
-chapters, Lecture IR/evidence); eligibility is decided by the client-captured
-selection baseline, while the completed-work identity binds account scope,
-course, lecture, output-bundle version and pipeline version so unrelated
-config changes never replay finished lectures.  Per-lecture stage progress is
+chapters, Lecture IR/evidence); every playable lecture of a selected course is
+eligible — including the lectures already playable when the course was enabled
+(enabling promises the full history; V010-SUBFIX-1) — while the completed-work
+identity binds account scope, course, lecture, output-bundle version and
+pipeline version so unrelated config changes never replay finished lectures.  Per-lecture stage progress is
 checkpointed into the encrypted state artifact so a retry reacquires fresh
 media URLs and resumes completed stages instead of restarting.
 
@@ -63,6 +64,10 @@ STATE_PREFIX = "courselens-cloud-state-"
 # outputs; quiz generation stays a manual, local action.
 OUTPUT_BUNDLE = ("subtitle", "ocr", "summary", "chapters")
 OUTPUT_BUNDLE_VERSION = "unattended-full.v1"
+
+# 长讲时长上限的闭集顶（V010-SUBFIX-1）：与客户端 max_lecture_minutes 校验
+# 上界（5..600）同源，兜底平台目录里的异常时长（如未停止的全天流）。
+LECTURE_DURATION_CAP_MAX_MINUTES = 600
 
 # A pending record from a crashed run blocks reprocessing for one day, then
 # the item becomes retryable again.
@@ -802,7 +807,9 @@ def _gate_decision(
     empty evidence — no selected course ends inside this window and no
     uncertain rows — and every uncertain or unknown-ledger row passes the
     gate (fail-open).  It reads the once-per-day ledgers only and never
-    writes seen/pending/baseline, so exactly-once semantics are untouched.
+    writes seen/pending, so exactly-once semantics are untouched.  Since
+    V010-SUBFIX-1 a baseline lecture is not "known": unless completed or
+    pending it is exactly the work this window should process.
     """
     stats = {"rows": 0, "matched": 0, "uncertain": 0, "known": 0}
     try:
@@ -843,21 +850,15 @@ def _gate_decision(
         sub_id = str(row.get("sub_id") or "")
         if not sub_id:
             return True, stats
-        rule = rule_map[str(row.get("course_id") or "")]
-        baseline = {
-            str(item) for item in list(rule.get("baseline") or [])
-            if str(item or "").strip()
-        }
-        if sub_id in baseline:
-            stats["known"] += 1
-            continue
+        # V010-SUBFIX-1：baseline 不再构成「已知」——存量讲次除非已完成或在
+        # 途，否则正是本窗要处理的工作，必须过门。
         item_key = _dedupe_key(rules, str(row.get("course_id") or ""), sub_id)
         if item_key in completed or item_key in pending:
             stats["known"] += 1
             continue
         return True, stats
-    # Every matched row is already completed, pending, or baseline-excluded:
-    # positive evidence the pipeline would process nothing new.
+    # Every matched row is already completed or pending: positive evidence the
+    # pipeline would process nothing new.
     return False, stats
 
 
@@ -935,20 +936,16 @@ def run_daily() -> int:
             if course_id not in rule_map:
                 continue
             rule = rule_map[course_id]
-            baseline = {
-                str(item) for item in list(rule.get("baseline") or [])
-                if str(item or "").strip()
-            }
             for lecture in list(course.get("lectures") or []):
                 sub_id = str(lecture.get("sub_id") or "")
                 # Playback gate: a listed lecture that cannot play at this
                 # window becomes eligible exactly when playback appears.
                 if not sub_id or not lecture.get("has_playback"):
                     continue
-                # Selection baseline: lectures already playable at the
-                # selection instant stay excluded for this generation.
-                if sub_id in baseline:
-                    continue
+                # V010-SUBFIX-1（SUBDIAG-1 定谳）：启用自动整理的意图=处理全部
+                # 历史讲次，含启用时刻已可播放的存量讲次。旧的 baseline 永久
+                # 排除是语义反转（自动无路+手动无门死锁）；恰一次由 completed/
+                # pending 台账保证，与基线无关。
                 requested = list(OUTPUT_BUNDLE)
                 item_key = _dedupe_key(rules, course_id, sub_id)
                 if item_key in completed or item_key in pending_keys:
@@ -1001,7 +998,20 @@ def run_daily() -> int:
                 code = "deepseek_circuit_open"
                 continue
             duration = int(lecture.get("duration_seconds") or 0)
-            if duration and duration > int(rule.get("max_lecture_minutes") or 240) * 60:
+            # V010-SUBFIX-1 长讲上限（SUBDIAG-1 定谳）：上限的保护面=「整个单窗
+            # 预算都装不下的讲次」——预算只在讲次间检查，开工后装不下=24h
+            # pending 停滞。实测处理时长远小于讲次时长（4.5h 连堂讲在同一
+            # Actions 环全管线 ≈29min），旧默认 240min 曾把 267-270min 真实连堂
+            # 课型永久 defer。有效上限=max(规则上限, 单窗预算)，再以闭集顶
+            # 600min 兜底异常时长；规则值仍为下限（显式配置不被架空）。
+            duration_cap_minutes = min(
+                max(
+                    int(rule.get("max_lecture_minutes") or 240),
+                    int(limits.get("max_runner_minutes") or 300),
+                ),
+                LECTURE_DURATION_CAP_MAX_MINUTES,
+            )
+            if duration and duration > duration_cap_minutes * 60:
                 counts["deferred"] += 1
                 continue
             remember_pending(course_id, sub_id, item_key)
