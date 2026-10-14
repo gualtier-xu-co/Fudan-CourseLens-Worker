@@ -62,14 +62,17 @@ def make_rules(*, rules=None, config_hash="d" * 64, account_id="2020001", budget
     }
 
 
-def make_course_rule(course_id="36941", *, baseline=None, priority=50):
-    return {
+def make_course_rule(course_id="36941", *, baseline=None, cascade_skip=None, priority=50):
+    rule = {
         "course_id": course_id,
         "priority": priority,
         "max_lecture_minutes": 240,
         "selection_generation": 1,
         "baseline": list(baseline or []),
     }
+    if cascade_skip is not None:
+        rule["cascade_skip"] = list(cascade_skip)
+    return rule
 
 
 class FakeConnector:
@@ -486,7 +489,7 @@ class CloudAutomationTests(WorkerEnvTestCase):
         self.assertTrue(_rules_need_ai({"rules": [make_course_rule()]}))
         self.assertFalse(_rules_need_ai({"rules": []}))
 
-    def test_rules_envelope_must_be_v3_with_trusted_config_hash(self):
+    def test_rules_envelope_must_be_v3_or_v4_with_trusted_config_hash(self):
         self.set_rules({"schema": "cloud-automation.v2", "config_hash": "d" * 64})
         with self.assertRaises(cloud_automation.CloudAutomationError) as caught:
             cloud_automation._rules()
@@ -499,6 +502,25 @@ class CloudAutomationTests(WorkerEnvTestCase):
         with self.assertRaises(cloud_automation.CloudAutomationError) as caught:
             cloud_automation._rules()
         self.assertEqual(caught.exception.code, "cloud_rules_invalid")
+        # cascade_skip 与 baseline 同形同界：401/课与 2001 总量都拒绝；坏行拒绝。
+        oversize_skip = make_course_rule(cascade_skip=[f"l-{index:04d}" for index in range(401)])
+        self.set_rules(make_rules(rules=[oversize_skip]))
+        with self.assertRaises(cloud_automation.CloudAutomationError) as caught:
+            cloud_automation._rules()
+        self.assertEqual(caught.exception.code, "cloud_rules_invalid")
+        total = make_course_rule(cascade_skip=[f"l-{index:04d}" for index in range(1000)])
+        self.set_rules(make_rules(rules=[
+            total, dict(total, course_id="36942"), dict(total, course_id="36943"),
+        ]))
+        with self.assertRaises(cloud_automation.CloudAutomationError):
+            cloud_automation._rules()
+        bad_row = make_course_rule(cascade_skip=[""])
+        self.set_rules(make_rules(rules=[bad_row]))
+        with self.assertRaises(cloud_automation.CloudAutomationError):
+            cloud_automation._rules()
+        # 两个协议代都接受（v3=老客户端信封，v4=级联显式语义）。
+        self.set_rules({"schema": "cloud-automation.v3", "config_hash": "d" * 64, "rules": []})
+        self.assertEqual(cloud_automation._rules()["schema"], "cloud-automation.v3")
         self.set_rules(make_rules())
         self.assertEqual(cloud_automation._rules()["schema"], RULES_SCHEMA)
 
@@ -849,6 +871,152 @@ class CloudAutomationTests(WorkerEnvTestCase):
         code, processed = run_with(courses_later, baseline=["l-old"])
         self.assertEqual(code, 0)
         self.assertEqual(len(processed), 1)
+
+    def _run_cascade_with(self, rules, *, connector=None, env=None):
+        """One run_daily pass with an explicit rules envelope; returns (code, processed)."""
+        os.environ["COURSELENS_CLOUD_STATE_KEY"] = self.state_key
+        os.environ["COURSELENS_CLOUD_DEEPSEEK_API_KEY"] = "sk-synthetic"
+        self.set_rules(rules)
+        if connector is None:
+            class EchoConnector(FakeConnector):
+                def media_source(self, course_id, sub_id):
+                    super().media_source(course_id, sub_id)
+                    return {"kind": "synthetic", "sub_id": sub_id}
+            connector = EchoConnector([{"course_id": "36941", "lectures": [
+                {"sub_id": "l-done", "has_playback": True},
+                {"sub_id": "l-open", "has_playback": True},
+            ]}])
+        processed = []
+        def process(job, *, checkpoint_writer=None):
+            processed.append(job)
+            return {"outputs": {}, "metrics": {}}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(unittest.mock.patch.dict(os.environ, dict(env or {})))
+            stack.enter_context(unittest.mock.patch.object(
+                cloud_automation, "cloud_session_from_environment", return_value=connector,
+            ))
+            stack.enter_context(unittest.mock.patch.object(cloud_automation, "process_job", process))
+            stack.enter_context(unittest.mock.patch.object(
+                cloud_automation, "usage_snapshot", return_value={"total_tokens": 0},
+            ))
+            code = cloud_automation.run_daily()
+        # 各腿状态隔离：不上传 state artifact（下一腿从零账起算），磁盘上的
+        # state 仅供 read_persisted_state 断言当腿计数。
+        return code, processed
+
+    def test_v4_cascade_skip_and_v3_fallback_truth_chain(self):
+        """V010-CASCADE-1 R1 真值链：语义由信封 schema 显式承载。
+
+        ① v3 旧信封（老客户端契约）回退 baseline 排除旧语义——l-done 被排除、
+           l-open 处理，绝不因新 worker 而改变老客户端已验证的行为；
+        ② v4 显式 cascade_skip=客户端申明产物已齐——l-done 走 skipped_cascade
+           诚实计数、零预算消耗，l-open 正常入队拿完整无人值守包；
+        ③ v4 信封里的遗留 baseline 行被忽略（v4 只认 cascade_skip）——升级后
+           未重算的旧行不会把历史讲次重新排除（自动无路死锁不回归）。
+        """
+        budget = {"max_lectures": 5, "max_runner_minutes": 300, "max_deepseek_tokens": 100000}
+        v3_rules = {
+            "schema": "cloud-automation.v3", "config_hash": "d" * 64,
+            "account_id": "2020001", "budget": budget,
+            "rules": [make_course_rule("36941", baseline=["l-done"])],
+        }
+        # 老客户端一致配对：v3 信封 + env=v3（setUp 缺省 env 是 v4）。
+        code, processed = self._run_cascade_with(
+            v3_rules, env={"COURSELENS_CLOUD_EXPECTED_PROTOCOL_VERSION": "cloud-automation.v3"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([str((job["payload"].get("media") or {}).get("sub_id")) for job in processed], ["l-open"])
+
+        v4_rules = {
+            "schema": RULES_SCHEMA, "config_hash": "e" * 64,
+            "account_id": "2020001", "budget": budget,
+            "rules": [make_course_rule("36941", cascade_skip=["l-done"])],
+        }
+        code, processed = self._run_cascade_with(
+            v4_rules, env={"COURSELENS_CLOUD_EXPECTED_CONFIG_HASH": "e" * 64},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([str((job["payload"].get("media") or {}).get("sub_id")) for job in processed], ["l-open"])
+        state = self.read_persisted_state()
+        self.assertEqual(state["last_run"]["counts"]["skipped_cascade"], 1)
+        self.assertEqual(state["last_run"]["counts"]["discovered"], 1)
+        open_job = processed[0]
+        self.assertEqual(open_job["requested_outputs"], list(OUTPUT_BUNDLE))
+        # 处理管线盖章冻结在 v3 身份上：协议升级绝不改写产物管线身份。
+        self.assertEqual(open_job["pipeline"]["version"], "cloud-automation.v3")
+
+        stale_rules = {
+            "schema": RULES_SCHEMA, "config_hash": "f" * 64,
+            "account_id": "2020001", "budget": budget,
+            "rules": [make_course_rule("36941", baseline=["l-done", "l-open"])],
+        }
+        code, processed = self._run_cascade_with(
+            stale_rules, env={"COURSELENS_CLOUD_EXPECTED_CONFIG_HASH": "f" * 64},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(
+            str((job["payload"].get("media") or {}).get("sub_id")) for job in processed
+        ), ["l-done", "l-open"])
+
+    def test_v4_cascade_skip_counts_as_gate_known_and_binding_cross_pair_fails(self):
+        """门面已知语义+协议/env 交叉配对 fail-closed。"""
+        budget = {"max_lectures": 5, "max_runner_minutes": 300, "max_deepseek_tokens": 100000}
+        rules = {
+            "schema": RULES_SCHEMA, "config_hash": "d" * 64,
+            "account_id": "2020001", "budget": budget,
+            "rules": [make_course_rule("36941", cascade_skip=["l-1"])],
+        }
+        # 精确端时刻 10:10，gate 时刻 10:40（offset 30）→ 唯一命中行。
+        rows = [{
+            "course_id": "36941", "date": "2026-10-06", "sub_id": "l-1",
+            "end_precise": datetime(2026, 10, 6, 10, 10, tzinfo=GATE_TZ),
+        }]
+        connector = FakeConnector([], schedule_rows=rows)
+        fixed = datetime(2026, 10, 6, 10, 40, tzinfo=GATE_TZ)
+        with unittest.mock.patch.object(cloud_automation, "_gate_now", return_value=fixed):
+            code, processed = self._run_cascade_with(rules, connector=connector)
+        # 唯一命中行已被 cascade_skip 申明=正性空证据的一部分 → 门秒退。
+        self.assertEqual(code, 0)
+        self.assertEqual(processed, [])
+        state = self.read_persisted_state()
+        self.assertEqual(state["last_run"]["code"], "cloud_gate_skipped")
+        self.assertEqual(state["last_run"]["counts"]["discovered"], 0)
+
+        # 协议/env 交叉配对 fail-closed：v4 信封 + env=v3（或反向）都是
+        # cloud_protocol_mismatch，绝不带着错配的语义跑真登录。
+        v3_env = {"COURSELENS_CLOUD_EXPECTED_PROTOCOL_VERSION": "cloud-automation.v3"}
+        code, _ = self._run_cascade_with(rules, env=v3_env)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_persisted_state()["last_run"]["code"], "cloud_protocol_mismatch")
+        v3_rules = dict(rules, schema="cloud-automation.v3")
+        code, _ = self._run_cascade_with(v3_rules)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_persisted_state()["last_run"]["code"], "cloud_protocol_mismatch")
+        # 一致的老配对（v3 env + v3 信封）照常过绑定进候选链。
+        code, processed = self._run_cascade_with(v3_rules, env=v3_env)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(processed), 2)  # v3 无 baseline 行=无排除，全部入队
+
+    def test_dedupe_identity_frozen_across_protocol_bump(self):
+        """恰一次账身份跨 v3→v4 不变：升级绝不把已完成台账变成重放。"""
+        budget = {"max_lectures": 5, "max_runner_minutes": 300, "max_deepseek_tokens": 100000}
+        v3 = {
+            "schema": "cloud-automation.v3", "config_hash": "d" * 64,
+            "account_id": "2020001", "budget": budget, "rules": [],
+        }
+        v4 = {
+            "schema": "cloud-automation.v4", "config_hash": "e" * 64,
+            "account_id": "2020001", "budget": budget, "rules": [],
+        }
+        self.assertEqual(
+            _dedupe_key(v3, "36941", "l-1"),
+            _dedupe_key(v4, "36941", "l-1"),
+        )
+        # 账号仍是身份的一部分（跨账号永不共享完成账）。
+        self.assertNotEqual(
+            _dedupe_key(v4, "36941", "l-1"),
+            _dedupe_key(dict(v4, account_id="2020002"), "36941", "l-1"),
+        )
 
     def test_long_lecture_duration_cap_fits_run_window_not_old_default(self):
         """V010-SUBFIX-1 长讲三分支：真实连堂课型（270min）入队；异常超长
