@@ -285,7 +285,7 @@ class PlatformSessionTests(unittest.TestCase):
         self.assertEqual(request.kwargs["timeout"], (5, 15))
 
     def test_webvpn_authorized_request_omits_bearer_when_token_carrier_absent(self):
-        # PLATFORM-REWORK 形态钉（2026-10-07 run 37557294406 闭集定谳）：
+        # PLATFORM-REWORK 形态钉（2026-10-07 内部 workflow run 闭集定谳）：
         # wengine 网关把 origin cookie 服务端映射，webvpn 会话罐内恒无
         # _token serialized 载体；authorization_required 请求此时必须省略
         # Authorization 头照发（走登录时 _verify_course 已上游验证的会话

@@ -1415,7 +1415,7 @@ class VerifyAiProbeTests(unittest.TestCase):
     背景：deepseek-flash（09-21 e6cb675 起）为思考档模型，_chat 缺省不带
     thinking 字段=提供商默认 enabled/high，思考 token 计入 max_tokens 预算
     → 原 max_tokens=8 探针被思考耗尽、content 空 → deepseek_verification_
-    failed（verify workflow run 37288805260 根因）。钉面经完整 _chat 传输链：
+    failed（内部 verify workflow run 实证根因）。钉面经完整 _chat 传输链：
     探针载荷必须显式 thinking={"type": "disabled"} + max_tokens=32；思考档
     usage 记账形态（reasoning_tokens>0）+content="OK" 通过；截断空 content
     按既有闭集码诚实失败。

@@ -19,7 +19,7 @@ from courselens_worker.llm import (
     _SUMMARY_MERGE_MAX_TOKENS,
     _SUMMARY_WINDOW_MAX_TOKENS,
     _SUMMARY_WINDOW_PROMPT,
-    _SUMMARY_MERGE_PROMPT,
+    _SUMMARY_MERGE_PROMPT_TEACHING,
     REVIEW_VIEWS_ENV,
     SUMMARY_THINKING,
     SUMMARY_THINKING_ENV,
@@ -68,11 +68,11 @@ class ThinkingTierTests(unittest.TestCase):
         def fake_chat(api_key, messages, **kwargs):
             system = messages[0]["content"]
             captured.append({
-                "merge": system == _SUMMARY_MERGE_PROMPT,
+                "merge": system == _SUMMARY_MERGE_PROMPT_TEACHING,
                 "thinking": kwargs.get("thinking"),
                 "max_tokens": kwargs.get("max_tokens"),
             })
-            if system == _SUMMARY_MERGE_PROMPT:
+            if system == _SUMMARY_MERGE_PROMPT_TEACHING:
                 return json.dumps({"markdown": "combined", "chapters": []})
             return json.dumps(_part("part"))
 
@@ -94,7 +94,7 @@ class ThinkingTierTests(unittest.TestCase):
         captured: list[int] = []
 
         def fake_chat(api_key, messages, **kwargs):
-            if messages[0]["content"] != _SUMMARY_MERGE_PROMPT:
+            if messages[0]["content"] != _SUMMARY_MERGE_PROMPT_TEACHING:
                 captured.append(int(kwargs.get("max_tokens") or 0))
                 return json.dumps(_part("part"))
             return json.dumps({"markdown": "combined", "chapters": []})
@@ -146,7 +146,7 @@ class WindowRetryTests(unittest.TestCase):
         def fake_chat(api_key, messages, **kwargs):
             system = messages[0]["content"]
             user = messages[1]["content"]
-            if system == _SUMMARY_MERGE_PROMPT:
+            if system == _SUMMARY_MERGE_PROMPT_TEACHING:
                 calls.append("merge")
                 return merge_response
             calls.append("a" if "text-0\"" in user[:400] else "b")
@@ -199,7 +199,7 @@ class WindowRetryTests(unittest.TestCase):
 
     def test_all_windows_skipped_fails_closed(self):
         def fake_chat(api_key, messages, **kwargs):
-            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT:
+            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
                 return json.dumps({"markdown": "combined", "chapters": []})
             return json.dumps({"markdown": "", "chapters": []})
 
@@ -220,7 +220,7 @@ class MergeRetryTests(unittest.TestCase):
         calls = {"n": 0}
 
         def fake_chat(api_key, messages, **kwargs):
-            if messages[0]["content"] != _SUMMARY_MERGE_PROMPT:
+            if messages[0]["content"] != _SUMMARY_MERGE_PROMPT_TEACHING:
                 return json.dumps(_part(f"part-{calls['n']}"))
             response = merge_responses[min(calls["n"], len(merge_responses) - 1)]
             calls["n"] += 1
@@ -270,7 +270,7 @@ class ChapterAnchorRescueTests(unittest.TestCase):
     @staticmethod
     def _run(merge_payload, transcript=None, lines=None):
         def fake_chat(api_key, messages, **kwargs):
-            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT:
+            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
                 return json.dumps(merge_payload)
             return json.dumps(_part("part"))
 
@@ -353,7 +353,7 @@ class UsageSinkTests(unittest.TestCase):
                 "reasoning_tokens": 30, "prompt_cache_hit_tokens": 64,
                 "latency_ms": 900, "thinking": None,
             })
-            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT:
+            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
                 return json.dumps({"markdown": "combined", "chapters": []})
             return json.dumps(_part("part"))
 
@@ -386,7 +386,7 @@ class UsageSinkTests(unittest.TestCase):
                 "reasoning_tokens": 0, "prompt_cache_hit_tokens": 0,
                 "latency_ms": 100, "thinking": None,
             })
-            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT:
+            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
                 return json.dumps({"markdown": "m", "chapters": []})
             return json.dumps(_part("part"))
 

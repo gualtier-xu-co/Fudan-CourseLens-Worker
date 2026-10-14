@@ -1104,7 +1104,7 @@ class PlatformSession:
                 # 头走已验证的 webvpn 会话 cookie。runner 的 schedule 触发形态
                 # 下罐内恒无载体，旧「懒提取硬失败」曾把门腿与发现腿双双打成
                 # platform_session_rejected 的 course_ticket_follow_direct 塌缩
-                # 码（2026-10-07 run 37557294406 闭集定谳，verify 链从不发
+                # 码（2026-10-07 内部 workflow run 闭集定谳，verify 链从不发
                 # authorization_required 请求故恒 PASS 的形态差）。direct 会话
                 # 仍强制 bearer（该路径唯一凭证）。
                 bearer = self._optional_course_bearer(self.session)

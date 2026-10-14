@@ -1,6 +1,6 @@
 {
   "exporter": {
-    "allowlist_sha256": "5629b9df0339179885db27c6bfc4493efb6783bf73c2a20916ca9b304cce94c4",
+    "allowlist_sha256": "e31d082e687ae879307747a9aa27dbd0f756e4386374d9f8c772aea24132c4af",
     "version": "1.0.0"
   },
   "payload": {
@@ -152,8 +152,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/llm.py",
-        "sha256": "daece36b3704854ffa0838abdb0876deff8681b6697ee230fffaa2df73cb88fd",
-        "size": 142376
+        "sha256": "0519340be5650b9aba92b401cdcebf3c669606f83860c7a50e21f334bc496045",
+        "size": 146563
       },
       {
         "mode": "100644",
@@ -170,8 +170,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/platform_session.py",
-        "sha256": "f9a2572405d0323a08b53f26c76fd2da0bdf6d39d5a4bdb8a50a220be4a5eefd",
-        "size": 78942
+        "sha256": "6e832350056806ca7324c1f5b2f885a7fa9a1cde72c27036f4e337267b00a9a0",
+        "size": 78946
       },
       {
         "mode": "100644",
@@ -380,14 +380,14 @@
       {
         "mode": "100644",
         "path": "tests/test_cloud_automation.py",
-        "sha256": "e262769299c2b35d9ea34c0ca722b96480c311b37d8feed1510808897caf0944",
-        "size": 75896
+        "sha256": "96b9e04c25c4e6909321ef463f17d3c3ea316dac702cab3e4cddf765c48b0647",
+        "size": 75897
       },
       {
         "mode": "100644",
         "path": "tests/test_course_knowledge.py",
-        "sha256": "61d9b1895415a5f3e9176e31e3d2f2247e3b86deeb37c71a03b40efa6b158ce8",
-        "size": 54256
+        "sha256": "f7dadd9c50818f227a88b5d599f0e7e6cdfbb1dbbf48a8ce07717ec0290580a1",
+        "size": 54525
       },
       {
         "mode": "100644",
@@ -440,14 +440,14 @@
       {
         "mode": "100644",
         "path": "tests/test_llm_transport_session.py",
-        "sha256": "0a4234d67be9b04736e72b7c2355f4a2491193a07210ef3613a0604e6312a4ba",
-        "size": 7652
+        "sha256": "73ba3d54c1a0c961b09b88b0b63a21f2aef6a3df2b9c34c9179cacbcbdaf2df7",
+        "size": 7679
       },
       {
         "mode": "100644",
         "path": "tests/test_llm_window_progress.py",
-        "sha256": "9aa69d2c14d663453aaa4cdb188f03d4c7ae7ee7585653d6ca860d5c07d9bf3a",
-        "size": 8174
+        "sha256": "aabb759b5c309d49386e88f334c7a0a6edde93538edf75b766c4b7935a237bf4",
+        "size": 8192
       },
       {
         "mode": "100644",
@@ -500,8 +500,8 @@
       {
         "mode": "100644",
         "path": "tests/test_platform_session.py",
-        "sha256": "610e7fed16fdfb4c6663e50d8eccb1d02bda02188de178e20ddb4e692de51067",
-        "size": 84600
+        "sha256": "b13156d033a1c75044bdc38c5e2609a744f1b5296946686caa26365a1e895cc3",
+        "size": 84604
       },
       {
         "mode": "100644",
@@ -524,14 +524,14 @@
       {
         "mode": "100644",
         "path": "tests/test_quality_judge.py",
-        "sha256": "5cc118527832c60c8a17b8333ef4fe175cf8a3deadc29481001f823fade924f8",
-        "size": 44979
+        "sha256": "fc6ae94c552e68dcb5bc0916a9f232b79f0f1e2b8a239f91104cf6d38169221b",
+        "size": 45184
       },
       {
         "mode": "100644",
         "path": "tests/test_review_views.py",
-        "sha256": "217894de75e1df2f8a8309b89d090a38afe4aa6e7b7e4786f2afb4e69da24be2",
-        "size": 20761
+        "sha256": "8eeb8ecd6dbd671ff5ca69e7b7e358c628d12f20dc451a5c05d77f6a2d45584a",
+        "size": 20814
       },
       {
         "mode": "100644",
@@ -556,6 +556,12 @@
         "path": "tests/test_source.py",
         "sha256": "04ea68838e56da49905c23c1d32f37a9edae1bab222f1db271dcaad553adee86",
         "size": 19028
+      },
+      {
+        "mode": "100644",
+        "path": "tests/test_stem_teaching_prompts.py",
+        "sha256": "a7e37a146ed433b9ad573392119a000b4ef11e966ebec4434de0d5e713002ac8",
+        "size": 10855
       },
       {
         "mode": "100644",
@@ -596,14 +602,14 @@
       {
         "mode": "100644",
         "path": "tests/test_subtitle_summary_usage_ledger.py",
-        "sha256": "1fc81b5fa2d348464e03ff079190e53042487ae8b781cd9fd86fef61db535589",
-        "size": 8475
+        "sha256": "a0fd8aa680ee2a28551674dcffb5582c3626b718846e69fa6a22f79993273ef7",
+        "size": 8484
       },
       {
         "mode": "100644",
         "path": "tests/test_summary_chain_hardening.py",
-        "sha256": "71025879c74f86958a4b8399ad0486f86994dbbc5de0824b315954449b5579e1",
-        "size": 19225
+        "sha256": "1707834f3102f11ddc4fb69170edf72c242cc44308c3841906c22cbc29d51409",
+        "size": 19315
       },
       {
         "mode": "100644",
@@ -644,8 +650,8 @@
       {
         "mode": "100644",
         "path": "tests/test_v4nonthink.py",
-        "sha256": "99cd32a7b576ad1f6575f9420634fbbabeefbe95452bba1b971bf1fd882c9658",
-        "size": 24191
+        "sha256": "fe5e6813f81340160f4bd3f9c2b5dd8b2965b91bc044261be34f3843f4997423",
+        "size": 24461
       },
       {
         "mode": "100644",
@@ -660,8 +666,8 @@
         "size": 10522
       }
     ],
-    "git_tree": "9753b24681652b0f89fbf13c30841cf7d5e5ef6e",
-    "tree_sha256": "0f62287b5cb80ba5ac7b76164db8da2dff55fab9ae619799ae5301add1b4cf65"
+    "git_tree": "fa3d0561a32879898d1f98093cad4938c5226b0a",
+    "tree_sha256": "5000dcc252087bb0bfefe5d8fba69c35f916fed5834442b364da81b3e5b3c69c"
   },
   "protocol": {
     "supported_versions": [
@@ -670,8 +676,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "91bf0e3b97213cdd5d2c582a408176908417bb40",
+    "commit": "c4ab59bab98648d6e0e9ac0e6a6188c77d079edf",
     "repository": "gualtier-xu-co/Fudan-CourseLens-Private",
-    "worker_tree": "f139f8e04436c1e694addd646966798591c14f8a"
+    "worker_tree": "2963375e331a89bd349184c2e77d11cb56f0afd4"
   }
 }
