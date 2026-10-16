@@ -1704,16 +1704,10 @@ def transcribe(
                     f"reason=media_prefetch_incomplete elapsed={_elapsed_ticks()}"
                 )
                 time.sleep(_MEDIA_RETRY_BACKOFF_SECONDS[0])
-                # R5-WORKERFIX（2026-10-14，37355/39178 批量尾段败定谳）：此处
-                # 曾传 elapsed=_elapsed_ticks()——把调用结果（int）当回调传入，
-                # 梯内首次遇到可重试闭集码时遥测行 elapsed() 即抛
-                # TypeError: 'int' object is not callable：既掩盖真实闭集码，
-                # 又从 except 处理器内炸出、跳过剩余退避重试（瞬态刷新失败
-                # 被升格成整单即死）。传回调本体，梯语义按 P55 原设计生效。
                 _refresh_media_authorization(
                     proxy,
                     chunk=completed_chunks,
-                    elapsed=_elapsed_ticks,
+                    elapsed=_elapsed_ticks(),
                     label="face=prefetch",
                 )
                 _prefetch_media_pcm(proxy.url, full_pcm, duration=duration)

@@ -4,29 +4,21 @@ All platform access is delegated to ``platform_session``.  This module keeps
 only encrypted incremental state and encrypted result envelopes in Actions
 artifacts.  Public logs contain closed-set codes, counts, stages and timing.
 
-The ``cloud-automation.v4`` contract fixes the schedule on the client side
+The ``cloud-automation.v3`` contract fixes the schedule on the client side
 (weekday class-grid cron points shortly after each standard period ends plus
 a nightly 22:00 Asia/Shanghai fallback).  Each daytime scheduled run first
 passes a bounded schedule gate (SMART-SCHED): with positive empty evidence —
 no selected course ends within the window and no uncertain rows — the run
 skips discovery honestly (``cloud_gate_skipped``); every uncertain or
 unknown-ledger row passes the gate (fail-open).  The worker trusts
-only the exact signed rules envelope and its config hash.  v4 makes the
-cascade semantics explicit: every playable lecture of a selected course is
-eligible — including the lectures already playable when the course was
-enabled (enabling promises the full history) — while each rule carries a
-client-computed ``cascade_skip`` list (lectures whose local artifacts are
-already complete) so the budget is spent only on lectures that still lack
-outputs.  A legacy ``v3`` envelope (an old client) keeps the historical
-baseline-exclusion semantics; the schema field carries the semantics, so a
-missing field is never a signal.  The completed-work identity and every
-output stamp stay bound to the frozen processing-pipeline identity across
-the protocol bump, so finished lectures and imported summaries never replay
-because of an upgrade.  Every run is bound
+only the exact signed rules envelope and its config hash.  Every run is bound
 to the exact expected protocol and verified config values before any school
 login; manual dispatch stays closed while automation is paused.  One selected
 course is one fixed output bundle (subtitle ASR, slide OCR, AI summary and
-chapters, Lecture IR/evidence); per-lecture stage progress is
+chapters, Lecture IR/evidence); eligibility is decided by the client-captured
+selection baseline, while the completed-work identity binds account scope,
+course, lecture, output-bundle version and pipeline version so unrelated
+config changes never replay finished lectures.  Per-lecture stage progress is
 checkpointed into the encrypted state artifact so a retry reacquires fresh
 media URLs and resumes completed stages instead of restarting.
 
@@ -63,17 +55,7 @@ from .runner import process_job, safe_worker_error_detail
 
 
 STATE_SCHEMA = "cloud.state.v1"
-RULES_SCHEMA = "cloud-automation.v4"
-# 协议载体闭集（V010-CASCADE-1）：v4=显式级联语义（cascade_skip=客户端申明
-# 本地产物已齐的讲次，预算只花在缺产物讲次上）；v3=旧信封（老客户端），
-# 回退 baseline 排除旧语义不回归（设计 R1）。语义由 schema 字段显式承载，
-# 字段缺席永远不是信号。
-_RULES_SCHEMAS = ("cloud-automation.v3", "cloud-automation.v4")
-# 恰一次账与产物盖章的管线身份（冻结，V010-CASCADE-1）：v3→v4 只反转「哪些
-# 讲次进候选」的选择语义，处理管线与输出包（unattended-full.v1）未变——
-# dedupe 键、job/result 的 pipeline 盖章、courseware_plan.pipeline 都锚在
-# 本身份上，已完成讲次与已导入总结永不因协议升级重跑/重复导入。
-PIPELINE_IDENTITY = "cloud-automation.v3"
+RULES_SCHEMA = "cloud-automation.v3"
 RESULT_PREFIX = "courselens-cloud-result-"
 STATE_PREFIX = "courselens-cloud-state-"
 
@@ -81,10 +63,6 @@ STATE_PREFIX = "courselens-cloud-state-"
 # outputs; quiz generation stays a manual, local action.
 OUTPUT_BUNDLE = ("subtitle", "ocr", "summary", "chapters")
 OUTPUT_BUNDLE_VERSION = "unattended-full.v1"
-
-# 长讲时长上限的闭集顶（V010-SUBFIX-1）：与客户端 max_lecture_minutes 校验
-# 上界（5..600）同源，兜底平台目录里的异常时长（如未停止的全天流）。
-LECTURE_DURATION_CAP_MAX_MINUTES = 600
 
 # A pending record from a crashed run blocks reprocessing for one day, then
 # the item becomes retryable again.
@@ -278,47 +256,23 @@ def _rules() -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise CloudAutomationError("cloud_rules_invalid") from exc
     raw = ""
-    if not isinstance(value, dict) or str(value.get("schema") or "") not in _RULES_SCHEMAS:
+    if not isinstance(value, dict) or value.get("schema") != RULES_SCHEMA:
         raise CloudAutomationError("cloud_rules_invalid")
     if not str(value.get("config_hash") or ""):
         raise CloudAutomationError("cloud_rules_invalid")
     total_baseline = 0
-    total_skipped = 0
     for item in list(value.get("rules") or []):
         if not isinstance(item, dict):
             raise CloudAutomationError("cloud_rules_invalid")
         baseline = list(item.get("baseline") or [])
-        skipped = list(item.get("cascade_skip") or [])
-        # cascade_skip 与 baseline 同形同界：有界不透明 sub_id 列表
-        # （≤400/课程、总量 ≤2000），校验面零新增。
-        if len(baseline) > 400 or len(skipped) > 400:
+        if len(baseline) > 400:
             raise CloudAutomationError("cloud_rules_invalid")
-        if any(
-            not str(row or "").strip() or len(str(row)) > PLAN_RECORD_ID_MAX_LENGTH
-            for row in baseline + skipped
-        ):
+        if any(not str(row or "").strip() or len(str(row)) > PLAN_RECORD_ID_MAX_LENGTH for row in baseline):
             raise CloudAutomationError("cloud_rules_invalid")
         total_baseline += len(baseline)
-        total_skipped += len(skipped)
-    if total_baseline > 2000 or total_skipped > 2000:
+    if total_baseline > 2000:
         raise CloudAutomationError("cloud_rules_invalid")
     return value
-
-
-def _selection_skip_ids(schema: str, rule: dict[str, Any]) -> set[str]:
-    """Per-course already-known lecture ids, by explicit envelope schema.
-
-    v4 cascade semantics: the client declares which lectures already have
-    complete local artifacts (``cascade_skip``).  A legacy v3 envelope keeps
-    the historical baseline-exclusion semantics.  The schema field carries
-    the semantics; a missing field is never a signal.
-    """
-    field = "cascade_skip" if str(schema) == RULES_SCHEMA else "baseline"
-    return {
-        str(row).strip()
-        for row in list(rule.get(field) or [])
-        if str(row or "").strip()
-    }
 
 
 def _verify_run_binding(rules: dict[str, Any], *, check_dispatch: bool) -> None:
@@ -329,10 +283,7 @@ def _verify_run_binding(rules: dict[str, Any], *, check_dispatch: bool) -> None:
     automation is paused) fails closed before the school session is touched.
     """
     expected_protocol = os.environ.get("COURSELENS_CLOUD_EXPECTED_PROTOCOL_VERSION", "").strip()
-    # The variable and the envelope are written by the same client upload, so
-    # they must name the same schema: a v3 client keeps env=v3 + v3 envelope,
-    # a v4 client env=v4 + v4 envelope.  Any cross pairing fails closed.
-    if expected_protocol != str(rules.get("schema") or ""):
+    if expected_protocol != RULES_SCHEMA:
         raise CloudAutomationError("cloud_protocol_mismatch")
     expected_hash = os.environ.get("COURSELENS_CLOUD_EXPECTED_CONFIG_HASH", "").strip()
     if not expected_hash or expected_hash != str(rules.get("config_hash") or ""):
@@ -424,7 +375,7 @@ def _verification_record(rules: dict[str, Any]) -> dict[str, Any]:
     """Signed verification evidence, stored inside the encrypted state."""
     record = {
         "config_hash": str(rules.get("config_hash") or ""),
-        "protocol": str(rules.get("schema") or RULES_SCHEMA),
+        "protocol": RULES_SCHEMA,
         "verified_at": time.time(),
     }
     signing_bytes = base64.b64decode(_required("WORKER_SIGNING_PRIVATE_KEY"), validate=True)
@@ -617,7 +568,7 @@ def build_courseware_plan(
     return {
         "schema": PLAN_SCHEMA,
         "policy_version": PLAN_POLICY_VERSION,
-        "pipeline": PIPELINE_IDENTITY,
+        "pipeline": RULES_SCHEMA,
         "course_id": str(course_id or ""),
         "sub_id": str(sub_id or ""),
         "inventory_digest": inventory_digest,
@@ -699,7 +650,7 @@ def _result_envelope(
         "task_id": task_id,
         "job_kind": "learning_pack",
         "input_hash": dedupe_key,
-        "pipeline_fingerprint": PIPELINE_IDENTITY,
+        "pipeline_fingerprint": RULES_SCHEMA,
         "status": "completed",
         "outputs": {
             **outputs,
@@ -736,23 +687,20 @@ def _write_result(envelope: dict[str, Any]) -> None:
 
 def _dedupe_key(rules: dict[str, Any], course_id: str, sub_id: str) -> str:
     """Stable completed-work identity: account scope, course, lecture, output
-    bundle version and the frozen processing-pipeline identity.
+    bundle version and pipeline version.
 
     Global configuration (budgets, priorities, rule sets, the config hash)
     deliberately stays out: a settings change must never replay finished
-    lectures.  The pipeline identity is frozen across the v3→v4 selection-
-    semantics bump (V010-CASCADE-1): upgrading the client must never turn the
-    completed ledger into replays or duplicate summary imports.  Selection-
-    generation eligibility and the pending/completed ledgers remain the only
-    replay controls.
+    lectures.  Selection-generation eligibility and the pending/completed
+    ledgers remain the only replay controls.
     """
     return sha256_hex(canonical_json({
-        "schema": PIPELINE_IDENTITY,
+        "schema": RULES_SCHEMA,
         "account_id": str(rules.get("account_id") or ""),
         "course_id": str(course_id),
         "sub_id": str(sub_id),
         "output_bundle": OUTPUT_BUNDLE_VERSION,
-        "pipeline": PIPELINE_IDENTITY,
+        "pipeline": RULES_SCHEMA,
     }))
 
 
@@ -854,11 +802,7 @@ def _gate_decision(
     empty evidence — no selected course ends inside this window and no
     uncertain rows — and every uncertain or unknown-ledger row passes the
     gate (fail-open).  It reads the once-per-day ledgers only and never
-    writes seen/pending, so exactly-once semantics are untouched.  Since
-    V010-SUBFIX-1 a baseline lecture is not "known" unless the envelope says
-    so: v4 cascade_skip declares client-complete lectures; a legacy v3
-    envelope keeps the baseline-exclusion semantics.  Completed, pending and
-    schema-declared lectures are all known work this window will not do.
+    writes seen/pending/baseline, so exactly-once semantics are untouched.
     """
     stats = {"rows": 0, "matched": 0, "uncertain": 0, "known": 0}
     try:
@@ -871,14 +815,9 @@ def _gate_decision(
     low = expected_end - timedelta(minutes=GATE_TOLERANCE_MIN)
     high = expected_end + timedelta(minutes=GATE_TOLERANCE_MIN)
     today = now_bj.date().isoformat()
-    schema = str(rules.get("schema") or "")
     rule_map = {
         str(item.get("course_id") or ""): dict(item)
         for item in list(rules.get("rules") or [])
-    }
-    skip_map = {
-        course_id: _selection_skip_ids(schema, rule)
-        for course_id, rule in rule_map.items()
     }
     matched: list[dict[str, Any]] = []
     for row in rows:
@@ -904,10 +843,12 @@ def _gate_decision(
         sub_id = str(row.get("sub_id") or "")
         if not sub_id:
             return True, stats
-        # 信封申明已知的讲次（v4 cascade_skip=客户端产物已齐 / v3 baseline=
-        # 旧排除契约）与已完成或在途一样不构成本窗工作：正性空证据的一部分。
-        # 语义按 schema 走（_selection_skip_ids），字段缺席永远不是信号。
-        if sub_id in skip_map.get(str(row.get("course_id") or ""), set()):
+        rule = rule_map[str(row.get("course_id") or "")]
+        baseline = {
+            str(item) for item in list(rule.get("baseline") or [])
+            if str(item or "").strip()
+        }
+        if sub_id in baseline:
             stats["known"] += 1
             continue
         item_key = _dedupe_key(rules, str(row.get("course_id") or ""), sub_id)
@@ -915,8 +856,8 @@ def _gate_decision(
             stats["known"] += 1
             continue
         return True, stats
-    # Every matched row is already completed or pending: positive evidence the
-    # pipeline would process nothing new.
+    # Every matched row is already completed, pending, or baseline-excluded:
+    # positive evidence the pipeline would process nothing new.
     return False, stats
 
 
@@ -945,8 +886,7 @@ def run_daily() -> int:
     circuits = dict(state.get("circuits") or {})
     counts = {
         "discovered": 0, "processed": 0, "failed": 0, "deferred": 0,
-        "skipped_pending": 0, "skipped_cascade": 0,
-        "expiring_results": _expiring_result_count(),
+        "skipped_pending": 0, "expiring_results": _expiring_result_count(),
     }
     code = "cloud_daily_completed"
     connector = None
@@ -986,7 +926,6 @@ def run_daily() -> int:
             "state": "closed", "failures": 0, "last_error_code": "",
         }
         rule_map = {str(item.get("course_id") or ""): dict(item) for item in list(rules.get("rules") or [])}
-        envelope_schema = str(rules.get("schema") or "")
         completed = _completed_keys(state)
         pending_keys = _active_pending_keys(state)
         candidates: list[tuple[int, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
@@ -996,21 +935,19 @@ def run_daily() -> int:
             if course_id not in rule_map:
                 continue
             rule = rule_map[course_id]
-            # v4 显式级联语义（V010-CASCADE-1）：cascade_skip=客户端从本地
-            # catalog 真值算出的「产物已齐」讲次，预算只花在缺产物讲次上；
-            # v3 旧信封回退 baseline 排除旧语义（老客户端契约不回归）。语义
-            # 由信封 schema 显式承载，字段缺席永远不是信号。
-            skip_ids = _selection_skip_ids(envelope_schema, rule)
+            baseline = {
+                str(item) for item in list(rule.get("baseline") or [])
+                if str(item or "").strip()
+            }
             for lecture in list(course.get("lectures") or []):
                 sub_id = str(lecture.get("sub_id") or "")
                 # Playback gate: a listed lecture that cannot play at this
                 # window becomes eligible exactly when playback appears.
                 if not sub_id or not lecture.get("has_playback"):
                     continue
-                if sub_id in skip_ids:
-                    # 客户端申明产物已齐（v4）或启用基线（v3 旧语义）：不进
-                    # 候选、不消耗预算；诚实计数供 run 卡与验收对账。
-                    counts["skipped_cascade"] += 1
+                # Selection baseline: lectures already playable at the
+                # selection instant stay excluded for this generation.
+                if sub_id in baseline:
                     continue
                 requested = list(OUTPUT_BUNDLE)
                 item_key = _dedupe_key(rules, course_id, sub_id)
@@ -1064,20 +1001,7 @@ def run_daily() -> int:
                 code = "deepseek_circuit_open"
                 continue
             duration = int(lecture.get("duration_seconds") or 0)
-            # V010-SUBFIX-1 长讲上限（SUBDIAG-1 定谳）：上限的保护面=「整个单窗
-            # 预算都装不下的讲次」——预算只在讲次间检查，开工后装不下=24h
-            # pending 停滞。实测处理时长远小于讲次时长（4.5h 连堂讲在同一
-            # Actions 环全管线 ≈29min），旧默认 240min 曾把 267-270min 真实连堂
-            # 课型永久 defer。有效上限=max(规则上限, 单窗预算)，再以闭集顶
-            # 600min 兜底异常时长；规则值仍为下限（显式配置不被架空）。
-            duration_cap_minutes = min(
-                max(
-                    int(rule.get("max_lecture_minutes") or 240),
-                    int(limits.get("max_runner_minutes") or 300),
-                ),
-                LECTURE_DURATION_CAP_MAX_MINUTES,
-            )
-            if duration and duration > duration_cap_minutes * 60:
+            if duration and duration > int(rule.get("max_lecture_minutes") or 240) * 60:
                 counts["deferred"] += 1
                 continue
             remember_pending(course_id, sub_id, item_key)
@@ -1111,7 +1035,7 @@ def run_daily() -> int:
                 "payload": payload,
                 "requested_outputs": requested,
                 "secrets": {"deepseek_api_key": api_key},
-                "pipeline": {"version": PIPELINE_IDENTITY},
+                "pipeline": {"version": RULES_SCHEMA},
             }
             job["input_hash"] = sha256_hex(canonical_json({key: value for key, value in job.items() if key != "input_hash"}))
 
