@@ -4,21 +4,29 @@ All platform access is delegated to ``platform_session``.  This module keeps
 only encrypted incremental state and encrypted result envelopes in Actions
 artifacts.  Public logs contain closed-set codes, counts, stages and timing.
 
-The ``cloud-automation.v3`` contract fixes the schedule on the client side
+The ``cloud-automation.v4`` contract fixes the schedule on the client side
 (weekday class-grid cron points shortly after each standard period ends plus
 a nightly 22:00 Asia/Shanghai fallback).  Each daytime scheduled run first
 passes a bounded schedule gate (SMART-SCHED): with positive empty evidence —
 no selected course ends within the window and no uncertain rows — the run
 skips discovery honestly (``cloud_gate_skipped``); every uncertain or
 unknown-ledger row passes the gate (fail-open).  The worker trusts
-only the exact signed rules envelope and its config hash.  Every run is bound
+only the exact signed rules envelope and its config hash.  v4 makes the
+cascade semantics explicit: every playable lecture of a selected course is
+eligible — including the lectures already playable when the course was
+enabled (enabling promises the full history) — while each rule carries a
+client-computed ``cascade_skip`` list (lectures whose local artifacts are
+already complete) so the budget is spent only on lectures that still lack
+outputs.  A legacy ``v3`` envelope (an old client) keeps the historical
+baseline-exclusion semantics; the schema field carries the semantics, so a
+missing field is never a signal.  The completed-work identity and every
+output stamp stay bound to the frozen processing-pipeline identity across
+the protocol bump, so finished lectures and imported summaries never replay
+because of an upgrade.  Every run is bound
 to the exact expected protocol and verified config values before any school
 login; manual dispatch stays closed while automation is paused.  One selected
 course is one fixed output bundle (subtitle ASR, slide OCR, AI summary and
-chapters, Lecture IR/evidence); eligibility is decided by the client-captured
-selection baseline, while the completed-work identity binds account scope,
-course, lecture, output-bundle version and pipeline version so unrelated
-config changes never replay finished lectures.  Per-lecture stage progress is
+chapters, Lecture IR/evidence); per-lecture stage progress is
 checkpointed into the encrypted state artifact so a retry reacquires fresh
 media URLs and resumes completed stages instead of restarting.
 
@@ -55,7 +63,17 @@ from .runner import process_job, safe_worker_error_detail
 
 
 STATE_SCHEMA = "cloud.state.v1"
-RULES_SCHEMA = "cloud-automation.v3"
+RULES_SCHEMA = "cloud-automation.v4"
+# 协议载体闭集（V010-CASCADE-1）：v4=显式级联语义（cascade_skip=客户端申明
+# 本地产物已齐的讲次，预算只花在缺产物讲次上）；v3=旧信封（老客户端），
+# 回退 baseline 排除旧语义不回归（设计 R1）。语义由 schema 字段显式承载，
+# 字段缺席永远不是信号。
+_RULES_SCHEMAS = ("cloud-automation.v3", "cloud-automation.v4")
+# 恰一次账与产物盖章的管线身份（冻结，V010-CASCADE-1）：v3→v4 只反转「哪些
+# 讲次进候选」的选择语义，处理管线与输出包（unattended-full.v1）未变——
+# dedupe 键、job/result 的 pipeline 盖章、courseware_plan.pipeline 都锚在
+# 本身份上，已完成讲次与已导入总结永不因协议升级重跑/重复导入。
+PIPELINE_IDENTITY = "cloud-automation.v3"
 RESULT_PREFIX = "courselens-cloud-result-"
 STATE_PREFIX = "courselens-cloud-state-"
 
@@ -64,6 +82,10 @@ STATE_PREFIX = "courselens-cloud-state-"
 OUTPUT_BUNDLE = ("subtitle", "ocr", "summary", "chapters")
 OUTPUT_BUNDLE_VERSION = "unattended-full.v1"
 
+# 长讲时长上限的闭集顶（V010-SUBFIX-1）：与客户端 max_lecture_minutes 校验
+# 上界（5..600）同源，兜底平台目录里的异常时长（如未停止的全天流）。
+LECTURE_DURATION_CAP_MAX_MINUTES = 600
+
 # A pending record from a crashed run blocks reprocessing for one day, then
 # the item becomes retryable again.
 PENDING_TTL_SECONDS = 24 * 3600
@@ -71,6 +93,24 @@ PENDING_TTL_SECONDS = 24 * 3600
 # Bounded active-lecture checkpoints: newest wins, older entries drop so the
 # encrypted state artifact stays small even across long candidate lists.
 CHECKPOINT_KEEP_LIMIT = 4
+
+# 内容生命周期三态闭集（V010-CONTENTLIFE-1-A，设计权威
+# product-v010contentlife-result-20261017.md §2）：讲次级 media_state ∈
+# {current, mismatch_deferred, stale_reprocessing}。签名=平台目录声明时长
+# （duration_seconds，每窗免费重枚举自带），变化阈值 ≥2s 吸收平台秒级抖动
+# （设计 §2.2 转移图「签名变化≥2s」）。台账全部 additive 落加密 state 且
+# 有界封顶（completed ≤2000 / mismatch ≤400 / 观测 ≤400，与 envelope 同规）；
+# 老状态缺键=空账，缺字段永远不是信号。
+MEDIA_STATE_CURRENT = "current"
+MEDIA_STATE_MISMATCH_DEFERRED = "mismatch_deferred"
+MEDIA_STATE_STALE_REPROCESSING = "stale_reprocessing"
+# worker 侧确定性失败闭集码（MEDIAMISMATCH-1 产物，runner._ASR_ERROR_CODES
+# 映射「authorized media duration mismatch」）：mismatch 台账的唯一入口。
+MEDIA_MISMATCH_CODE = "media_duration_mismatch"
+MEDIA_SIGNATURE_DELTA_SECONDS = 2
+COMPLETED_MEDIA_KEEP_LIMIT = 2000
+MISMATCH_MEDIA_KEEP_LIMIT = 400
+MEDIA_OBSERVATIONS_KEEP_LIMIT = 400
 
 # SMART-SCHED（2026-10-06）智能门常量：cron 网格点 = 节末 + 30 分钟，门把
 # 「实际启动 - 30 分钟」视为本窗末，±20 分钟吸收 GitHub schedule 的常规延迟。
@@ -181,6 +221,68 @@ def _bounded_checkpoints(value: Any) -> dict[str, Any]:
     return dict(keep)
 
 
+def _signature_changed(previous: int, current: int) -> bool:
+    """设计 §2.2：声明时长签名变化 ≥2s 才算平台侧真变化；秒级抖动不复活
+    不重排队，缺声明（0）无从比对一律不判（缺字段永远不是信号）。"""
+    return (
+        int(previous or 0) > 0 and int(current or 0) > 0
+        and abs(int(current) - int(previous)) >= MEDIA_SIGNATURE_DELTA_SECONDS
+    )
+
+
+def _bounded_media_ledger(value: Any, limit: int, *, stamp_field: str) -> dict[str, Any]:
+    """有界签名台账：按时间戳 newest-wins，老条目丢弃保 state artifact 小。"""
+    items = [
+        (str(key), dict(row))
+        for key, row in dict(value or {}).items()
+        if isinstance(row, dict)
+    ]
+    if len(items) <= limit:
+        return dict(items)
+    items.sort(key=lambda item: float(item[1].get(stamp_field) or 0))
+    return dict(items[-limit:])
+
+
+def _bounded_media_observations(value: Any) -> list[dict[str, Any]]:
+    items = [dict(row) for row in list(value or []) if isinstance(row, dict)]
+    return items[-MEDIA_OBSERVATIONS_KEEP_LIMIT:]
+
+
+def _record_media_observation(
+    state: dict[str, Any], *, course_id: str, sub_id: str,
+    media_state: str, declared_duration_seconds: int,
+) -> None:
+    """讲次级观测入既有加密 state（additive 有界，设计 §2.4）：客户端
+    _import_cloud_state 消费为 catalog media_state 与「老师更新了」通知面。
+    闭集字段（sub_id/state/声明秒数/观测时刻），零课程名零媒体值。"""
+    observations = _bounded_media_observations(state.get("media_observations"))
+    observations.append({
+        "course_id": str(course_id or ""),
+        "sub_id": str(sub_id or ""),
+        "media_state": str(media_state),
+        "declared_duration_seconds": int(declared_duration_seconds or 0),
+        "observed_at": time.time(),
+    })
+    state["media_observations"] = _bounded_media_observations(observations)
+
+
+def _prune_media_ledgers(state: dict[str, Any]) -> None:
+    """内容生命周期台账封顶（设计 §2.6）：只在有内容时写键，老状态零扰动。"""
+    completed = _bounded_media_ledger(
+        state.get("completed_media"), COMPLETED_MEDIA_KEEP_LIMIT, stamp_field="recorded_at",
+    )
+    if completed:
+        state["completed_media"] = completed
+    mismatch = _bounded_media_ledger(
+        state.get("mismatch_media"), MISMATCH_MEDIA_KEEP_LIMIT, stamp_field="first_detected_at",
+    )
+    if mismatch:
+        state["mismatch_media"] = mismatch
+    observations = _bounded_media_observations(state.get("media_observations"))
+    if observations:
+        state["media_observations"] = observations
+
+
 def _open_state(raw: bytes, key: bytes) -> dict[str, Any]:
     try:
         envelope = json.loads(raw.decode("utf-8"))
@@ -256,23 +358,47 @@ def _rules() -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise CloudAutomationError("cloud_rules_invalid") from exc
     raw = ""
-    if not isinstance(value, dict) or value.get("schema") != RULES_SCHEMA:
+    if not isinstance(value, dict) or str(value.get("schema") or "") not in _RULES_SCHEMAS:
         raise CloudAutomationError("cloud_rules_invalid")
     if not str(value.get("config_hash") or ""):
         raise CloudAutomationError("cloud_rules_invalid")
     total_baseline = 0
+    total_skipped = 0
     for item in list(value.get("rules") or []):
         if not isinstance(item, dict):
             raise CloudAutomationError("cloud_rules_invalid")
         baseline = list(item.get("baseline") or [])
-        if len(baseline) > 400:
+        skipped = list(item.get("cascade_skip") or [])
+        # cascade_skip 与 baseline 同形同界：有界不透明 sub_id 列表
+        # （≤400/课程、总量 ≤2000），校验面零新增。
+        if len(baseline) > 400 or len(skipped) > 400:
             raise CloudAutomationError("cloud_rules_invalid")
-        if any(not str(row or "").strip() or len(str(row)) > PLAN_RECORD_ID_MAX_LENGTH for row in baseline):
+        if any(
+            not str(row or "").strip() or len(str(row)) > PLAN_RECORD_ID_MAX_LENGTH
+            for row in baseline + skipped
+        ):
             raise CloudAutomationError("cloud_rules_invalid")
         total_baseline += len(baseline)
-    if total_baseline > 2000:
+        total_skipped += len(skipped)
+    if total_baseline > 2000 or total_skipped > 2000:
         raise CloudAutomationError("cloud_rules_invalid")
     return value
+
+
+def _selection_skip_ids(schema: str, rule: dict[str, Any]) -> set[str]:
+    """Per-course already-known lecture ids, by explicit envelope schema.
+
+    v4 cascade semantics: the client declares which lectures already have
+    complete local artifacts (``cascade_skip``).  A legacy v3 envelope keeps
+    the historical baseline-exclusion semantics.  The schema field carries
+    the semantics; a missing field is never a signal.
+    """
+    field = "cascade_skip" if str(schema) == RULES_SCHEMA else "baseline"
+    return {
+        str(row).strip()
+        for row in list(rule.get(field) or [])
+        if str(row or "").strip()
+    }
 
 
 def _verify_run_binding(rules: dict[str, Any], *, check_dispatch: bool) -> None:
@@ -283,7 +409,10 @@ def _verify_run_binding(rules: dict[str, Any], *, check_dispatch: bool) -> None:
     automation is paused) fails closed before the school session is touched.
     """
     expected_protocol = os.environ.get("COURSELENS_CLOUD_EXPECTED_PROTOCOL_VERSION", "").strip()
-    if expected_protocol != RULES_SCHEMA:
+    # The variable and the envelope are written by the same client upload, so
+    # they must name the same schema: a v3 client keeps env=v3 + v3 envelope,
+    # a v4 client env=v4 + v4 envelope.  Any cross pairing fails closed.
+    if expected_protocol != str(rules.get("schema") or ""):
         raise CloudAutomationError("cloud_protocol_mismatch")
     expected_hash = os.environ.get("COURSELENS_CLOUD_EXPECTED_CONFIG_HASH", "").strip()
     if not expected_hash or expected_hash != str(rules.get("config_hash") or ""):
@@ -375,7 +504,7 @@ def _verification_record(rules: dict[str, Any]) -> dict[str, Any]:
     """Signed verification evidence, stored inside the encrypted state."""
     record = {
         "config_hash": str(rules.get("config_hash") or ""),
-        "protocol": RULES_SCHEMA,
+        "protocol": str(rules.get("schema") or RULES_SCHEMA),
         "verified_at": time.time(),
     }
     signing_bytes = base64.b64decode(_required("WORKER_SIGNING_PRIVATE_KEY"), validate=True)
@@ -568,7 +697,7 @@ def build_courseware_plan(
     return {
         "schema": PLAN_SCHEMA,
         "policy_version": PLAN_POLICY_VERSION,
-        "pipeline": RULES_SCHEMA,
+        "pipeline": PIPELINE_IDENTITY,
         "course_id": str(course_id or ""),
         "sub_id": str(sub_id or ""),
         "inventory_digest": inventory_digest,
@@ -650,7 +779,7 @@ def _result_envelope(
         "task_id": task_id,
         "job_kind": "learning_pack",
         "input_hash": dedupe_key,
-        "pipeline_fingerprint": RULES_SCHEMA,
+        "pipeline_fingerprint": PIPELINE_IDENTITY,
         "status": "completed",
         "outputs": {
             **outputs,
@@ -687,20 +816,23 @@ def _write_result(envelope: dict[str, Any]) -> None:
 
 def _dedupe_key(rules: dict[str, Any], course_id: str, sub_id: str) -> str:
     """Stable completed-work identity: account scope, course, lecture, output
-    bundle version and pipeline version.
+    bundle version and the frozen processing-pipeline identity.
 
     Global configuration (budgets, priorities, rule sets, the config hash)
     deliberately stays out: a settings change must never replay finished
-    lectures.  Selection-generation eligibility and the pending/completed
-    ledgers remain the only replay controls.
+    lectures.  The pipeline identity is frozen across the v3→v4 selection-
+    semantics bump (V010-CASCADE-1): upgrading the client must never turn the
+    completed ledger into replays or duplicate summary imports.  Selection-
+    generation eligibility and the pending/completed ledgers remain the only
+    replay controls.
     """
     return sha256_hex(canonical_json({
-        "schema": RULES_SCHEMA,
+        "schema": PIPELINE_IDENTITY,
         "account_id": str(rules.get("account_id") or ""),
         "course_id": str(course_id),
         "sub_id": str(sub_id),
         "output_bundle": OUTPUT_BUNDLE_VERSION,
-        "pipeline": RULES_SCHEMA,
+        "pipeline": PIPELINE_IDENTITY,
     }))
 
 
@@ -802,7 +934,12 @@ def _gate_decision(
     empty evidence — no selected course ends inside this window and no
     uncertain rows — and every uncertain or unknown-ledger row passes the
     gate (fail-open).  It reads the once-per-day ledgers only and never
-    writes seen/pending/baseline, so exactly-once semantics are untouched.
+    writes seen/pending, so exactly-once semantics are untouched.  Since
+    V010-SUBFIX-1 a baseline lecture is not "known" unless the envelope says
+    so: v4 cascade_skip declares client-complete lectures; a legacy v3
+    envelope keeps the baseline-exclusion semantics.  Completed, pending,
+    mismatch-deferred and schema-declared lectures are all known work this
+    window will not do.
     """
     stats = {"rows": 0, "matched": 0, "uncertain": 0, "known": 0}
     try:
@@ -815,9 +952,14 @@ def _gate_decision(
     low = expected_end - timedelta(minutes=GATE_TOLERANCE_MIN)
     high = expected_end + timedelta(minutes=GATE_TOLERANCE_MIN)
     today = now_bj.date().isoformat()
+    schema = str(rules.get("schema") or "")
     rule_map = {
         str(item.get("course_id") or ""): dict(item)
         for item in list(rules.get("rules") or [])
+    }
+    skip_map = {
+        course_id: _selection_skip_ids(schema, rule)
+        for course_id, rule in rule_map.items()
     }
     matched: list[dict[str, Any]] = []
     for row in rows:
@@ -839,25 +981,31 @@ def _gate_decision(
         return False, stats
     completed = _completed_keys(state)
     pending = _active_pending_keys(state)
+    # 内容生命周期三态语义（V010-CONTENTLIFE-1-A）：mismatch_deferred 讲次
+    # 本窗不会被 selection 段入队（零入队零配额烧），门面计入已知——不算
+    # 未知工作、不烧门、不入失败面；stale_reprocessing（已摘账）对门不可见，
+    # 正是本窗要复活的工作，照旧过门。
+    mismatch_media = dict(state.get("mismatch_media") or {})
     for row in matched:
         sub_id = str(row.get("sub_id") or "")
         if not sub_id:
             return True, stats
-        rule = rule_map[str(row.get("course_id") or "")]
-        baseline = {
-            str(item) for item in list(rule.get("baseline") or [])
-            if str(item or "").strip()
-        }
-        if sub_id in baseline:
+        # 信封申明已知的讲次（v4 cascade_skip=客户端产物已齐 / v3 baseline=
+        # 旧排除契约）与已完成或在途一样不构成本窗工作：正性空证据的一部分。
+        # 语义按 schema 走（_selection_skip_ids），字段缺席永远不是信号。
+        if sub_id in skip_map.get(str(row.get("course_id") or ""), set()):
             stats["known"] += 1
             continue
         item_key = _dedupe_key(rules, str(row.get("course_id") or ""), sub_id)
+        if item_key in mismatch_media:
+            stats["known"] += 1
+            continue
         if item_key in completed or item_key in pending:
             stats["known"] += 1
             continue
         return True, stats
-    # Every matched row is already completed, pending, or baseline-excluded:
-    # positive evidence the pipeline would process nothing new.
+    # Every matched row is already completed or pending: positive evidence the
+    # pipeline would process nothing new.
     return False, stats
 
 
@@ -879,6 +1027,7 @@ def run_daily() -> int:
     key = _state_key()
     state = _load_previous_state(key)
     state["checkpoints"] = _bounded_checkpoints(state.get("checkpoints"))
+    _prune_media_ledgers(state)
     _prune_previous_states()
     api_key = os.environ.pop("COURSELENS_CLOUD_DEEPSEEK_API_KEY", "").strip()
     limits = dict(rules.get("budget") or {})
@@ -886,7 +1035,8 @@ def run_daily() -> int:
     circuits = dict(state.get("circuits") or {})
     counts = {
         "discovered": 0, "processed": 0, "failed": 0, "deferred": 0,
-        "skipped_pending": 0, "expiring_results": _expiring_result_count(),
+        "skipped_pending": 0, "skipped_cascade": 0, "skipped_mismatch": 0,
+        "expiring_results": _expiring_result_count(),
     }
     code = "cloud_daily_completed"
     connector = None
@@ -926,8 +1076,13 @@ def run_daily() -> int:
             "state": "closed", "failures": 0, "last_error_code": "",
         }
         rule_map = {str(item.get("course_id") or ""): dict(item) for item in list(rules.get("rules") or [])}
+        envelope_schema = str(rules.get("schema") or "")
         completed = _completed_keys(state)
         pending_keys = _active_pending_keys(state)
+        # 内容生命周期台账（V010-CONTENTLIFE-1-A）：completed 签名账 + mismatch
+        # 台账的窗内工作副本；每次变更即刻回写 state（窗内逐项 persist 可见）。
+        completed_media = dict(state.get("completed_media") or {})
+        mismatch_media = dict(state.get("mismatch_media") or {})
         candidates: list[tuple[int, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
         for course in catalog:
             course_id = str(course.get("course_id") or "")
@@ -935,28 +1090,86 @@ def run_daily() -> int:
             if course_id not in rule_map:
                 continue
             rule = rule_map[course_id]
-            baseline = {
-                str(item) for item in list(rule.get("baseline") or [])
-                if str(item or "").strip()
-            }
+            # v4 显式级联语义（V010-CASCADE-1）：cascade_skip=客户端从本地
+            # catalog 真值算出的「产物已齐」讲次，预算只花在缺产物讲次上；
+            # v3 旧信封回退 baseline 排除旧语义（老客户端契约不回归）。语义
+            # 由信封 schema 显式承载，字段缺席永远不是信号。
+            skip_ids = _selection_skip_ids(envelope_schema, rule)
             for lecture in list(course.get("lectures") or []):
                 sub_id = str(lecture.get("sub_id") or "")
                 # Playback gate: a listed lecture that cannot play at this
                 # window becomes eligible exactly when playback appears.
                 if not sub_id or not lecture.get("has_playback"):
                     continue
-                # Selection baseline: lectures already playable at the
-                # selection instant stay excluded for this generation.
-                if sub_id in baseline:
+                if sub_id in skip_ids:
+                    # 客户端申明产物已齐（v4）或启用基线（v3 旧语义）：不进
+                    # 候选、不消耗预算；诚实计数供 run 卡与验收对账。
+                    counts["skipped_cascade"] += 1
                     continue
                 requested = list(OUTPUT_BUNDLE)
                 item_key = _dedupe_key(rules, course_id, sub_id)
+                # 内容生命周期两段比对（V010-CONTENTLIFE-1-A，设计 §2.3-1）：
+                # 本窗重枚举自带每讲新鲜声明时长，检测成本=0、零新增平台调用。
+                # ① mismatch 台账：签名未变=确定性失败仍在 → 零入队零配额烧
+                #   （skipped_mismatch 诚实计数）；签名已变（平台修正/换媒体）
+                #   → 摘账复活转 stale_reprocessing 自动重排队+通知事件。
+                # ② 已完成讲次签名比对：「老师更新了」检测——声明时长变化 ≥2s
+                #   → 摘账标 stale 自动重排队+通知事件；无基线（存量完成讲）
+                #   首窗只补记不判，绝不因补基线而重跑。
+                declared = int(lecture.get("duration_seconds") or 0)
+                stale_requeued = False
+                mm_record = dict(mismatch_media.get(item_key) or {})
+                if mm_record:
+                    if _signature_changed(int(mm_record.get("declared_duration_seconds") or 0), declared):
+                        mismatch_media.pop(item_key, None)
+                        state["mismatch_media"] = mismatch_media
+                        _record_media_observation(
+                            state, course_id=course_id, sub_id=sub_id,
+                            media_state=MEDIA_STATE_STALE_REPROCESSING,
+                            declared_duration_seconds=declared,
+                        )
+                        stale_requeued = True
+                    else:
+                        mm_record["last_checked_at"] = time.time()
+                        mismatch_media[item_key] = mm_record
+                        state["mismatch_media"] = mismatch_media
+                        counts["skipped_mismatch"] += 1
+                        continue
+                elif item_key in completed:
+                    recorded = int(dict(
+                        completed_media.get(item_key) or {}
+                    ).get("declared_duration_seconds") or 0)
+                    if _signature_changed(recorded, declared):
+                        seen_map = dict(state.get("seen") or {})
+                        seen_map[course_id] = [
+                            key for key in list(seen_map.get(course_id) or [])
+                            if key != item_key
+                        ]
+                        state["seen"] = seen_map
+                        completed.discard(item_key)
+                        completed_media.pop(item_key, None)
+                        state["completed_media"] = completed_media
+                        _record_media_observation(
+                            state, course_id=course_id, sub_id=sub_id,
+                            media_state=MEDIA_STATE_STALE_REPROCESSING,
+                            declared_duration_seconds=declared,
+                        )
+                        stale_requeued = True
+                    elif not recorded and declared:
+                        completed_media[item_key] = {
+                            "declared_duration_seconds": declared,
+                            "recorded_at": time.time(),
+                        }
+                        state["completed_media"] = completed_media
                 if item_key in completed or item_key in pending_keys:
                     # Completed or already-pending work never runs twice.
                     counts["skipped_pending"] += 1
                     continue
                 counts["discovered"] += 1
-                candidates.append((int(rule.get("priority") or 0), course, lecture, rule, item_key, requested))
+                candidates.append((
+                    int(rule.get("priority") or 0), course, lecture, rule,
+                    item_key, requested, stale_requeued,
+                ))
         candidates.sort(key=lambda item: (
             -item[0], str(item[2].get("date") or ""), str(item[2].get("sub_id") or "")
         ))
@@ -982,7 +1195,7 @@ def run_daily() -> int:
                 if str(item.get("key") or "") != item_key
             ]
 
-        for _priority, course, lecture, rule, item_key, requested in candidates:
+        for _priority, course, lecture, rule, item_key, requested, stale_requeued in candidates:
             course_id = str(course.get("course_id") or "")
             sub_id = str(lecture.get("sub_id") or "")
             current_runner_minutes = float(budget.get("runner_minutes") or 0) + (time.monotonic() - started) / 60.0
@@ -1001,7 +1214,20 @@ def run_daily() -> int:
                 code = "deepseek_circuit_open"
                 continue
             duration = int(lecture.get("duration_seconds") or 0)
-            if duration and duration > int(rule.get("max_lecture_minutes") or 240) * 60:
+            # V010-SUBFIX-1 长讲上限（SUBDIAG-1 定谳）：上限的保护面=「整个单窗
+            # 预算都装不下的讲次」——预算只在讲次间检查，开工后装不下=24h
+            # pending 停滞。实测处理时长远小于讲次时长（4.5h 连堂讲在同一
+            # Actions 环全管线 ≈29min），旧默认 240min 曾把 267-270min 真实连堂
+            # 课型永久 defer。有效上限=max(规则上限, 单窗预算)，再以闭集顶
+            # 600min 兜底异常时长；规则值仍为下限（显式配置不被架空）。
+            duration_cap_minutes = min(
+                max(
+                    int(rule.get("max_lecture_minutes") or 240),
+                    int(limits.get("max_runner_minutes") or 300),
+                ),
+                LECTURE_DURATION_CAP_MAX_MINUTES,
+            )
+            if duration and duration > duration_cap_minutes * 60:
                 counts["deferred"] += 1
                 continue
             remember_pending(course_id, sub_id, item_key)
@@ -1035,7 +1261,7 @@ def run_daily() -> int:
                 "payload": payload,
                 "requested_outputs": requested,
                 "secrets": {"deepseek_api_key": api_key},
-                "pipeline": {"version": RULES_SCHEMA},
+                "pipeline": {"version": PIPELINE_IDENTITY},
             }
             job["input_hash"] = sha256_hex(canonical_json({key: value for key, value in job.items() if key != "input_hash"}))
 
@@ -1083,6 +1309,21 @@ def run_daily() -> int:
                 state["checkpoints"] = updated
                 state.setdefault("seen", {}).setdefault(course_id, []).append(item_key)
                 completed.add(item_key)
+                # 内容生命周期落账（设计 §2.3-1）：成功=签名入账回 current；
+                # 复活讲成功额外写 current 观测，客户端及时清 stale/deferred 标。
+                completed_media[item_key] = {
+                    "declared_duration_seconds": int(duration or 0),
+                    "recorded_at": time.time(),
+                }
+                state["completed_media"] = completed_media
+                if mismatch_media.pop(item_key, None) is not None:
+                    state["mismatch_media"] = mismatch_media
+                if stale_requeued:
+                    _record_media_observation(
+                        state, course_id=course_id, sub_id=sub_id,
+                        media_state=MEDIA_STATE_CURRENT,
+                        declared_duration_seconds=int(duration or 0),
+                    )
                 counts["processed"] += 1
                 circuits["deepseek"] = {"state": "closed", "failures": [], "retry_after": 0, "last_error_code": ""}
                 _persist_state(state, key)
@@ -1095,6 +1336,22 @@ def run_daily() -> int:
                 _persist_state(state, key)
                 counts["failed"] += 1
                 reason = safe_worker_error_detail(exc)
+                if reason == MEDIA_MISMATCH_CODE:
+                    # 确定性媒体签名不符（MEDIAMISMATCH-1 闭集码）→ 讲次置
+                    # mismatch_deferred：后续窗零入队零配额烧，签名一变自动
+                    # 复活转正（设计 §2.2 转移图）；本次尝试仍诚实计 failed，
+                    # 此后不再烧——「deferred 不算失败」指门面与后续窗语义。
+                    mismatch_media[item_key] = {
+                        "declared_duration_seconds": int(duration or 0),
+                        "first_detected_at": time.time(),
+                        "last_checked_at": time.time(),
+                    }
+                    state["mismatch_media"] = mismatch_media
+                    _record_media_observation(
+                        state, course_id=course_id, sub_id=sub_id,
+                        media_state=MEDIA_STATE_MISMATCH_DEFERRED,
+                        declared_duration_seconds=int(duration or 0),
+                    )
                 if isinstance(exc, CloudAutomationError):
                     code = exc.code
                     continue
@@ -1150,6 +1407,7 @@ def run_daily() -> int:
     finally:
         elapsed = time.monotonic() - started
         budget["runner_minutes"] = round(float(budget.get("runner_minutes") or 0) + elapsed / 60.0, 3)
+        _prune_media_ledgers(state)
         state.update({
             "schema": STATE_SCHEMA,
             "budget": budget,
@@ -1164,6 +1422,7 @@ def run_daily() -> int:
             f"stage=complete code={code} discovered={counts['discovered']} "
             f"processed={counts['processed']} failed={counts['failed']} deferred={counts['deferred']} "
             f"skipped_pending={counts['skipped_pending']} "
+            f"skipped_mismatch={counts['skipped_mismatch']} "
             f"elapsed={round(elapsed, 2)}",
             flush=True,
         )

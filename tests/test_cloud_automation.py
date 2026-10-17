@@ -20,7 +20,10 @@ from nacl.signing import VerifyKey
 from courselens_worker import cloud_automation
 from courselens_worker.cloud_automation import (
     CHECKPOINT_KEEP_LIMIT,
+    COMPLETED_MEDIA_KEEP_LIMIT,
     GATE_TZ,
+    MEDIA_OBSERVATIONS_KEEP_LIMIT,
+    MISMATCH_MEDIA_KEEP_LIMIT,
     OUTPUT_BUNDLE,
     PENDING_TTL_SECONDS,
     RULES_SCHEMA,
@@ -28,6 +31,7 @@ from courselens_worker.cloud_automation import (
     _dedupe_key,
     _empty_state,
     _open_state,
+    _prune_media_ledgers,
     _reset_daily_budget,
     _rules_need_ai,
     _seal_state,
@@ -62,14 +66,17 @@ def make_rules(*, rules=None, config_hash="d" * 64, account_id="2020001", budget
     }
 
 
-def make_course_rule(course_id="36941", *, baseline=None, priority=50):
-    return {
+def make_course_rule(course_id="36941", *, baseline=None, cascade_skip=None, priority=50):
+    rule = {
         "course_id": course_id,
         "priority": priority,
         "max_lecture_minutes": 240,
         "selection_generation": 1,
         "baseline": list(baseline or []),
     }
+    if cascade_skip is not None:
+        rule["cascade_skip"] = list(cascade_skip)
+    return rule
 
 
 class FakeConnector:
@@ -277,7 +284,8 @@ class ScheduleGateTests(unittest.TestCase):
     """SMART-SCHED 智能门单元钉：激活矩阵/伪造时刻 fail-closed/窗匹配/fail-open/账面预检。
 
     门是预过滤器不是裁决器：秒退必须持肯定性空证据，一切不确定一律过门
-    （fail-open）；账面预检只读 completed/pending/baseline，恰一次语义零弱化。
+    （fail-open）；账面预检只读 completed/pending 台账（V010-SUBFIX-1 起
+    baseline 不再构成「已知」），恰一次语义零弱化。
     """
 
     def _moment(self, hour, minute):
@@ -402,12 +410,13 @@ class ScheduleGateTests(unittest.TestCase):
         connector = FakeConnector([], schedule_rows=[{**hit, "sub_id": ""}])
         gate_pass, _ = cloud_automation._gate_decision(connector, rules, self._state(), moment)
         self.assertTrue(gate_pass)
-        # 基线排除 → 已知 → 秒退。
+        # V010-SUBFIX-1：baseline 内但未完成/未在途 → 正是本窗要处理的工作 →
+        # 过门（基线不再是「已知」，存量讲次不因启用时刻被门吞掉）。
         baseline_rules = self._rules(baseline=["s-1"])
         connector = FakeConnector([], schedule_rows=[hit])
         gate_pass, stats = cloud_automation._gate_decision(connector, baseline_rules, self._state(), moment)
-        self.assertFalse(gate_pass)
-        self.assertEqual(stats["known"], 1)
+        self.assertTrue(gate_pass)
+        self.assertEqual(stats["known"], 0)
         # 已完成 → 已知 → 秒退。
         connector = FakeConnector([], schedule_rows=[hit])
         gate_pass, stats = cloud_automation._gate_decision(
@@ -434,6 +443,227 @@ class ScheduleGateTests(unittest.TestCase):
             connector, rules, self._state(("36941", "s-1")), moment)
         self.assertTrue(gate_pass)
         self.assertEqual(stats["known"], 1)
+
+
+class ContentLifecycleTests(WorkerEnvTestCase):
+    """V010-CONTENTLIFE-1-A 三态迁移全矩阵（设计 §2/§8①，云窗复检链）。
+
+    讲次级 media_state 闭集 {current, mismatch_deferred, stale_reprocessing}：
+    签名=平台目录声明时长（每窗免费重枚举），变化阈值 ≥2s 吸收秒级抖动；
+    mismatch 未变=零入队零配额烧（skipped_mismatch、零 process_job），签名一变
+    自动复活转 stale_reprocessing（观测通知落账+重排队），已完成讲次签名变化
+    =「老师更新了」同链路；mismatch 讲在门面计入 known（不算失败不入 failed
+    面）；台账有界封顶 newest-wins。
+    """
+
+    # safe_worker_error_detail 按 type.__name__=="ASRError" 识别 ASR 闭集码；
+    # 本地同形态异常避免在测试进程导入 asr 重依赖（conftest 桩同纪律）。
+    _MismatchASRError = type("ASRError", (Exception,), {})
+
+    @staticmethod
+    def _courses(*durations):
+        # (sub_id, declared_seconds) → 单一选中课程，声明时长逐讲可控。
+        return [{"course_id": "36941", "lectures": [
+            {"sub_id": sub_id, "has_playback": True, "duration_seconds": float(seconds)}
+            for sub_id, seconds in durations
+        ]}]
+
+    def _run_window(self, courses, *, process=None, prefill=None):
+        os.environ["COURSELENS_CLOUD_STATE_KEY"] = self.state_key
+        os.environ["COURSELENS_CLOUD_DEEPSEEK_API_KEY"] = "sk-synthetic"
+        self.set_rules(make_rules(rules=[make_course_rule("36941")]))
+        if prefill is not None:
+            key = base64.b64decode(self.state_key)
+            self.github_state.upload_state(_seal_state(prefill, key))
+        connector = FakeConnector(courses)
+        processed = []
+
+        def wrapper(job, *, checkpoint_writer=None):
+            processed.append(job)
+            if process is not None:
+                return process(job, checkpoint_writer=checkpoint_writer)
+            return {"outputs": {}, "metrics": {}}
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(unittest.mock.patch.object(
+                cloud_automation, "cloud_session_from_environment", return_value=connector,
+            ))
+            stack.enter_context(unittest.mock.patch.object(
+                cloud_automation, "process_job", wrapper,
+            ))
+            stack.enter_context(unittest.mock.patch.object(
+                cloud_automation, "usage_snapshot", return_value={"total_tokens": 0},
+            ))
+            code = cloud_automation.run_daily()
+        state_path = Path(".work/cloud-state/state.box.json")
+        if state_path.exists():
+            self.github_state.upload_state(state_path.read_bytes())
+        return code, processed
+
+    def _item_key(self, sub_id):
+        return _dedupe_key(make_rules(rules=[make_course_rule("36941")]), "36941", sub_id)
+
+    def test_three_state_full_matrix_current_stale_and_current_restored(self):
+        sub = "l-cycle"
+        # 窗1：处理成功 → current（声明签名入账；例行成功零观测噪声）。
+        code, processed = self._run_window(self._courses((sub, 10065)))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(processed), 1)
+        state = self.read_persisted_state()
+        self.assertEqual(state["completed_media"][self._item_key(sub)]["declared_duration_seconds"], 10065)
+        # additive 键语义：无转移时观测键缺席（缺字段永远不是信号）。
+        self.assertEqual(state.get("media_observations") or [], [])
+        # 窗2：平台修声明（10065→10114，+49s ≥2s 阈）→ 摘账 stale 自动重排队。
+        code, processed = self._run_window(self._courses((sub, 10114)))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(processed), 1)  # 复活讲入候选并被处理
+        state = self.read_persisted_state()
+        self.assertEqual(state["last_run"]["counts"]["skipped_pending"], 0)
+        self.assertEqual(state["last_run"]["counts"]["discovered"], 1)
+        # 检测即落 stale 观测，复活成功同窗回 current（设计 §7 剧本 1）。
+        self.assertEqual(
+            [row["media_state"] for row in state["media_observations"]],
+            ["stale_reprocessing", "current"],
+        )
+        self.assertEqual(state["media_observations"][0]["sub_id"], sub)
+        # 复活成功 → 签名入账更新为新声明值。
+        self.assertEqual(state["completed_media"][self._item_key(sub)]["declared_duration_seconds"], 10114)
+        # 窗3：签名未变 → 恰一次账零重跑，零新观测。
+        code, processed = self._run_window(self._courses((sub, 10114)))
+        self.assertEqual(code, 0)
+        self.assertEqual(processed, [])
+        state = self.read_persisted_state()
+        self.assertEqual(state["last_run"]["counts"]["skipped_pending"], 1)
+        self.assertEqual(len(state["media_observations"]), 2)
+        # 窗4：秒级抖动（+1s < 2s 阈）不构成签名变化，零重跑零观测。
+        code, processed = self._run_window(self._courses((sub, 10115)))
+        self.assertEqual(code, 0)
+        self.assertEqual(processed, [])
+        state = self.read_persisted_state()
+        self.assertEqual(len(state["media_observations"]), 2)
+        self.assertEqual(state["last_run"]["counts"]["skipped_pending"], 1)
+
+    def test_mismatch_deferred_zero_enqueue_then_signature_fix_resurrects(self):
+        sub = "l-mm"
+
+        def mismatch_failure(job, *, checkpoint_writer=None):
+            raise self._MismatchASRError("authorized media duration mismatch")
+
+        # 窗1：确定性失败 → mismatch_deferred 入台账+观测（本次尝试诚实 failed=1）。
+        code, processed = self._run_window(
+            self._courses((sub, 10065)), process=mismatch_failure)
+        state = self.read_persisted_state()
+        self.assertEqual(state["last_run"]["counts"]["failed"], 1)
+        mm = state["mismatch_media"][self._item_key(sub)]
+        self.assertEqual(mm["declared_duration_seconds"], 10065)
+        self.assertIn("first_detected_at", mm)
+        self.assertIn("last_checked_at", mm)
+        self.assertEqual(
+            [row["media_state"] for row in state["media_observations"]],
+            ["mismatch_deferred"],
+        )
+        # 窗2/窗3：签名未变 → 零入队零配额烧（零 process_job、skipped_mismatch、
+        # discovered=0、failed=0）——确定性失败不再逐窗重烧。
+        for _window in (2, 3):
+            code, processed = self._run_window(self._courses((sub, 10065)))
+            self.assertEqual(code, 0)
+            self.assertEqual(processed, [])
+            state = self.read_persisted_state()
+            self.assertEqual(state["last_run"]["counts"]["skipped_mismatch"], 1)
+            self.assertEqual(state["last_run"]["counts"]["discovered"], 0)
+            self.assertEqual(state["last_run"]["counts"]["failed"], 0)
+            self.assertEqual(len(state["media_observations"]), 1)
+        # 窗4：平台修声明（10065→9300）→ 复活转 stale_reprocessing 自动重排队，
+        # 重处理成功 → current（消灭人肉候复诊）。
+        code, processed = self._run_window(self._courses((sub, 9300)))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(processed), 1)
+        state = self.read_persisted_state()
+        self.assertNotIn(self._item_key(sub), state.get("mismatch_media") or {})
+        self.assertEqual(state["completed_media"][self._item_key(sub)]["declared_duration_seconds"], 9300)
+        self.assertEqual(
+            [row["media_state"] for row in state["media_observations"]],
+            ["mismatch_deferred", "stale_reprocessing", "current"],
+        )
+
+    def test_gate_counts_mismatch_deferred_as_known_not_failure(self):
+        rules = make_rules(rules=[make_course_rule("36941")])
+        state = _empty_state()
+        state["mismatch_media"] = {
+            self._item_key("s-1"): {
+                "declared_duration_seconds": 10065,
+                "first_detected_at": 1.0, "last_checked_at": 1.0,
+            },
+        }
+        row = {
+            "course_id": "36941", "sub_id": "s-1", "date": "2026-10-06",
+            "end_precise": datetime(2026, 10, 6, 9, 40, tzinfo=GATE_TZ),
+        }
+        moment = datetime(2026, 10, 6, 10, 10, tzinfo=GATE_TZ)
+        gate_pass, stats = cloud_automation._gate_decision(
+            FakeConnector([], schedule_rows=[row]), rules, state, moment)
+        # mismatch 讲=已知 → 唯一命中行构成正性空证据 → 秒退且 known=1；
+        # 台账只读，秒退不写 seen/pending/mismatch（恰一次语义零弱化）。
+        self.assertFalse(gate_pass)
+        self.assertEqual(stats["known"], 1)
+        self.assertEqual(state["mismatch_media"], {
+            self._item_key("s-1"): state["mismatch_media"][self._item_key("s-1")],
+        })
+        # 已摘账的复活讲（stale）：seen/mismatch/pending 全无 → 门视为未知工作
+        # 过门（正是本窗要做的复活工作，不因历史完成被吞）。
+        state["seen"] = {}
+        state["mismatch_media"] = {}
+        row2 = dict(row, sub_id="s-2")
+        gate_pass, stats = cloud_automation._gate_decision(
+            FakeConnector([], schedule_rows=[row2]), rules, state, moment)
+        self.assertTrue(gate_pass)
+        self.assertEqual(stats["known"], 0)
+
+    def test_legacy_completed_lecture_baseline_recorded_without_replay(self):
+        # 存量完成账无签名基线：首窗只补记不判（绝不因补基线重跑既有完成讲）。
+        legacy = _empty_state()
+        legacy["seen"] = {"36941": [self._item_key("l-1")]}
+        code, processed = self._run_window(
+            self._courses(("l-1", 10065)), prefill=legacy)
+        self.assertEqual(code, 0)
+        self.assertEqual(processed, [])
+        state = self.read_persisted_state()
+        self.assertEqual(state["completed_media"][self._item_key("l-1")]["declared_duration_seconds"], 10065)
+        self.assertEqual(state["last_run"]["counts"]["skipped_pending"], 1)
+        self.assertEqual(state.get("media_observations") or [], [])
+        # 基线在账后，签名变化即可检测 → stale 重排队。
+        code, processed = self._run_window(self._courses(("l-1", 10114)))
+        self.assertEqual(len(processed), 1)
+        state = self.read_persisted_state()
+        self.assertEqual(state["media_observations"][0]["media_state"], "stale_reprocessing")
+
+    def test_media_ledgers_bounded_newest_wins(self):
+        state = _empty_state()
+        state["completed_media"] = {
+            f"key-{i}": {"declared_duration_seconds": i, "recorded_at": float(i)}
+            for i in range(COMPLETED_MEDIA_KEEP_LIMIT + 50)
+        }
+        state["mismatch_media"] = {
+            f"key-{i}": {
+                "declared_duration_seconds": i,
+                "first_detected_at": float(i), "last_checked_at": float(i),
+            }
+            for i in range(MISMATCH_MEDIA_KEEP_LIMIT + 10)
+        }
+        state["media_observations"] = [
+            {"sub_id": f"s-{i}", "media_state": "current",
+             "declared_duration_seconds": i, "observed_at": float(i)}
+            for i in range(MEDIA_OBSERVATIONS_KEEP_LIMIT + 10)
+        ]
+        cloud_automation._prune_media_ledgers(state)
+        self.assertEqual(len(state["completed_media"]), COMPLETED_MEDIA_KEEP_LIMIT)
+        self.assertEqual(len(state["mismatch_media"]), MISMATCH_MEDIA_KEEP_LIMIT)
+        self.assertEqual(len(state["media_observations"]), MEDIA_OBSERVATIONS_KEEP_LIMIT)
+        # newest-wins：最老丢弃、最新保留。
+        self.assertNotIn("key-0", state["completed_media"])
+        self.assertIn(f"key-{COMPLETED_MEDIA_KEEP_LIMIT + 49}", state["completed_media"])
+        self.assertNotIn("key-0", state["mismatch_media"])
+        self.assertEqual(state["media_observations"][-1]["sub_id"], f"s-{MEDIA_OBSERVATIONS_KEEP_LIMIT + 9}")
 
 
 class CloudAutomationTests(WorkerEnvTestCase):
@@ -484,7 +714,7 @@ class CloudAutomationTests(WorkerEnvTestCase):
         self.assertTrue(_rules_need_ai({"rules": [make_course_rule()]}))
         self.assertFalse(_rules_need_ai({"rules": []}))
 
-    def test_rules_envelope_must_be_v3_with_trusted_config_hash(self):
+    def test_rules_envelope_must_be_v3_or_v4_with_trusted_config_hash(self):
         self.set_rules({"schema": "cloud-automation.v2", "config_hash": "d" * 64})
         with self.assertRaises(cloud_automation.CloudAutomationError) as caught:
             cloud_automation._rules()
@@ -497,6 +727,25 @@ class CloudAutomationTests(WorkerEnvTestCase):
         with self.assertRaises(cloud_automation.CloudAutomationError) as caught:
             cloud_automation._rules()
         self.assertEqual(caught.exception.code, "cloud_rules_invalid")
+        # cascade_skip 与 baseline 同形同界：401/课与 2001 总量都拒绝；坏行拒绝。
+        oversize_skip = make_course_rule(cascade_skip=[f"l-{index:04d}" for index in range(401)])
+        self.set_rules(make_rules(rules=[oversize_skip]))
+        with self.assertRaises(cloud_automation.CloudAutomationError) as caught:
+            cloud_automation._rules()
+        self.assertEqual(caught.exception.code, "cloud_rules_invalid")
+        total = make_course_rule(cascade_skip=[f"l-{index:04d}" for index in range(1000)])
+        self.set_rules(make_rules(rules=[
+            total, dict(total, course_id="36942"), dict(total, course_id="36943"),
+        ]))
+        with self.assertRaises(cloud_automation.CloudAutomationError):
+            cloud_automation._rules()
+        bad_row = make_course_rule(cascade_skip=[""])
+        self.set_rules(make_rules(rules=[bad_row]))
+        with self.assertRaises(cloud_automation.CloudAutomationError):
+            cloud_automation._rules()
+        # 两个协议代都接受（v3=老客户端信封，v4=级联显式语义）。
+        self.set_rules({"schema": "cloud-automation.v3", "config_hash": "d" * 64, "rules": []})
+        self.assertEqual(cloud_automation._rules()["schema"], "cloud-automation.v3")
         self.set_rules(make_rules())
         self.assertEqual(cloud_automation._rules()["schema"], RULES_SCHEMA)
 
@@ -782,13 +1031,22 @@ class CloudAutomationTests(WorkerEnvTestCase):
         self.assertEqual(state["last_run"]["code"], "cloud_gate_time_invalid")
         self.assertEqual(state["last_run"]["counts"]["failed"], 1)
 
-    def test_selection_baseline_excludes_playable_and_releases_later_lectures(self):
-        """基线语义：选择时刻已可播放的讲次被排除；未列出/新讲次可播即合格。"""
+    def test_existing_playable_lectures_join_queue_then_stay_idempotent(self):
+        """V010-SUBFIX-1 存量语义：启用时已可播放的讲次（baseline 内）入队处
+        理一次；恰一次由 completed/pending 台账保证，与基线无关。"""
+        class EchoConnector(FakeConnector):
+            def media_source(self, course_id, sub_id):
+                super().media_source(course_id, sub_id)
+                return {"kind": "synthetic", "sub_id": sub_id}
+
         def run_with(courses, baseline):
             os.environ["COURSELENS_CLOUD_STATE_KEY"] = self.state_key
             os.environ["COURSELENS_CLOUD_DEEPSEEK_API_KEY"] = "sk-synthetic"
-            self.set_rules(make_rules(rules=[make_course_rule("36941", baseline=baseline)]))
-            connector = FakeConnector(courses)
+            self.set_rules(make_rules(
+                rules=[make_course_rule("36941", baseline=baseline)],
+                budget={"max_lectures": 5, "max_runner_minutes": 300, "max_deepseek_tokens": 100000},
+            ))
+            connector = EchoConnector(courses)
             processed = []
             def process(job, *, checkpoint_writer=None):
                 processed.append(job)
@@ -812,14 +1070,26 @@ class CloudAutomationTests(WorkerEnvTestCase):
             {"sub_id": "l-new", "has_playback": True},
             {"sub_id": "l-future", "has_playback": False},
         ]}]
+        # ① 存量入队：启用时刻已可播放的 l-old（baseline 内）与 l-new 同权处理，
+        #    且拿完整无人值守包；l-future 不可播放不入队。
         code, processed = run_with(courses, baseline=["l-old"])
         self.assertEqual(code, 0)
-        # l-old excluded by the baseline; l-new processed; l-future unplayable.
-        self.assertEqual(len(processed), 1)
+        self.assertEqual(sorted(
+            str((job["payload"].get("media") or {}).get("sub_id") or "") for job in processed
+        ), ["l-new", "l-old"])
+        old_job = next(job for job in processed if (job["payload"]["media"] or {}).get("sub_id") == "l-old")
+        self.assertEqual(old_job["requested_outputs"], list(OUTPUT_BUNDLE))
 
-        # A listed lecture that could not play becomes eligible when it can:
-        # the next window discovers l-future now playable, and it is not in
-        # the baseline, so it runs.
+        # ② 幂等跳过：同样的目录再扫一遍，两个讲次都已在 completed 台账里，
+        #    绝不重跑（skipped_pending=2、discovered=0）。
+        code, processed = run_with(courses, baseline=["l-old"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(processed), 0)
+        state = self.read_persisted_state()
+        self.assertEqual(state["last_run"]["counts"]["skipped_pending"], 2)
+        self.assertEqual(state["last_run"]["counts"]["discovered"], 0)
+
+        # ③ 播放门保留：不可播放讲次在可播放出现的窗口变为合格并处理。
         courses_later = [{"course_id": "36941", "lectures": [
             {"sub_id": "l-future", "has_playback": True},
         ]}]
@@ -827,10 +1097,206 @@ class CloudAutomationTests(WorkerEnvTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(processed), 1)
 
-        # A fresh generation that lists everything playable excludes all of it.
-        code, processed = run_with(courses_later, baseline=["l-future"])
+    def _run_cascade_with(self, rules, *, connector=None, env=None):
+        """One run_daily pass with an explicit rules envelope; returns (code, processed)."""
+        os.environ["COURSELENS_CLOUD_STATE_KEY"] = self.state_key
+        os.environ["COURSELENS_CLOUD_DEEPSEEK_API_KEY"] = "sk-synthetic"
+        self.set_rules(rules)
+        if connector is None:
+            class EchoConnector(FakeConnector):
+                def media_source(self, course_id, sub_id):
+                    super().media_source(course_id, sub_id)
+                    return {"kind": "synthetic", "sub_id": sub_id}
+            connector = EchoConnector([{"course_id": "36941", "lectures": [
+                {"sub_id": "l-done", "has_playback": True},
+                {"sub_id": "l-open", "has_playback": True},
+            ]}])
+        processed = []
+        def process(job, *, checkpoint_writer=None):
+            processed.append(job)
+            return {"outputs": {}, "metrics": {}}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(unittest.mock.patch.dict(os.environ, dict(env or {})))
+            stack.enter_context(unittest.mock.patch.object(
+                cloud_automation, "cloud_session_from_environment", return_value=connector,
+            ))
+            stack.enter_context(unittest.mock.patch.object(cloud_automation, "process_job", process))
+            stack.enter_context(unittest.mock.patch.object(
+                cloud_automation, "usage_snapshot", return_value={"total_tokens": 0},
+            ))
+            code = cloud_automation.run_daily()
+        # 各腿状态隔离：不上传 state artifact（下一腿从零账起算），磁盘上的
+        # state 仅供 read_persisted_state 断言当腿计数。
+        return code, processed
+
+    def test_v4_cascade_skip_and_v3_fallback_truth_chain(self):
+        """V010-CASCADE-1 R1 真值链：语义由信封 schema 显式承载。
+
+        ① v3 旧信封（老客户端契约）回退 baseline 排除旧语义——l-done 被排除、
+           l-open 处理，绝不因新 worker 而改变老客户端已验证的行为；
+        ② v4 显式 cascade_skip=客户端申明产物已齐——l-done 走 skipped_cascade
+           诚实计数、零预算消耗，l-open 正常入队拿完整无人值守包；
+        ③ v4 信封里的遗留 baseline 行被忽略（v4 只认 cascade_skip）——升级后
+           未重算的旧行不会把历史讲次重新排除（自动无路死锁不回归）。
+        """
+        budget = {"max_lectures": 5, "max_runner_minutes": 300, "max_deepseek_tokens": 100000}
+        v3_rules = {
+            "schema": "cloud-automation.v3", "config_hash": "d" * 64,
+            "account_id": "2020001", "budget": budget,
+            "rules": [make_course_rule("36941", baseline=["l-done"])],
+        }
+        # 老客户端一致配对：v3 信封 + env=v3（setUp 缺省 env 是 v4）。
+        code, processed = self._run_cascade_with(
+            v3_rules, env={"COURSELENS_CLOUD_EXPECTED_PROTOCOL_VERSION": "cloud-automation.v3"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([str((job["payload"].get("media") or {}).get("sub_id")) for job in processed], ["l-open"])
+
+        v4_rules = {
+            "schema": RULES_SCHEMA, "config_hash": "e" * 64,
+            "account_id": "2020001", "budget": budget,
+            "rules": [make_course_rule("36941", cascade_skip=["l-done"])],
+        }
+        code, processed = self._run_cascade_with(
+            v4_rules, env={"COURSELENS_CLOUD_EXPECTED_CONFIG_HASH": "e" * 64},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([str((job["payload"].get("media") or {}).get("sub_id")) for job in processed], ["l-open"])
+        state = self.read_persisted_state()
+        self.assertEqual(state["last_run"]["counts"]["skipped_cascade"], 1)
+        self.assertEqual(state["last_run"]["counts"]["discovered"], 1)
+        open_job = processed[0]
+        self.assertEqual(open_job["requested_outputs"], list(OUTPUT_BUNDLE))
+        # 处理管线盖章冻结在 v3 身份上：协议升级绝不改写产物管线身份。
+        self.assertEqual(open_job["pipeline"]["version"], "cloud-automation.v3")
+
+        stale_rules = {
+            "schema": RULES_SCHEMA, "config_hash": "f" * 64,
+            "account_id": "2020001", "budget": budget,
+            "rules": [make_course_rule("36941", baseline=["l-done", "l-open"])],
+        }
+        code, processed = self._run_cascade_with(
+            stale_rules, env={"COURSELENS_CLOUD_EXPECTED_CONFIG_HASH": "f" * 64},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(
+            str((job["payload"].get("media") or {}).get("sub_id")) for job in processed
+        ), ["l-done", "l-open"])
+
+    def test_v4_cascade_skip_counts_as_gate_known_and_binding_cross_pair_fails(self):
+        """门面已知语义+协议/env 交叉配对 fail-closed。"""
+        budget = {"max_lectures": 5, "max_runner_minutes": 300, "max_deepseek_tokens": 100000}
+        rules = {
+            "schema": RULES_SCHEMA, "config_hash": "d" * 64,
+            "account_id": "2020001", "budget": budget,
+            "rules": [make_course_rule("36941", cascade_skip=["l-1"])],
+        }
+        # 精确端时刻 10:10，gate 时刻 10:40（offset 30）→ 唯一命中行。
+        rows = [{
+            "course_id": "36941", "date": "2026-10-06", "sub_id": "l-1",
+            "end_precise": datetime(2026, 10, 6, 10, 10, tzinfo=GATE_TZ),
+        }]
+        connector = FakeConnector([], schedule_rows=rows)
+        fixed = datetime(2026, 10, 6, 10, 40, tzinfo=GATE_TZ)
+        with unittest.mock.patch.object(cloud_automation, "_gate_now", return_value=fixed):
+            code, processed = self._run_cascade_with(rules, connector=connector)
+        # 唯一命中行已被 cascade_skip 申明=正性空证据的一部分 → 门秒退。
+        self.assertEqual(code, 0)
+        self.assertEqual(processed, [])
+        state = self.read_persisted_state()
+        self.assertEqual(state["last_run"]["code"], "cloud_gate_skipped")
+        self.assertEqual(state["last_run"]["counts"]["discovered"], 0)
+
+        # 协议/env 交叉配对 fail-closed：v4 信封 + env=v3（或反向）都是
+        # cloud_protocol_mismatch，绝不带着错配的语义跑真登录。
+        v3_env = {"COURSELENS_CLOUD_EXPECTED_PROTOCOL_VERSION": "cloud-automation.v3"}
+        code, _ = self._run_cascade_with(rules, env=v3_env)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_persisted_state()["last_run"]["code"], "cloud_protocol_mismatch")
+        v3_rules = dict(rules, schema="cloud-automation.v3")
+        code, _ = self._run_cascade_with(v3_rules)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_persisted_state()["last_run"]["code"], "cloud_protocol_mismatch")
+        # 一致的老配对（v3 env + v3 信封）照常过绑定进候选链。
+        code, processed = self._run_cascade_with(v3_rules, env=v3_env)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(processed), 2)  # v3 无 baseline 行=无排除，全部入队
+
+    def test_dedupe_identity_frozen_across_protocol_bump(self):
+        """恰一次账身份跨 v3→v4 不变：升级绝不把已完成台账变成重放。"""
+        budget = {"max_lectures": 5, "max_runner_minutes": 300, "max_deepseek_tokens": 100000}
+        v3 = {
+            "schema": "cloud-automation.v3", "config_hash": "d" * 64,
+            "account_id": "2020001", "budget": budget, "rules": [],
+        }
+        v4 = {
+            "schema": "cloud-automation.v4", "config_hash": "e" * 64,
+            "account_id": "2020001", "budget": budget, "rules": [],
+        }
+        self.assertEqual(
+            _dedupe_key(v3, "36941", "l-1"),
+            _dedupe_key(v4, "36941", "l-1"),
+        )
+        # 账号仍是身份的一部分（跨账号永不共享完成账）。
+        self.assertNotEqual(
+            _dedupe_key(v4, "36941", "l-1"),
+            _dedupe_key(dict(v4, account_id="2020002"), "36941", "l-1"),
+        )
+
+    def test_long_lecture_duration_cap_fits_run_window_not_old_default(self):
+        """V010-SUBFIX-1 长讲三分支：真实连堂课型（270min）入队；异常超长
+        defer；规则上限仍是下限（小单窗预算下更小规则值被尊重）。"""
+        def run_once(duration_seconds, *, max_minutes=240, budget=None):
+            os.environ["COURSELENS_CLOUD_STATE_KEY"] = self.state_key
+            os.environ["COURSELENS_CLOUD_DEEPSEEK_API_KEY"] = "sk-synthetic"
+            rule = make_course_rule("36941")
+            rule["max_lecture_minutes"] = max_minutes
+            self.set_rules(make_rules(
+                rules=[rule],
+                budget=budget or {"max_lectures": 2, "max_runner_minutes": 300, "max_deepseek_tokens": 100000},
+            ))
+            courses = [{"course_id": "36941", "lectures": [
+                {"sub_id": "l-long", "has_playback": True, "duration_seconds": duration_seconds},
+            ]}]
+            processed = []
+            def process(job, *, checkpoint_writer=None):
+                processed.append(job)
+                return {"outputs": {}, "metrics": {}}
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(unittest.mock.patch.object(
+                    cloud_automation, "cloud_session_from_environment",
+                    return_value=FakeConnector(courses),
+                ))
+                stack.enter_context(unittest.mock.patch.object(cloud_automation, "process_job", process))
+                stack.enter_context(unittest.mock.patch.object(
+                    cloud_automation, "usage_snapshot", return_value={"total_tokens": 0},
+                ))
+                code = cloud_automation.run_daily()
+            state = self.read_persisted_state()
+            return code, processed, state["last_run"]["counts"]
+
+        # ① 真实连堂课型：16219s=270.3min（SUBDIAG-1 实测课型），默认规则 240
+        #    + 默认单窗预算 300 → 有效上限 300 → 正常入队处理。
+        code, processed, counts = run_once(16219)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(processed), 1)
+        self.assertEqual(counts["deferred"], 0)
+
+        # ② 异常超长（720min，疑似未停止的全天流）：超出闭集顶 600 → defer。
+        code, processed, counts = run_once(43200)
         self.assertEqual(code, 0)
         self.assertEqual(len(processed), 0)
+        self.assertEqual(counts["deferred"], 1)
+
+        # ③ 规则上限=下限：小单窗预算（120min）下有效上限=max(240,120)=240，
+        #    250min 讲 defer、240min 整讲处理——更小规则值不被预算架空。
+        small_budget = {"max_lectures": 2, "max_runner_minutes": 120, "max_deepseek_tokens": 100000}
+        code, processed, counts = run_once(15000, budget=small_budget)
+        self.assertEqual(len(processed), 0)
+        self.assertEqual(counts["deferred"], 1)
+        code, processed, counts = run_once(14400, budget=small_budget)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(processed), 1)
 
     def test_fixed_bundle_outputs_and_checkpoint_resume(self):
         courses = [{"course_id": "36941", "lectures": [{"sub_id": "l-1", "has_playback": True}]}]
@@ -1174,7 +1640,7 @@ class VerifyAiProbeTests(unittest.TestCase):
     背景：deepseek-flash（09-21 e6cb675 起）为思考档模型，_chat 缺省不带
     thinking 字段=提供商默认 enabled/high，思考 token 计入 max_tokens 预算
     → 原 max_tokens=8 探针被思考耗尽、content 空 → deepseek_verification_
-    failed（verify workflow run 37288805260 根因）。钉面经完整 _chat 传输链：
+    failed（内部 verify workflow run 实证根因）。钉面经完整 _chat 传输链：
     探针载荷必须显式 thinking={"type": "disabled"} + max_tokens=32；思考档
     usage 记账形态（reasoning_tokens>0）+content="OK" 通过；截断空 content
     按既有闭集码诚实失败。

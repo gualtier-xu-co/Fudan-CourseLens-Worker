@@ -47,6 +47,9 @@ _ASR_ERROR_CODES = {
     "authorized media decode timed out": "media_decode_timeout",
     "ffmpeg could not decode the authorized media stream": "media_decode_failed",
     "authorized media prefetch was incomplete": "media_prefetch_incomplete",
+    # MEDIAMISMATCH-1（DIAG755894-1 P1）：并行字节门证容器完整后 PCM 仍短于目录
+    # 声明——平台媒体与目录时长不符的诚实死因码（asr.py proven_complete 门抛出）。
+    "authorized media duration mismatch": "media_duration_mismatch",
     "authorized media request returned HTTP 401": "media_http_401",
     "authorized media request returned HTTP 403": "media_http_403",
     "authorized media request returned HTTP 404": "media_http_404",
@@ -793,8 +796,19 @@ def _process_materialized_job(
             metrics["evidence_items"] = len(packet.get("items") or [])
             metrics["knowledge_points"] = len(list(summary.get("knowledge_points") or []))
             metrics["citations_rejected"] = int(summary.get("citations_rejected") or 0)
-        if slides_skipped:
-            metrics["slides_skipped"] = slides_skipped
+        # V010-PPT-DEDUP-1：ppt_dedup_pages 是同页复用计数不是跳过——单列
+        # metrics 供观测；绝不进 slides_skipped 通知面（客户端对键是闭集码
+        # 映射，且健康 job 不得向学生报「有页被跳过」警告）。
+        dedup_pages = int(slides_skipped.get("ppt_dedup_pages") or 0)
+        if dedup_pages:
+            metrics["ppt_dedup_pages"] = dedup_pages
+        skip_notices = {
+            name: count
+            for name, count in slides_skipped.items()
+            if name != "ppt_dedup_pages"
+        }
+        if skip_notices:
+            metrics["slides_skipped"] = skip_notices
             warnings.append("slides_skipped")
         # N2-2a：judge 共位（R1 六卡/THINK-LADDER 批顺路件）——payload 带
         # additive 键 judge_request（客户端 summary build_job 组装；旧客户端
@@ -980,8 +994,19 @@ def _process_materialized_job(
             )
         if "ocr" in requested:
             outputs["ppt_pages"] = pages
-        if slides_skipped:
-            metrics["slides_skipped"] = slides_skipped
+        # V010-PPT-DEDUP-1：ppt_dedup_pages 是同页复用计数不是跳过——单列
+        # metrics 供观测；绝不进 slides_skipped 通知面（客户端对键是闭集码
+        # 映射，且健康 job 不得向学生报「有页被跳过」警告）。
+        dedup_pages = int(slides_skipped.get("ppt_dedup_pages") or 0)
+        if dedup_pages:
+            metrics["ppt_dedup_pages"] = dedup_pages
+        skip_notices = {
+            name: count
+            for name, count in slides_skipped.items()
+            if name != "ppt_dedup_pages"
+        }
+        if skip_notices:
+            metrics["slides_skipped"] = skip_notices
             warnings.append("slides_skipped")
         if requested.intersection({"summary", "chapters"}):
             def summary_checkpoint(value: dict[str, Any]) -> None:
