@@ -718,17 +718,6 @@ _MEDIA_RETRY_MESSAGES = frozenset({
 # fail-closed；分块短块/空切片同码归真，不再错标 decode 失败。
 _MEDIA_PREFETCH_INCOMPLETE_MESSAGE = "authorized media prefetch was incomplete"
 
-# MEDIAMISMATCH-1（2026-10-17，DIAG755894-1 根因 P1 裁决）：755894 平台更换媒体
-# 后实际音频短于目录声明时长（声明 10065s，实解码仅 ~93-97%），PCM 完整性门与
-# 网络截断共用 media_prefetch_incomplete——学生面只见泛化 remote_failed，真实
-# 死因不可见，17 次重驱全烧在同一确定性失败上。并行路径段级字节门已逐段核账
-# （received==expected）即容器完整已证，此后解码 PCM 仍短于期望只可能是「媒体
-# 内容本身短于目录声明」——按独立闭集码如实上报，载荷带实测/声明两秒数（纯
-# 数字，禁 URL/凭据）；单流路径零变化（proven_complete 缺省 False，维持截断
-# 守卫语义）。该码确定性成立，transcribe 层重取梯不重驱（梯度语义：仅
-# media_prefetch_incomplete 进梯）。
-_MEDIA_DURATION_MISMATCH_MESSAGE = "authorized media duration mismatch"
-
 # P55（第五十五案）：块边界授权刷新此前裸奔——真机事故 2026-09-24：粗腿与前两
 # 块正常，chunk 2 边界 refresh 抛 platform_auth_context_missing 整单即死，且死在
 # decode-start 遥测之前（死窗无痕）。边界刷新与块内媒体重取同族：同量退避梯
@@ -921,10 +910,7 @@ def _prefetch_media_pcm_parallel(
             for index in range(len(bounds)):
                 with (parts_dir / f"seg-{index:04d}.bin").open("rb") as source:
                     shutil.copyfileobj(source, sink, length=1 << 20)
-        # 段级字节门此刻已全部核账通过（每段 received==expected），容器完整性
-        # 已证：传 proven_complete=True，此后 PCM 门短量按 media_duration_mismatch
-        # 如实归因（媒体内容短于目录声明），不再与网络截断共用一个码。
-        _decode_media_to_pcm(str(container), target, duration=duration, proven_complete=True)
+        _decode_media_to_pcm(str(container), target, duration=duration)
         return True
     except _RangeUnsupported:
         return False
@@ -944,21 +930,11 @@ def _prefetch_media_pcm_parallel(
             pass
 
 
-def _decode_media_to_pcm(
-    source_ref: str,
-    target: Path,
-    *,
-    duration: float,
-    proven_complete: bool = False,
-) -> None:
+def _decode_media_to_pcm(source_ref: str, target: Path, *, duration: float) -> None:
     """One bounded ffmpeg pass from a URL or local container to gated PCM.
 
     单流与并行分段两条预取路径共用的解码+完整性门；闭集码与 MEDIA-FIX-
-    PREFETCH-1 期望字节门在此唯一维护。proven_complete=True 仅由并行路径在
-    段级字节门逐段核账通过后传入（MEDIAMISMATCH-1）：容器完整已证时短 PCM
-    只可能是媒体内容短于目录声明，按 media_duration_mismatch 闭集码如实
-    失败（载荷=实测/声明秒数，遥测行同账）；单流路径缺省 False，维持
-    media_prefetch_incomplete 截断守卫语义零变化。
+    PREFETCH-1 期望字节门在此唯一维护。
     """
     command = [
         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
@@ -985,24 +961,8 @@ def _decode_media_to_pcm(
     # 放行截断文件去烧后续分块 ASR。
     expected_bytes = int(round(duration * SAMPLE_RATE)) * _PCM_SAMPLE_BYTES
     minimum_bytes = expected_bytes - SAMPLE_RATE * _PCM_SAMPLE_BYTES
-    actual_bytes = target.stat().st_size
-    if actual_bytes < minimum_bytes:
+    if target.stat().st_size < minimum_bytes:
         target.unlink(missing_ok=True)
-        if proven_complete:
-            # MEDIAMISMATCH-1：段级字节门已证容器完整，短 PCM=媒体内容短于目录
-            # 声明（755894 形状）。独立闭集码+实测/声明两秒数上行（遥测行与
-            # 异常属性，纯数字零 URL/凭据）；确定性失败，调用方不进重取梯。
-            measured_seconds = max(0, actual_bytes // (SAMPLE_RATE * _PCM_SAMPLE_BYTES))
-            declared_seconds = max(0, int(duration))
-            _emit_telemetry(
-                "stage=media-duration-mismatch "
-                f"measured_seconds={measured_seconds} declared_seconds={declared_seconds} "
-                f"bytes={actual_bytes} expected_bytes={expected_bytes}"
-            )
-            error = ASRError(_MEDIA_DURATION_MISMATCH_MESSAGE)
-            error.measured_seconds = measured_seconds
-            error.declared_seconds = declared_seconds
-            raise error
         raise ASRError(_MEDIA_PREFETCH_INCOMPLETE_MESSAGE)
 
 
@@ -1737,8 +1697,6 @@ def transcribe(
             try:
                 _prefetch_media_pcm(proxy.url, full_pcm, duration=duration)
             except ASRError as exc:
-                # media_duration_mismatch（MEDIAMISMATCH-1）是确定性内容失败，
-                # 不进重取梯——换签名 URL 重驱必同败，原样上行停 Retry。
                 if str(exc) != _MEDIA_PREFETCH_INCOMPLETE_MESSAGE:
                     raise
                 _emit_telemetry(
@@ -1746,16 +1704,10 @@ def transcribe(
                     f"reason=media_prefetch_incomplete elapsed={_elapsed_ticks()}"
                 )
                 time.sleep(_MEDIA_RETRY_BACKOFF_SECONDS[0])
-                # R5-WORKERFIX（2026-10-14，37355/39178 批量尾段败定谳）：此处
-                # 曾传 elapsed=_elapsed_ticks()——把调用结果（int）当回调传入，
-                # 梯内首次遇到可重试闭集码时遥测行 elapsed() 即抛
-                # TypeError: 'int' object is not callable：既掩盖真实闭集码，
-                # 又从 except 处理器内炸出、跳过剩余退避重试（瞬态刷新失败
-                # 被升格成整单即死）。传回调本体，梯语义按 P55 原设计生效。
                 _refresh_media_authorization(
                     proxy,
                     chunk=completed_chunks,
-                    elapsed=_elapsed_ticks,
+                    elapsed=_elapsed_ticks(),
                     label="face=prefetch",
                 )
                 _prefetch_media_pcm(proxy.url, full_pcm, duration=duration)
