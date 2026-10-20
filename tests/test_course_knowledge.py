@@ -13,7 +13,6 @@ import os
 import unittest
 from unittest.mock import patch
 
-import courselens_worker.llm as llm
 from courselens_worker.course_knowledge import (
     CONTRACT_ID,
     EVIDENCE_KINDS,
@@ -31,8 +30,7 @@ from courselens_worker.course_knowledge import (
 from courselens_worker.llm import (
     _SUMMARY_EVIDENCE_WINDOW_PROMPT,
     _SUMMARY_MERGE_PROMPT,
-    _SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING,
-    _SUMMARY_MERGE_PROMPT_TEACHING,
+    _SUMMARY_MERGE_PROMPT_WITH_EVIDENCE,
     REVIEW_VIEWS_ENV,
     create_summary,
 )
@@ -431,13 +429,11 @@ class SummaryEvidenceTests(unittest.TestCase):
         with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
                 patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             value = create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES)
-        # V010-STEM-P0-1：窗口提示词=基础串+教学保真后缀（基础串本体一字不改）。
         self.assertEqual(payloads[0][0]["content"],
                          "你是严谨的课程学习助理。仅依据输入整理当前窗口，输出 JSON 对象，"
                          "字段为 markdown 和 chapters；chapters 每项包含 title、start_ms、summary，"
-                         "start_ms 必须来自输入。"
-                         + llm._WINDOW_TEACHING_SUFFIX)
-        self.assertEqual(payloads[-1][0]["content"], _SUMMARY_MERGE_PROMPT_TEACHING)
+                         "start_ms 必须来自输入。")
+        self.assertEqual(payloads[-1][0]["content"], _SUMMARY_MERGE_PROMPT)
         self.assertEqual(sorted(json.loads(payloads[-1][1]["content"])), ["parts", "title"])
         self.assertEqual(value["knowledge_points"], [])
         self.assertEqual(value["topic_candidates"], [])
@@ -469,14 +465,14 @@ class SummaryEvidenceTests(unittest.TestCase):
         merge_payload = json.loads(payloads[-1][1]["content"])
         self.assertIn("evidence_index", merge_payload)
         self.assertEqual(len(merge_payload["evidence_index"]), 7)
-        self.assertEqual(payloads[-1][0]["content"], _SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING)
+        self.assertEqual(payloads[-1][0]["content"], _SUMMARY_MERGE_PROMPT_WITH_EVIDENCE)
         self.assertNotIn("knowledge_points", _SUMMARY_MERGE_PROMPT,
                          "旧提示词不得被改写（有 300 字守门）")
 
     def test_evidence_prompts_pin_the_three_honesty_rules(self):
         for rule in ("只依据 evidence", "不要裁决", "不可信数据", "不得编造标准答案",
                      "材料未给答案"):
-            self.assertIn(rule, _SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING)
+            self.assertIn(rule, _SUMMARY_MERGE_PROMPT_WITH_EVIDENCE)
         self.assertIn("不可信数据", _SUMMARY_EVIDENCE_WINDOW_PROMPT)
 
     def test_valid_points_land_and_dangling_ones_are_dropped(self):
@@ -503,7 +499,7 @@ class SummaryEvidenceTests(unittest.TestCase):
              "citation_ids": [citation], "conflict": True}])
         self.assertTrue(value["knowledge_points"][0]["conflict"])
         for banned in ("必考", "押题", "一定会考"):
-            self.assertNotIn(banned, _SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING)
+            self.assertNotIn(banned, _SUMMARY_MERGE_PROMPT_WITH_EVIDENCE)
 
     def test_broken_model_output_degrades_by_raising(self):
         packet = normalize(all_packets()["complete"])
@@ -524,7 +520,7 @@ class SummaryEvidenceTests(unittest.TestCase):
                 patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             value = create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES,
                                    evidence_packet=normalize({"contract": "other"}))
-        self.assertEqual(payloads[-1][0]["content"], _SUMMARY_MERGE_PROMPT_TEACHING)
+        self.assertEqual(payloads[-1][0]["content"], _SUMMARY_MERGE_PROMPT)
         self.assertEqual(value["knowledge_points"], [])
 
 
