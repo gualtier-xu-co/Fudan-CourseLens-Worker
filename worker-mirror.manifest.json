@@ -1,6 +1,6 @@
 {
   "exporter": {
-    "allowlist_sha256": "ffe8d14836e6236699c2cb34cfde173682a80ee833cd0015d02a58df80754ee2",
+    "allowlist_sha256": "e3a985e27d902f97425bcd1516a01b78f137886e3a11f9f0173e3267c2569d94",
     "version": "1.0.0"
   },
   "payload": {
@@ -152,8 +152,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/llm.py",
-        "sha256": "0d0eaaced1efd1d441a797b05f56aeb8746f590faf18510f2b24628ee4bef484",
-        "size": 153640
+        "sha256": "474962674f120db8539932a184b42548aa5bcd7533af2690f791d9f0dac623ec",
+        "size": 159062
       },
       {
         "mode": "100644",
@@ -194,8 +194,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/runner.py",
-        "sha256": "575d81119b3a527df6440e7d1b80a4fd79085a87b54307b9c1e0dfc599e0f543",
-        "size": 69154
+        "sha256": "f71dc0b6b81ce8d17eef9cd4d55e8dc847138746c007d9fe097a6e157b48784e",
+        "size": 70980
       },
       {
         "mode": "100644",
@@ -235,9 +235,15 @@
       },
       {
         "mode": "100644",
+        "path": "courselens_worker/subtitle_clean.py",
+        "sha256": "8e674da6f3fe8dbf64c174e0693d054fb6b569206a76590dcb0b35cdc7484561",
+        "size": 18627
+      },
+      {
+        "mode": "100644",
         "path": "courselens_worker/summary_contract.py",
-        "sha256": "d4725e364dfbc6e2bcaffab9731e977c22b5500debcbfee79aa6ea98e5d60d13",
-        "size": 26494
+        "sha256": "1396dded532acb820b1de0fd8cd34760b2055a1e3acba08a04170ec463cf8a13",
+        "size": 30337
       },
       {
         "mode": "100644",
@@ -613,6 +619,12 @@
       },
       {
         "mode": "100644",
+        "path": "tests/test_subtitle_clean.py",
+        "sha256": "4bbcc7f61a6c092f88770f7bec51b7fa80e9786658128b698e5fde3db0504666",
+        "size": 22466
+      },
+      {
+        "mode": "100644",
         "path": "tests/test_subtitle_correction.py",
         "sha256": "d2a983695facfef2700e093b625430cfb09d6371e5a2f9e29af28990cf05bf52",
         "size": 16692
@@ -632,8 +644,8 @@
       {
         "mode": "100644",
         "path": "tests/test_summary_contract_v3.py",
-        "sha256": "9567e254151f9a5380ccaa04efc0a03e39cddd7c5a3e2a7b12097cb84d1cea48",
-        "size": 26393
+        "sha256": "3e7092f7b43fd893b5db8c17bfe7b912f99faf73cf0fcdc1c44592b5084f7dcb",
+        "size": 30787
       },
       {
         "mode": "100644",
@@ -690,8 +702,8 @@
         "size": 10522
       }
     ],
-    "git_tree": "b1f9d000e1be6ebe8c92e4844b29582430e877a0",
-    "tree_sha256": "61479b6a62c955144d58052143c13b69188ebf86a7049192bb6e80835c4aafc1"
+    "git_tree": "79a01144b0ac102d4fdba4a308deaa7db766ba24",
+    "tree_sha256": "b4f27aaf31d2d502c9c86dd1f0a4b79d706c039d6c5ad1d54ab7cafdaa2d871e"
   },
   "protocol": {
     "supported_versions": [
@@ -700,8 +712,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "89d0320861dc7501e1427d760d6b4343e2d6249b",
+    "commit": "9f7230734bd027188c0fdfd450a3666870d4b39e",
     "repository": "gualtier-xu-co/Fudan-CourseLens-Private",
-    "worker_tree": "0775a40ede236870f00516337d71462d075cd34e"
+    "worker_tree": "a7395d52079481b791797492ffd1a2ac578a0514"
   }
 }

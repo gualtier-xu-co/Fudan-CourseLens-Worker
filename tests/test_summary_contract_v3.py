@@ -384,6 +384,104 @@ class TestCoerceLlmDoc:
         assert coerce_llm_doc(candidate, self._ANCHORS) is None
 
 
+class TestCoerceLlmDocAnchorRescue:
+    """BANQI-FIX1（685785 三连败定谳，2026-10-23）：doc 候选锚拯救与 chapters
+    同源（QSCOREFIX-1④ 同族）——白名单外先派生真锚、派生失败维持 fail-closed
+    丢段/丢点；pool 缺省 None=逐位旧行为（零回归面）。"""
+
+    _ANCHORS = {0, 300_000, 600_000}
+    # 锚池=合成转写（start_ms, text）：段文本含板块/要点的内容词，Dice 可达阈。
+    _POOL = [
+        (0, "课程安排与考核说明开课介绍"),
+        (300_000, "扩散电容与势垒电容的物理机制推导"),
+        (600_000, "特征频率与最高振荡频率的关系结论"),
+    ]
+
+    @staticmethod
+    def _doc() -> dict:
+        return {
+            "overview": "总述",
+            "sections": [
+                {
+                    "start_ms": 305_841,  # 白名单外（离格时间戳=685785 实证形态）
+                    "title": "扩散电容与势垒电容",  # 与池 300_000 段高重合
+                    "points": [
+                        {"text": "扩散电容与势垒电容的物理机制推导", "anchor_ms": 999_999},
+                    ],
+                },
+            ],
+            "summary_notes": ["小结"],
+        }
+
+    def test_off_whitelist_section_start_is_rescued_from_title(self):
+        stats: dict[str, int] = {}
+        doc = coerce_llm_doc(
+            self._doc(), self._ANCHORS, anchor_text_pool=self._POOL,
+            drop_stats=stats,
+        )
+        assert doc is not None
+        section = doc["sections"][0]
+        assert section["start_ms"] == 300_000  # 派生真锚（白名单值，非编造）
+        assert section["points"][0]["anchor_ms"] == 300_000
+        assert stats.get("sections_anchor_rescued") == 1
+        assert stats.get("points_anchor_rescued") == 1
+        assert stats.get("accepted_sections") == 1
+        # 落键形状恒过同一道门。
+        assert doc == validate_summary_doc(doc)
+
+    def test_off_whitelist_point_anchor_rescued_from_point_text(self):
+        candidate = self._doc()
+        candidate["sections"][0]["start_ms"] = 300_000  # 段锚合法
+        stats: dict[str, int] = {}
+        doc = coerce_llm_doc(
+            candidate, self._ANCHORS, anchor_text_pool=self._POOL,
+            drop_stats=stats,
+        )
+        assert doc is not None
+        assert doc["sections"][0]["points"][0]["anchor_ms"] == 300_000
+        assert stats.get("points_anchor_rescued") == 1
+        assert "sections_dropped_start" not in stats
+
+    def test_non_rescuable_anchors_still_fail_closed(self):
+        # 拯救不达阈值=维持既有丢段纪律（绝不编锚）；pool 在场也不放行。
+        candidate = self._doc()
+        candidate["sections"][0]["title"] = "完全无关的玄学话题甲乙丙丁"
+        candidate["sections"][0]["points"][0]["text"] = "风马牛不相及的另一段内容"
+        stats: dict[str, int] = {}
+        doc = coerce_llm_doc(
+            candidate, self._ANCHORS, anchor_text_pool=self._POOL,
+            drop_stats=stats,
+        )
+        assert doc is None
+        assert stats.get("sections_dropped_start") == 1
+
+    def test_no_pool_keeps_legacy_behavior_bit_for_bit(self):
+        # 不传池=旧行为：白名单外点锚直接剪、离格段锚丢段。
+        candidate = self._doc()
+        candidate["sections"][0]["start_ms"] = 300_000
+        doc = coerce_llm_doc(candidate, self._ANCHORS)
+        assert doc is None  # 点锚 999_999 剪空→段丢→None（与改动前逐位一致）
+        stats: dict[str, int] = {}
+        legacy = coerce_llm_doc(self._doc(), self._ANCHORS, drop_stats=stats)
+        assert legacy is None
+        assert stats.get("sections_dropped_start") == 1
+        assert "sections_anchor_rescued" not in stats
+
+    def test_drop_stats_attributes_validate_rejection(self):
+        # 逐级清洗后仍被整门拒=overview 坏形：拒因归档到 validate_rejected。
+        candidate = self._doc()
+        candidate["sections"][0]["start_ms"] = 300_000
+        candidate["sections"][0]["points"][0]["anchor_ms"] = 300_000
+        del candidate["overview"]
+        stats: dict[str, int] = {}
+        doc = coerce_llm_doc(
+            candidate, self._ANCHORS, anchor_text_pool=self._POOL,
+            drop_stats=stats,
+        )
+        assert doc is None
+        assert stats.get("validate_rejected") == 1
+
+
 class TestEventsAdditive:
     def test_annotate_is_purely_additive(self):
         events = [{

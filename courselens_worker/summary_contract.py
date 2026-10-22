@@ -73,6 +73,11 @@ _POINT_CAP = 500
 _TERM_CAP = 64
 _NOTE_CAP = 120
 _NOTES_MAX = 5  # 合同「3-5 条小结」；key_takeaways(3-6) 头部截取
+# BANQI-FIX1（685785 三连败定谳，2026-10-23）：doc 候选锚拯救阈值=chapters 锚
+# 拯救（llm QSCOREFIX-1④ / RR-QWIN-1 同族）同值同义；本模块零依赖 llm 的独立
+# 同式实现（与 _boundary_similarity 同族字符二元组 Dice）。fail-closed 语义
+# 零放宽：白名单外锚先派生、派生不达阈值宁可丢段/丢点，绝不编锚。
+_DOC_ANCHOR_MIN_SCORE = 0.22
 
 
 def _clean_text(value: Any, cap: int) -> str:
@@ -453,19 +458,69 @@ def enforce_chapter_count(
 # ---- 期 1 LLM 结构化 doc 增量（V010-CONTENT-IMPL-1；走同一校验门）----------
 
 
-def coerce_llm_doc(raw: Any, valid_anchors: set[int]) -> dict[str, Any] | None:
+def _derive_doc_anchor_ms(
+    text: str, pool: list[tuple[int, str]] | None,
+) -> int | None:
+    """doc 候选锚拯救（BANQI-FIX1）：title/point 文本对转写锚池取字符二元组
+    Dice 最优，低于阈值=None。与 chapters 锚拯救（llm._takeaway_anchor_ms，
+    QSCOREFIX-1④）同源同阈同纪律——锚错比锚缺更伤「AI 说的话可信吗」的信任
+    闭环；``pool`` 缺省 None=无拯救（调用方不传=逐位旧行为，零回归面）。"""
+    if not pool:
+        return None
+    grams = _char_bigrams(text)
+    if not grams:
+        return None
+    best_ms: int | None = None
+    best_score = 0.0
+    for start_ms, candidate_text in pool:
+        candidate_grams = _char_bigrams(candidate_text)
+        if not candidate_grams:
+            continue
+        score = 2.0 * len(grams & candidate_grams) / (len(grams) + len(candidate_grams))
+        if score > best_score:
+            best_score = score
+            best_ms = int(start_ms)
+    if best_score < _DOC_ANCHOR_MIN_SCORE:
+        return None
+    return best_ms
+
+
+def coerce_llm_doc(
+    raw: Any,
+    valid_anchors: set[int],
+    anchor_text_pool: list[tuple[int, str]] | None = None,
+    drop_stats: dict[str, int] | None = None,
+) -> dict[str, Any] | None:
     """合并链 LLM doc 候选收敛器：逐级清洗后过 validate_summary_doc 同一道门
     （期 0 docstring 预留的「期 1 LLM 结构化输出」兑现）。清洗规则：
     - 锚完整性：sections 的 start_ms/points 的 anchor_ms 必须在转写/课件锚
       白名单内（QSCOREFIX-1④ 同纪律：白名单外=不可跳转=宁丢不编）；
+      BANQI-FIX1 增量：白名单外先走与 chapters 同源的锚拯救（title/point 文本
+      对 ``anchor_text_pool`` 派生真锚，阈值 _DOC_ANCHOR_MIN_SCORE），派生失败
+      维持既有 fail-closed 丢段/丢点——685785 三连败实证：LLM chapters 20/20
+      全过而 doc 候选三连全拒=doc 路径缺同款拯救（点锚取自渲染时间戳的确定性
+      离格）是对合法内容的系统性误拒，非门太严。
     - source 收敛：合并链候选语义恒为 ``semantic``（ provenance 是调用方已知
       事实，不信任 LLM 自报）；
     - 逐级丢弃：坏点丢点、空段丢段、全空= None（调用方回退本地
-      build_summary_doc 组装）；落键形状恒过 validate_summary_doc=禁半残。"""
+      build_summary_doc 组装）；落键形状恒过 validate_summary_doc=禁半残。
+    - ``drop_stats``（可选，闭集计数器）：raw_missing/sections_dropped_title/
+      sections_dropped_start/sections_anchor_rescued/sections_dropped_points/
+      points_dropped_text/points_dropped_anchor/points_anchor_rescued/
+      sections_empty/validate_rejected/accepted_sections——拒因归档遥测（夜10-C
+      同纪律：计数器零内容），供 685785 重生成轮实证落点条款。"""
+    stats = drop_stats if isinstance(drop_stats, dict) else None
+
+    def _bump(key: str) -> None:
+        if stats is not None:
+            stats[key] = stats.get(key, 0) + 1
+
     if not isinstance(raw, dict) or not isinstance(valid_anchors, set):
+        _bump("raw_missing")
         return None
     raw_sections = raw.get("sections")
     if not isinstance(raw_sections, list):
+        _bump("raw_missing")
         return None
     sections: list[dict[str, Any]] = []
     for item in raw_sections[:_MAX_BLOCKS]:
@@ -473,21 +528,39 @@ def coerce_llm_doc(raw: Any, valid_anchors: set[int]) -> dict[str, Any] | None:
             continue
         start_ms = _valid_ms(item.get("start_ms"))
         title = _clean_text(item.get("title"), _TITLE_CAP)
-        if start_ms is None or start_ms not in valid_anchors or not title:
+        if not title:
+            _bump("sections_dropped_title")
             continue
+        if start_ms is None or start_ms not in valid_anchors:
+            derived = _derive_doc_anchor_ms(title, anchor_text_pool)
+            if derived is None:
+                _bump("sections_dropped_start")
+                continue
+            start_ms = derived
+            _bump("sections_anchor_rescued")
         raw_points = item.get("points")
         if not isinstance(raw_points, list):
+            _bump("sections_dropped_points")
             continue
         points: list[dict[str, Any]] = []
         for point in raw_points[:16]:
             if not isinstance(point, dict):
                 continue
             text = _clean_text(point.get("text"), _POINT_CAP)
-            anchor = _valid_ms(point.get("anchor_ms"))
-            if not text or anchor is None or anchor not in valid_anchors:
+            if not text:
+                _bump("points_dropped_text")
                 continue
+            anchor = _valid_ms(point.get("anchor_ms"))
+            if anchor is None or anchor not in valid_anchors:
+                derived = _derive_doc_anchor_ms(text, anchor_text_pool)
+                if derived is None:
+                    _bump("points_dropped_anchor")
+                    continue
+                anchor = derived
+                _bump("points_anchor_rescued")
             points.append({"text": text, "anchor_ms": anchor})
         if not points:
+            _bump("sections_dropped_points")
             continue
         formulas: list[dict[str, Any]] = []
         raw_formulas = item.get("formulas")
@@ -524,13 +597,22 @@ def coerce_llm_doc(raw: Any, valid_anchors: set[int]) -> dict[str, Any] | None:
                 section["example"] = example
         sections.append(section)
     if not sections:
+        _bump("sections_empty")
         return None
-    return validate_summary_doc({
+    validated = validate_summary_doc({
         "overview": raw.get("overview") if raw.get("overview") is not None else "",
         "sections": sections,
         "terms": raw.get("terms") if raw.get("terms") is not None else [],
         "summary_notes": raw.get("summary_notes") if raw.get("summary_notes") is not None else [],
     })
+    if validated is None:
+        # 逐级清洗后仍被整门拒=overview/terms/summary_notes 形状坏（sections
+        # 已全部过形状门）——诚实省键走本地兜底，计数归档拒因。
+        _bump("validate_rejected")
+        return None
+    if stats is not None:
+        stats["accepted_sections"] = len(validated["sections"])
+    return validated
 
 
 # ---- doc 本地构建（期 0：零新调用，从已过门的结构化产物忠实组装）-----------

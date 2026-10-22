@@ -18,6 +18,7 @@ import requests
 from .formats import normalize_segments
 from .glossary import apply_glossary
 from .retry import LadderExhausted, LadderFailure, run_ladder
+from .subtitle_clean import CLEAN_MAX_OPS_PER_SEGMENT, validate_tier2_dels
 from .summary_contract import (
     SCHEMA_VER,
     annotate_assessment_events,
@@ -208,6 +209,14 @@ _PROOFREAD_INSTRUCTIONS = (
     "old 必须原样出现在对应 text 中，new 只替换该子串。"
     "只修正明显的识别错误；禁止改写、扩写、删句或调整顺序；"
     "数字、单位、公式和否定词不得改动，除非 alt 支持相同写法；无法确定时不要输出该项。"
+    # V010-SUBTITLE-D1 Tier2：deletion-only 轻清洗顺带产出（同窗同调用，零新
+    # 调用面）。del 提案与 old/new 改写 op 互斥并存；提案仍走确定性验证门
+    # （闭集词表+保护形零触碰+删词比帽，见 subtitle_clean.validate_tier2_dels），
+    # 未过门整段回退 Tier1，fail-closed。
+    '此外每项也可以形如 {"id":"p0","del":"要删除的填充词"}：'
+    "仅当 text 中出现纯口头禅、语气词或无实义的垫词（如 嗯、啊、呃、然后、"
+    "那个、就是说、对吧）时输出；del 必须逐字出现在该 text 中，只删不改；"
+    "实义内容、数字、单位、公式、否定词一律不得作为 del；无法确定时不要输出该项。"
 )
 # Evidence fields copied from the chosen primary candidate.  tokens and
 # segment_id describe the uncorrected text, so they are dropped whenever the
@@ -399,8 +408,21 @@ def _pair_alternates(
     return partners
 
 
-def _correct_window(chunk: list[dict[str, Any]], ops: Any) -> list[dict[str, Any]]:
-    """Apply bounded replacement ops to one window, failing closed per pair."""
+def _correct_window(
+    chunk: list[dict[str, Any]], ops: Any
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Apply bounded replacement ops to one window, failing closed per pair.
+
+    V010-SUBTITLE-D1：同时接收同窗顺带产出的 deletion-only 清洗提案
+    （``{"id","del"}``，与 old/new 改写 op 互斥并存）。删除提案不改写
+    text——逐段经 subtitle_clean 确定性验证门（闭集词表/保护形/删词比帽）
+    后以 ``{"start_ms","end_ms","dels"}`` 计划项返回，由调用方随检查点
+    沉淀、runner 终界对最终文本复验后落 clean 三元组。任何验证失败只
+    计拒因计数，绝不报错、绝不影响校对主链。
+    """
+    clean_rejects: dict[str, int] = {}
+    clean_proposed = 0
+    clean_candidates: dict[str, list[str]] = {}
     if not isinstance(ops, list):
         raise LLMError("proofreading response must be a JSON array")
     texts: dict[str, str] = {}
@@ -419,6 +441,23 @@ def _correct_window(chunk: list[dict[str, Any]], ops: Any) -> list[dict[str, Any
             continue
         pair_id = op.get("id")
         if not isinstance(pair_id, str) or pair_id not in texts:
+            continue
+        fragment = op.get("del")
+        if (
+            isinstance(fragment, str)
+            and fragment
+            and "old" not in op
+            and "new" not in op
+        ):
+            # Tier2 deletion-only 提案：只收集，窗内文本定型后统一验证。
+            clean_proposed += 1
+            key = (pair_id, fragment)
+            if key in seen_ops:
+                continue
+            seen_ops.add(key)
+            bucket = clean_candidates.setdefault(pair_id, [])
+            if len(bucket) < CLEAN_MAX_OPS_PER_SEGMENT:
+                bucket.append(fragment)
             continue
         old = op.get("old")
         new = op.get("new")
@@ -449,6 +488,24 @@ def _correct_window(chunk: list[dict[str, Any]], ops: Any) -> list[dict[str, Any
             continue
         texts[pair_id] = result
         applied_counts[pair_id] = applied_counts.get(pair_id, 0) + 1
+    # Tier2 删除提案：对窗内定型文本（old/new 应用后）统一验证；计划项随
+    # 返回值沉淀，验证失败只计闭集拒因（spec §2 遥测），零报错零副作用。
+    clean_plan_entries: list[dict[str, Any]] = []
+    for pair in chunk:
+        wire = pair["wire"]
+        pair_id = wire["id"]
+        fragments = clean_candidates.get(pair_id)
+        if not fragments:
+            continue
+        cleaned, reason = validate_tier2_dels(texts[pair_id], fragments)
+        if cleaned is None:
+            clean_rejects[reason or "contract"] = clean_rejects.get(reason or "contract", 0) + 1
+            continue
+        clean_plan_entries.append({
+            "start_ms": int(wire["start_ms"]),
+            "end_ms": int(wire["end_ms"]),
+            "dels": fragments,
+        })
     segments: list[dict[str, Any]] = []
     for pair in chunk:
         wire = pair["wire"]
@@ -474,7 +531,11 @@ def _correct_window(chunk: list[dict[str, Any]], ops: Any) -> list[dict[str, Any
         elif not pair["paired"]:
             segment["correction"] = "unpaired"
         segments.append(segment)
-    return segments
+    return segments, {
+        "entries": clean_plan_entries,
+        "proposed": clean_proposed,
+        "rejected": clean_rejects,
+    }
 
 
 # Slide context is terminology evidence, not rewrite authority: one bounded,
@@ -516,6 +577,7 @@ def proofread_segments(
     glossary: tuple[str, ...] = (),
     usage_sink: list[dict[str, Any]] | None = None,
     progress: Callable[[str, int, int], None] | None = None,
+    clean_plan_sink: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Bounded word-level correction of ``primary`` against alternates.
 
@@ -525,6 +587,9 @@ def proofread_segments(
     （与 term 链同法），供调用方把词级校对的真实 token 落进任务账。
     ``progress``（N8）非 None 时逐批发射 ("proofread", completed, total)——
     与 ASR 块环发射同形状，学生侧进度条不再整段冻结。
+    ``clean_plan_sink``（V010-SUBTITLE-D1）非 None 时收走窗内验证通过的
+    Tier2 删除计划（``{"start_ms","end_ms","dels"}`` 项；含检查点续跑种子），
+    runner 终界对最终文本复验后落 clean 三元组。
     """
     primaries = normalize_segments(primary)
     alternates = normalize_segments(rough_alternates)
@@ -536,6 +601,15 @@ def proofread_segments(
     # restarts from window 0 instead of trusting its segment list.
     trusted = prior.get("proofread_pairing") == PROOFREAD_PAIRING
     output: list[dict[str, Any]] = list(prior.get("proofread_segments") or []) if trusted else []
+    # V010-SUBTITLE-D1：Tier2 删除计划随检查点续跑（信任门与校对段同门——
+    # 非信任配对整单重启，计划一并作废重来，绝不混用跨链状态）。
+    clean_plan: list[dict[str, Any]] = (
+        list(prior.get("clean_ops_plan") or []) if trusted else []
+    )
+    if clean_plan_sink is not None:
+        clean_plan_sink[:] = clean_plan
+    clean_proposed_total = 0
+    clean_rejected_total: dict[str, int] = {}
     total_windows = (len(primaries) + _PROOFREAD_WINDOW - 1) // _PROOFREAD_WINDOW
     completed = (
         max(0, min(total_windows, int(prior.get("proofread_completed_windows") or 0)))
@@ -618,7 +692,16 @@ def proofread_segments(
             futures = {index: executor.submit(request_window, batch[index]) for index in indices}
             responses = {index: futures[index].result() for index in indices}
         for window_index in indices:
-            output.extend(_correct_window(batch[window_index], responses[window_index]))
+            window_segments, clean_result = _correct_window(
+                batch[window_index], responses[window_index]
+            )
+            output.extend(window_segments)
+            clean_plan.extend(clean_result["entries"])
+            clean_proposed_total += int(clean_result.get("proposed") or 0)
+            for reason, count in (clean_result.get("rejected") or {}).items():
+                clean_rejected_total[reason] = clean_rejected_total.get(reason, 0) + int(count)
+            if clean_plan_sink is not None:
+                clean_plan_sink[:] = clean_plan
             if checkpoint is not None:
                 checkpoint({
                     "stage": "proofread",
@@ -626,6 +709,7 @@ def proofread_segments(
                     "proofread_completed_windows": window_index + 1,
                     "proofread_total_windows": total_windows,
                     "proofread_segments": normalize_segments(output),
+                    "clean_ops_plan": list(clean_plan),
                 })
         if progress is not None:
             progress("proofread", indices[-1] + 1, total_windows)
@@ -639,10 +723,17 @@ def proofread_segments(
     distribution_text = " ".join(
         f"{key}={value}" for key, value in sorted(correction_distribution.items())
     ) or "none=0"
+    # V010-SUBTITLE-D1：Tier2 清洗腿遥测（proposed/验证通过计划数/闭集拒因
+    # 计数——零提案零内容零字幕文本，runner._progress 纪律同上）。
+    clean_rejected_text = " ".join(
+        f"{key}={value}" for key, value in sorted(clean_rejected_total.items())
+    ) or "none=0"
     _emit_telemetry(
         f"stage=proofread windows={total_windows}/{total_windows} "
         f"resumed={completed} window_retries={proofread_window_retries} "
-        f"segments={len(result)} {distribution_text}"
+        f"segments={len(result)} {distribution_text} "
+        f"clean_plan={len(clean_plan)} clean_proposed={clean_proposed_total} "
+        f"clean_rejected {clean_rejected_text}"
     )
     return result
 
@@ -2379,8 +2470,15 @@ def create_summary(
     chapters_v2 = build_chapters_v2(chapters, transcript)
     # V010-CONTENT-IMPL-1 件3（期 1 LLM 结构化增量）：合并调用顺带产出的 doc
     # 候选逐级清洗过 validate_summary_doc 同一道门（锚白名单收敛+source 恒
-    # semantic）；全不可用=本地组装兜底——落键形状恒过门，禁半残。
-    llm_doc = coerce_llm_doc(value.get("doc"), valid_anchors)
+    # semantic）；BANQI-FIX1：doc 锚拯救与 chapters 同源（anchor_text_pool 同池
+    # 同阈值，白名单外先派生、派生失败才丢段/丢点）——685785 三连败实证 doc
+    # 路径缺同款拯救=对合法内容系统性误拒；drop_stats 闭集计数随遥测归档拒因。
+    # 全不可用=本地组装兜底——落键形状恒过门，禁半残。
+    doc_drop_stats: dict[str, int] = {}
+    llm_doc = coerce_llm_doc(
+        value.get("doc"), valid_anchors,
+        anchor_text_pool=anchor_text_pool, drop_stats=doc_drop_stats,
+    )
     doc = llm_doc or build_summary_doc(value["markdown"], chapters_v2, takeaways)
     _emit_telemetry(
         f"stage=summary windows={len(sources)}/{len(sources)} "
@@ -2402,6 +2500,9 @@ def create_summary(
         f"doc={1 if doc is not None else 0} "
         f"doc_llm={1 if llm_doc is not None else 0} "
         f"chapters_v2={1 if chapters_v2 is not None else 0}"
+        # BANQI-FIX1 拒因归档（闭集计数器，仅非空时落遥测；键集由
+        # summary_contract.coerce_llm_doc docstring 冻结）。
+        f" doc_stats={doc_drop_stats if doc_drop_stats else '{}'}"
     )
     result = {
         "model": MODEL,

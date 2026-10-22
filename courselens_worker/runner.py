@@ -98,6 +98,9 @@ _SUBTITLE_RESUME_KEYS = (
     "term_proofread_total_windows",
     "term_proofread_terms",
     "term_proofread_segments",
+    # V010-SUBTITLE-D1：Tier2 清洗删除计划随检查点携带（校对窗顺带产出、
+    # runner 终界对最终文本复验后落 clean 三元组；跨段重排与续跑零重复计费）。
+    "clean_ops_plan",
 )
 
 
@@ -242,6 +245,33 @@ def _apply_ct_punc_stage(value: dict[str, Any], *, warnings: list[str]) -> None:
     print(
         f"stage=ct-punc mode={ct_punc_mode()} applied={stats.get('applied', 0)} "
         f"kept={stats.get('kept', 0)}",
+        flush=True,
+    )
+
+
+def _apply_display_cleaning_stage(
+    value: dict[str, Any],
+    clean_plan: list[dict[str, Any]],
+) -> None:
+    """V010-SUBTITLE-D1 终界清洗：Tier2 计划复验优先，Tier1 闭集兜底。
+
+    对链路终点（term 深校对 + ct-punc 之后）的最终文本就地附加 clean 展示
+    三元组（clean_text/clean_source/clean_del_ratio，shared 契约字段）；
+    ``text`` 恒不改写（忠实层：VTT/SRT/证据层恒 verbatim）。Tier1 零
+    token、缺省生效（未配置 DeepSeek 的用户=Tier1 only，现状链零回归）；
+    Tier2 计划按 (start_ms,end_ms) 锚匹配、任何复验失败整段回退 Tier1
+    （fail-closed）。遥测仅计数与闭集词。
+    """
+    from .subtitle_clean import apply_display_cleaning
+
+    stats = apply_display_cleaning(value.get("segments") or [], clean_plan)
+    print(
+        f"stage=subtitle-clean segments={stats.get('segments', 0)} "
+        f"tier1_applied={stats.get('tier1_applied', 0)} "
+        f"tier2_applied={stats.get('tier2_applied', 0)} "
+        f"tier2_fallback_tier1={stats.get('tier2_fallback_tier1', 0)} "
+        f"tier2_plan_unmatched={stats.get('tier2_plan_unmatched', 0)} "
+        f"no_cleaning={stats.get('no_cleaning', 0)}",
         flush=True,
     )
 
@@ -604,6 +634,9 @@ def _process_materialized_job(
         # RR-ACCOUNT2-1：字幕链统一账本（词级校对窗 + term 深校对段共用
         # 一本），任务级 metrics 汇总真实 token（纯观测计数）。
         subtitle_usage: list[dict[str, Any]] = []
+        # V010-SUBTITLE-D1：Tier2 清洗删除计划捕获槽（校对窗顺带产出；
+        # term 深校对链会重建段 dict，计划必须走段外通道穿越到终界）。
+        clean_plan: list[dict[str, Any]] = []
         value = transcribe(
             job,
             sensevoice_dir=Path(_required("SENSEVOICE_MODEL_DIR")),
@@ -619,6 +652,7 @@ def _process_materialized_job(
                     checkpoint=write,
                     usage_sink=subtitle_usage,
                     progress=progress,
+                    clean_plan_sink=clean_plan,
                 )) if api_key else None
             ),
             progress=progress,
@@ -634,6 +668,7 @@ def _process_materialized_job(
             progress=progress,
         )
         _apply_ct_punc_stage(value, warnings=warnings)
+        _apply_display_cleaning_stage(value, clean_plan)
         outputs = {
             "subtitle": {
                 "mode": value["mode"],
