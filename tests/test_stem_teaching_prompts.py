@@ -22,7 +22,9 @@ from courselens_worker.llm import (
     _REVIEW_VIEWS_PROMPT,
     _REVIEW_VIEWS_PROMPT_TEACHING,
     _STEM_TEACHING_RULES,
+    _SUMMARY_DOC_RULES,
     _SUMMARY_MERGE_PROMPT,
+    _SUMMARY_MERGE_PROMPT_DOC_TEACHING,
     _SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING,
     _SUMMARY_MERGE_PROMPT_TEACHING,
     _SUMMARY_WINDOW_PROMPT,
@@ -89,6 +91,50 @@ class WindowTeachingSuffixPins(unittest.TestCase):
         self.assertTrue(_SUMMARY_WINDOW_PROMPT.startswith("你是严谨的课程学习助理"))
         self.assertNotIn("教学骨架", _WINDOW_TEACHING_SUFFIX,
                          "骨架组织归合并步，窗口只做素材保真")
+
+
+class LatexNotationPins(unittest.TestCase):
+    """V010-CONTENT-IMPL-1 件1（CONTENT-R1 B1①）：LaTeX 记写指令映射客户端
+    MATHRENDER 识别闭集（math-render.js：display=\\[…\\]/$$…$$、inline=\\(…\\)，
+    有意排除单 $）——指令面禁止单 $ 包裹，窗口与合并两级都在场。"""
+
+    def test_window_suffix_carries_closed_set_notation(self):
+        self.assertIn("\\(…\\)", _WINDOW_TEACHING_SUFFIX)
+        self.assertIn("\\[…\\]", _WINDOW_TEACHING_SUFFIX)
+        self.assertIn("禁用单个 $", _WINDOW_TEACHING_SUFFIX)
+
+    def test_merge_rules_carry_closed_set_notation_course_type_agnostic(self):
+        # 无论课型（文科讲次也可能有符号式）——与课型自门控并列。
+        self.assertIn("无论课型", _STEM_TEACHING_RULES)
+        self.assertIn("\\(…\\)", _STEM_TEACHING_RULES)
+        self.assertIn("\\[…\\]", _STEM_TEACHING_RULES)
+        self.assertIn("$$…$$", _STEM_TEACHING_RULES)
+        self.assertIn("禁用单个 $", _STEM_TEACHING_RULES)
+        # 基础串一字不改（防膨胀钉照守）。
+        self.assertLessEqual(len(_SUMMARY_MERGE_PROMPT), 300)
+
+
+class SummaryDocRulesPins(unittest.TestCase):
+    """V010-CONTENT-IMPL-1 件3（CONTENT-R1 B3）：合并调用 doc 结构化产出指令
+    ——变体加段模式（基础串与既有变体零改），落键走 validate_summary_doc 同
+    一道门（合同面钉在 test_summary_contract_v3）。"""
+
+    def test_doc_rules_field_surface(self):
+        for needle in ("doc", "overview", "sections", "source恒填semantic",
+                       "points", "anchor_ms", "formulas", "latex",
+                       "summary_notes"):
+            self.assertIn(needle, _SUMMARY_DOC_RULES)
+
+    def test_variants_compose_through_doc_segment(self):
+        # 链式组合：base→teaching→doc→evidence；旧前缀性质逐级保持。
+        self.assertTrue(_SUMMARY_MERGE_PROMPT_DOC_TEACHING.startswith(
+            _SUMMARY_MERGE_PROMPT_TEACHING))
+        self.assertTrue(_SUMMARY_MERGE_PROMPT_DOC_TEACHING.endswith(
+            _SUMMARY_DOC_RULES))
+        self.assertTrue(_SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING.startswith(
+            _SUMMARY_MERGE_PROMPT_DOC_TEACHING))
+        self.assertTrue(_SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING.endswith(
+            _EVIDENCE_RULES))
 
 
 class ReviewViewsTeachingPromptPins(unittest.TestCase):
