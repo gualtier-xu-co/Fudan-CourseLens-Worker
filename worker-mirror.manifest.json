@@ -700,7 +700,7 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "89d0320861dc7501e1427d760d6b4343e2d6249b",
+    "commit": "58a178ad03beed865cd85681b9e3576a688e9b92",
     "repository": "gualtier-xu-co/Fudan-CourseLens-Private",
     "worker_tree": "0775a40ede236870f00516337d71462d075cd34e"
   }
