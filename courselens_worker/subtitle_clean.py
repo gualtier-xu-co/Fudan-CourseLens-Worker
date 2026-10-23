@@ -7,7 +7,9 @@ V010-SUBTITLE-UX-R1 §2，字段级契约=shared/subtitle_display_contract.py，
 - **Tier1（零 LLM token、默认生效）**：确定性闭集垫词删除。对段文本做
   闭集整词扫描（宁脏勿错守卫内置），产出 deletion-only 的 clean 视图
   （来源 ``tier1_rule``）；单段删词比超 ``CLEAN_TIER1_MAX_DEL_RATIO``
-  即整段放弃（保留原文）。
+  时按删除优先级类帽内贪心保留（V010-SUBTITLE-CLEAN-R2 U1：纯语气词＞
+  问询垫词＞话语垫词＞裸指示词，逐候选过守卫链，全不入帽才整段保留）。
+  落键前对 src AS13 句首剥离施展示视图对齐（U2，消费侧适配）。
 - **Tier2（deletion-only LLM 轻清洗）**：校对窗顺带产出的 ``{"id","del"}``
   删除提案的确定性验证器——闭集词表命中（或纯重复串）+ 保护形零触碰
   + 每段 ops ≤ 4 + 删词比 ≤ ``CLEAN_TIER2_MAX_DEL_RATIO``，任何一门
@@ -48,6 +50,7 @@ from shared.subtitle_display_contract import (
     CLEAN_MAX_OPS_PER_SEGMENT,
     clean_budget_ok,
     clean_del_ratio_of,
+    clean_text_is_deletion_only,
     validate_clean_ops,
     validate_display_cue_v2,
 )
@@ -60,36 +63,74 @@ TAG_QUESTION_FILLERS = (
     "对吧", "对不对", "是不是", "行不行", "好不好", "好吗", "懂吧", "明白吧",
 )
 # 句中垫词（仅垫词形态；形态本身无歧义，句中直接删——fixture 金样本
-# 「这个公式就是说我们…」对齐）。
-MID_SENTENCE_FILLERS = ("就是说", "然后呢", "这个呢", "那个呢", "的话呢", "然后的话")
+# 「这个公式就是说我们…」对齐）。V010-SUBTITLE-CLEAN-R2 U3 扩充：
+# 就是说吧（就是说 的语气尾扩形）/其实/那么（话语标记形态；那么 的程度/
+# 指示用法由 _MID_FORM_NEXT_EXCLUSION 后界排除闭集守卫）。
+MID_SENTENCE_FILLERS = (
+    "就是说", "然后呢", "这个呢", "那个呢", "的话呢", "然后的话",
+    "就是说吧", "其实", "那么",
+)
 # 裸指示垫词（歧义面最大，可作实义指示词/指代宾语；仅双边整词跨度才删，
 # 「这个公式」的指示用法与「我们讲这个」的句尾指代一律保留）。
 BARE_DEMONSTRATIVE_FILLERS = ("这个", "那个", "然后")
 # 纯语气词（与 src AS13 SHAPE_FILLER_CHARS 同表，客户端整形口径对齐；
-# 单边后界）。
+# 单边后界；其中 呃/嗯 由 MID_SENTENCE_PARTICLES 升级为句中守卫）。
 PARTICLE_FILLERS = tuple("呃嗯啊哦噢哎唉欸诶嘿哟唷咦哇喔咯嘞呣唔嘛啦呗")
+# 句中语气词扩充（V010-SUBTITLE-CLEAN-R2 U3；D4 走查实证「判别法呢呃两个
+# 级数」句中残留）：呃/嗯 与 src AS13 句首剥离拍板闭集同字（零实词词形，
+# 句中亦为纯噪音，升级 any 守卫）；呢=口语句中垫词，词义面仅 呢子/呢绒/
+# 呢喃 三个词形，由 _MID_FORM_NEXT_EXCLUSION 后界排除守卫。
+MID_SENTENCE_PARTICLES = ("呃", "嗯", "呢")
+
+# 句中扩充形态的后界排除闭集（宁脏勿错补充门；命中排除=该位保留原文）：
+# 那么 的程度/指示用法（那么多/那么大/那么远/那么久/那么些/那么样…）与
+# 呢 的实义词形（呢子/呢绒/呢喃）后接字闭集，具名防漂移。
+_MID_FORM_NEXT_EXCLUSION = {
+    "那么": frozenset("多大小长短远近高低快慢厚薄点些样回"),
+    "呢": frozenset("子绒喃"),
+}
 
 _GUARD_ANY = "any"
 _GUARD_AFTER = "after"
 _GUARD_WHOLE = "whole"
 
-# 长度优先扫描序（「然后的话」先于「然后」、「明白吧」先于单字）。
-_FILLER_RULES: tuple[tuple[str, str], ...] = tuple(sorted(
-    (
-        *(((form, _GUARD_AFTER) for form in TAG_QUESTION_FILLERS)),
-        *(((form, _GUARD_ANY) for form in MID_SENTENCE_FILLERS)),
-        *(((form, _GUARD_WHOLE) for form in BARE_DEMONSTRATIVE_FILLERS)),
-        *(((form, _GUARD_AFTER) for form in PARTICLE_FILLERS)),
-    ),
-    key=lambda item: (-len(item[0]), item[0]),
-))
+# 删除优先级类（V010-SUBTITLE-CLEAN-R2 U1 帽内贪心序）：纯语气词=零信息
+# 噪音（用户痛点本体）＞ 问询垫词（公式化互动）＞ 话语垫词（有承接义）＞
+# 裸指示词（歧义最大，最后考虑）。同类内按位置序（阅读顺序）。
+_PRIORITY_PARTICLE, _PRIORITY_TAG, _PRIORITY_MID, _PRIORITY_BARE = 0, 1, 2, 3
+
+# 长度优先扫描序（「然后的话」先于「然后」、「明白吧」先于单字）；
+# 呃/嗯 由 MID_SENTENCE_PARTICLES 守卫覆盖（同形覆盖，不重复入表）。
+_FORM_GUARDS: dict[str, str] = {}
+_FORM_PRIORITY: dict[str, int] = {}
+for _form in TAG_QUESTION_FILLERS:
+    _FORM_GUARDS[_form] = _GUARD_AFTER
+    _FORM_PRIORITY[_form] = _PRIORITY_TAG
+for _form in MID_SENTENCE_FILLERS:
+    _FORM_GUARDS[_form] = _GUARD_ANY
+    _FORM_PRIORITY[_form] = _PRIORITY_MID
+for _form in BARE_DEMONSTRATIVE_FILLERS:
+    _FORM_GUARDS[_form] = _GUARD_WHOLE
+    _FORM_PRIORITY[_form] = _PRIORITY_BARE
+for _form in PARTICLE_FILLERS:
+    _FORM_GUARDS[_form] = (
+        _GUARD_ANY if _form in MID_SENTENCE_PARTICLES else _GUARD_AFTER
+    )
+    _FORM_PRIORITY[_form] = _PRIORITY_PARTICLE
+for _form in MID_SENTENCE_PARTICLES:
+    _FORM_GUARDS[_form] = _GUARD_ANY
+    _FORM_PRIORITY[_form] = _PRIORITY_PARTICLE
+
+_FILLER_RULES: tuple[tuple[str, str], ...] = tuple(
+    sorted(
+        ((form, guard) for form, guard in _FORM_GUARDS.items()),
+        key=lambda item: (-len(item[0]), item[0]),
+    )
+)
 _FILLER_LOOKUP: dict[str, str] = dict(_FILLER_RULES)
 
-# Tier2 验证用闭集并集（闭集类别命中即放行，位置守卫属 Tier1 选择逻辑）。
-TIER2_CLOSED_SET = frozenset(
-    (*TAG_QUESTION_FILLERS, *MID_SENTENCE_FILLERS,
-     *BARE_DEMONSTRATIVE_FILLERS, *PARTICLE_FILLERS)
-)
+# Tier2 验证用闭集并集（闭集类别命中即放行，位置守卫属验证选择逻辑）。
+TIER2_CLOSED_SET = frozenset(_FORM_GUARDS)
 
 # 句读与空白（判定整词跨度/句首标点折叠）。
 _JUNCTURE_CHARS = frozenset("，。？！、；：,.!?;:…—·（）()「」『』《》〈〉\"'")
@@ -221,6 +262,12 @@ def _budget_source(max_del_ratio: float) -> str:
     return "tier1_rule" if max_del_ratio >= CLEAN_TIER1_MAX_DEL_RATIO else "tier2_llm"
 
 
+def _mid_form_next_excluded(form: str, text: str, end: int) -> bool:
+    """句中扩充形态的后界排除门（那么/呢 的程度与实义词形守卫）。"""
+    exclusion = _MID_FORM_NEXT_EXCLUSION.get(form)
+    return bool(exclusion) and end < len(text) and text[end] in exclusion
+
+
 def tier1_candidate_spans(text: str) -> list[tuple[int, int]]:
     """闭集整词扫描（宁脏勿错守卫内置；跨度按序、互不重叠）。
 
@@ -254,6 +301,7 @@ def tier1_candidate_spans(text: str) -> list[tuple[int, int]]:
         if (
             allowed
             and not negation_adjacent
+            and not _mid_form_next_excluded(form, text, end)
             and not any(_overlaps(start, end, span[0], span[1]) for span in spans)
         ):
             spans.append((start, end))
@@ -274,13 +322,31 @@ def tier1_candidate_spans(text: str) -> list[tuple[int, int]]:
 
 
 def tier1_clean_text(text: str) -> str | None:
-    """Tier1 确定性闭集垫词删除；无可清洗或守卫拒绝返回 None（保留原文）。"""
+    """Tier1 确定性闭集垫词删除（V010-SUBTITLE-CLEAN-R2 U1：帽内贪心保留）。
+
+    候选按删除优先级类（纯语气词＞问询垫词＞话语垫词＞裸指示词，同类按
+    位置序）逐个试探并入，每步经完整守卫链（保护形多重集/content-core/
+    删词比帽）复核：任一候选并入超帽或破坏守卫则弃用该候选继续——垫词
+    密集句由「超帽整句放弃」改为「帽内贪心保留」，帽语义与全部边界守卫
+    （否定/保护形/整词跨度/后界排除）原样。无任何候选可入帽返回 None。
+    """
     if not isinstance(text, str) or not text.strip():
         return None
     spans = tier1_candidate_spans(text)
     if not spans:
         return None
-    return _guard_cleaned(text, spans, CLEAN_TIER1_MAX_DEL_RATIO)
+    ordered = sorted(
+        spans,
+        key=lambda span: (_FORM_PRIORITY.get(text[span[0]:span[1]], _PRIORITY_BARE), span[0]),
+    )
+    accepted: list[tuple[int, int]] = []
+    for span in ordered:
+        trial = sorted(accepted + [span])
+        if _guard_cleaned(text, trial, CLEAN_TIER1_MAX_DEL_RATIO) is not None:
+            accepted = trial
+    if not accepted:
+        return None
+    return _guard_cleaned(text, accepted, CLEAN_TIER1_MAX_DEL_RATIO)
 
 
 def validate_tier2_dels(text: str, dels: list[Any]) -> tuple[str | None, str | None]:
@@ -312,7 +378,12 @@ def validate_tier2_dels(text: str, dels: list[Any]) -> tuple[str | None, str | N
         start = text.find(fragment)
         if start < 0:
             return None, "closed_set"
-        spans.append((start, start + len(fragment)))
+        end = start + len(fragment)
+        # 句中扩充形态后界排除门（与 Tier1 同源）：那么多/呢子 类实义形态
+        # 该位不适用垫词删除，提案拒（fail-closed 整段回退 Tier1）。
+        if _mid_form_next_excluded(fragment, text, end):
+            return None, "closed_set"
+        spans.append((start, end))
     # 否定边界守卫（与 Tier1 同源）：实际删除发生位的紧邻前/后为否定字 →
     # 拒。「他是不是不能来」的 A-not-A 疑问形态与「不对吧」的否定边界，
     # 删除会翻转/孤儿化否定语义（宁脏勿错，整段回退 Tier1）。
@@ -355,6 +426,46 @@ def validate_tier2_dels(text: str, dels: list[Any]) -> tuple[str | None, str | N
     return cleaned, None
 
 
+# ---- AS13 句首剥离镜像（V010-SUBTITLE-CLEAN-R2 U2 消费侧适配）------------
+# 展示链在服务端（src/runtime/subtitle_reader.py::_SHAPE_LEADING_FILLER_RE）
+# 对 cue text 确定性剥首（仅 呃/嗯 连串+紧随标点，拍板边界），前端镜像按
+# 「clean_text ⊑ 送达 text」复核、失配即整行回退 verbatim——worker 若按
+# 原文落三键，剥首突变即触发回退缝（D4 样本A 行1 实证）。此处按值镜像同
+# 一正则（契约本体零改动；worker/tests 挂 src 同源漂移钉），落键前把
+# clean 视图对齐到剥首后展示文本。
+_AS13_LEADING_STRIP_RE = re.compile(
+    r"^[呃嗯](?:[ \u00a0]*[呃嗯])*[ \u00a0]*[。！？，、；：,.!?;:~～…—··]*[ \u00a0]*"
+)
+
+
+def as13_display_text(text: str) -> str:
+    """src 展示链对 cue text 的句首剥离视图（对齐基准；纯函数镜像）。"""
+    return _AS13_LEADING_STRIP_RE.sub("", text.strip()).strip()
+
+
+def as13_aligned_clean(text: str, cleaned: str, source: str) -> str | None:
+    """把 clean 视图对齐到 AS13 剥首后的展示文本（U2 回退缝消除）。
+
+    ``cleaned`` 为按原文计算的删除式视图；若展示链将对 text 施剥首突变，
+    则对 cleaned 施同一剥离并复列三门（子序列/删词比帽/content-core）——
+    任何一门不过=放弃落键（前端回退 verbatim 与现状等价，宁缺勿错）。
+    text 无剥首突变或 clean 头部已无该形时原样返回。
+    """
+    shaped = as13_display_text(text)
+    if shaped == text:
+        return cleaned
+    aligned = _AS13_LEADING_STRIP_RE.sub("", cleaned.strip()).strip()
+    if aligned == cleaned and clean_text_is_deletion_only(cleaned, shaped):
+        return cleaned
+    if not aligned or not _has_content_core(aligned):
+        return None
+    if not clean_text_is_deletion_only(aligned, shaped):
+        return None
+    if not clean_budget_ok(source, clean_del_ratio_of(text, aligned)):
+        return None
+    return aligned
+
+
 def apply_display_cleaning(
     segments: list[dict[str, Any]],
     clean_plan: list[dict[str, Any]] | None,
@@ -377,6 +488,7 @@ def apply_display_cleaning(
         "tier2_fallback_tier1": 0,
         "tier2_plan_unmatched": 0,
         "no_cleaning": 0,
+        "as13_aligned": 0,
     }
     plan_by_anchor: dict[tuple[int, int], list[Any]] = {}
     for entry in clean_plan or []:
@@ -418,6 +530,15 @@ def apply_display_cleaning(
         if cleaned is None or source is None or cleaned == text:
             stats["no_cleaning"] += 1
             continue
+        aligned = as13_aligned_clean(text, cleaned, source)
+        if aligned is None:
+            # 对齐门放弃（剥首后子序列/帽/content-core 不过）：不落键，
+            # 前端回退 verbatim 与无三键等价（宁缺勿错，绝不半对齐）。
+            stats["no_cleaning"] += 1
+            continue
+        if aligned != cleaned:
+            stats["as13_aligned"] += 1
+        cleaned = aligned
         trio = {
             "clean_text": cleaned,
             "clean_source": source,

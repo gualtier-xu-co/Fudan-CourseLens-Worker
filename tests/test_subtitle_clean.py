@@ -23,6 +23,7 @@ from shared.subtitle_display_contract import (
     CLEAN_TIER1_MAX_DEL_RATIO,
     CLEAN_TIER2_MAX_DEL_RATIO,
     SubtitleDisplayContractError,
+    clean_del_ratio_of,
     clean_text_is_deletion_only,
     display_text,
     validate_display_cue_v2,
@@ -116,6 +117,64 @@ class Tier1BoundaryTests(unittest.TestCase):
         self.assertIsNone(tier1_clean_text("就是说不清楚这个概念"))
         self.assertIsNone(tier1_clean_text("啊不是这样的"))
 
+
+class MidSentenceExpansionTests(unittest.TestCase):
+    """V010-SUBTITLE-CLEAN-R2 U3 句中语气词/话语垫词扩充钉（D4 升级项）。
+
+    每个扩充形态均带否定陷阱与实义词形排除回归（「不对吧」类实证拒绝形态
+    的同源面）；守卫三重门（否定边界/保护形/后界排除）全部生效。
+    """
+
+    def test_mid_sentence_particle_deleted(self):
+        # D4 样本A 行3 实证残留（「判别法呢呃两个」）：呢/呃 句中形态删，
+        # 对吧 随贪心入帽；就是说 再入即超帽（7/19=37%）→ 帽内诚实保留
+        #（TAG 先于 MID，D4 优先级建议）。
+        self.assertEqual(
+            tier1_clean_text("比较判别法呢就是说呃两个级数比一比对吧"),
+            "比较判别法就是说两个级数比一比",
+        )
+        self.assertEqual(
+            tier1_clean_text("收敛的级数呢它有这个好的性质"),
+            "收敛的级数它有这个好的性质",
+        )
+
+    def test_head_particle_deleted_aligns_as13_strip(self):
+        # 呃/嗯 any 守卫与 AS13 句首剥离拍板闭集同字：句首形态一并删。
+        self.assertEqual(
+            tier1_clean_text("呃比值判别法也就是达朗贝尔判别法懂吧"),
+            "比值判别法也就是达朗贝尔判别法",
+        )
+
+    def test_particle_negation_traps(self):
+        # 否定陷阱回归（扩充形态逐词）：否定边界上一律不删。
+        self.assertIsNone(tier1_clean_text("嗯不是这样的"))
+        self.assertIsNone(tier1_clean_text("呃不"))  # 呃后紧邻否定字
+        self.assertIsNone(tier1_clean_text("其实不然，他没来"))
+        self.assertIsNone(tier1_clean_text("不那么做更稳妥"))
+        self.assertIsNone(tier1_clean_text("这个问题呢不存在反例"))  # 呢后否定
+
+    def test_discourse_fillers_deleted(self):
+        # 具名话语垫词扩充（就是说吧/其实/那么）句中直接删。
+        self.assertEqual(
+            tier1_clean_text("这一章就是说吧我们讲矩阵的乘法"),
+            "这一章我们讲矩阵的乘法",
+        )
+        self.assertEqual(tier1_clean_text("其实这道题有两种解法"), "这道题有两种解法")
+        self.assertEqual(tier1_clean_text("那么我们来看下一题"), "我们来看下一题")
+
+    def test_mid_form_next_exclusion_traps(self):
+        # 实义词形后界排除闭集：那么多/呢子/呢绒/呢喃 类形态保留原文。
+        self.assertIsNone(tier1_clean_text("那么多作业要写"))
+        self.assertIsNone(tier1_clean_text("这件呢子大衣很贵"))
+        self.assertIsNone(tier1_clean_text("呢喃细语很轻"))
+        # Tier2 同源排除门：实义形态提案拒（fail-closed 回退 Tier1）。
+        cleaned, reason = validate_tier2_dels("那么多作业要写", ["那么"])
+        self.assertIsNone(cleaned)
+        self.assertEqual(reason, "closed_set")
+        cleaned, reason = validate_tier2_dels("那么我们来看下一章的内容", ["那么"])
+        self.assertIsNone(reason)
+        self.assertEqual(cleaned, "我们来看下一章的内容")
+
     def test_whole_filler_cue_refused(self):
         # 整句皆垫词：删后 content-core 为空 → 保留原文（cue 级删除属整形层）。
         self.assertIsNone(tier1_clean_text("嗯，对吧。"))
@@ -127,9 +186,45 @@ class Tier1BoundaryTests(unittest.TestCase):
     def test_seam_double_punct_folded(self):
         self.assertEqual(tier1_clean_text("定义讲完了对吧，接下来讲定理"), "定义讲完了，接下来讲定理")
 
-    def test_ratio_cap_keeps_original(self):
-        # 单 cue 删除比 >30% → 该 cue 保留原文整句（不落三键）。
-        self.assertIsNone(tier1_clean_text("嗯啊对吧然后呢"))
+    def test_ratio_cap_greedy_partial_clean(self):
+        # V010-SUBTITLE-CLEAN-R2 U1：超帽句不再整句放弃——帽内贪心保留
+        # （「嗯啊对吧然后呢」：嗯(any)入帽 1/8；然后呢单项 3/8 超帽弃）。
+        text = "嗯啊对吧然后呢"
+        cleaned = tier1_clean_text(text)
+        self.assertEqual(cleaned, "啊对吧然后呢")
+        self.assertLessEqual(
+            clean_del_ratio_of(text, cleaned), CLEAN_TIER1_MAX_DEL_RATIO
+        )
+
+    def test_ratio_cap_no_candidate_fits_keeps_original(self):
+        # U1 边界：唯一可删候选自身超帽 → 保留原文（帽语义不变）。
+        self.assertIsNone(tier1_clean_text("哎就是说"))
+
+    def test_dense_filler_sentence_greedy_subset(self):
+        # U1 主靶（D4 样本A 行8）：14 字句 4 垫词全删=57% 超帽——贪心按
+        # 优先级类保留呢/啊（2/14），然后呢/就是说 各自超帽弃。
+        text = "然后呢大于一呢就是说它发散啊"
+        cleaned = tier1_clean_text(text)
+        self.assertEqual(cleaned, "然后呢大于一就是说它发散")
+        self.assertLessEqual(
+            clean_del_ratio_of(text, cleaned), CLEAN_TIER1_MAX_DEL_RATIO
+        )
+        self.assertTrue(clean_text_is_deletion_only(cleaned, text))
+
+    def test_greedy_priority_particle_before_mid(self):
+        # U1 优先级：纯语气词（呢/啊）先于话语垫词（就是说）入帽，且
+        # 「就是说呢」删就是说不再孤儿化句首呢。
+        text = "就是说呢先看这个正项级数啊"
+        cleaned = tier1_clean_text(text)
+        self.assertEqual(cleaned, "就是说先看这个正项级数")
+        self.assertNotIn("呢", cleaned)
+
+    def test_greedy_full_fit_identical_to_all_spans(self):
+        # U1 等价性：全候选入帽时与原 all-or-nothing 结果全等（零回归面）。
+        self.assertEqual(
+            tier1_clean_text("呃今天呢我们来讲这个级数收敛的判别法对吧"),
+            "今天我们来讲这个级数收敛的判别法",
+        )
 
     def test_protected_partial_overlap_drops_candidate(self):
         # 「三那个十」删「那个」会组合出新保护形「三十」→ 整段拒绝。
@@ -401,6 +496,49 @@ class ProofreadPiggybackTests(unittest.TestCase):
         self.assertEqual(sink, [])
 
 
+class As13AlignmentTests(unittest.TestCase):
+    """V010-SUBTITLE-CLEAN-R2 U2 钉：AS13 句首剥离×clean 三键失配缝消除。
+
+    展示链（src/runtime/subtitle_reader.py）服务端剥 cue text 句首 呃/嗯
+    后，前端镜像按「clean_text ⊑ 送达 text」复核——worker 落键前把 clean
+    对齐到剥首视图（消费侧适配；契约本体零改动）。
+
+    正则同源漂移钉（对 src 正则的逐字比对）平移至主仓
+    ``tests/test_subtitle_cue_shape.py::As13MirrorSyncTests``（R6 发布道
+    平移：镜像载荷禁私模块依赖，export fail-closed 拦截实证；两侧皆可见
+    的跨仓复核归主仓测试面）。
+    """
+
+    def test_alignment_mutates_clean_when_worker_kept_head_particle(self):
+        # 对偶形态：否定边界守卫保留的句首嗯（「嗯不是这样的…」——嗯 紧邻
+        # 不），AS13 剥首后由对齐剥离（与展示面一致；否定语义由剥首拍板
+        # 闭集自身承载）。合并删词比（worker 3/17 + 嗯 1 字）帽内通过。
+        segments = [seg(0, 2000, "嗯不是这样的同学呢我们下次再讲对吧")]
+        stats = apply_display_cleaning(segments, [])
+        cue = segments[0]
+        self.assertEqual(stats["as13_aligned"], 1)
+        self.assertEqual(cue["clean_text"], "不是这样的同学我们下次再讲")
+        self.assertLessEqual(
+            cue["clean_del_ratio"], CLEAN_TIER1_MAX_DEL_RATIO
+        )
+        validate_display_cue_v2(cue)
+
+    def test_alignment_fail_closed_on_budget(self):
+        # 对齐后删词比超帽 → 整键放弃（宁缺勿错，绝不落半对齐三键）。
+        segments = [seg(0, 2000, "呃，讲这个呢")]
+        stats = apply_display_cleaning(segments, [])
+        self.assertEqual(stats["no_cleaning"], 1)
+        for key in ("clean_text", "clean_source", "clean_del_ratio"):
+            self.assertNotIn(key, segments[0])
+
+    def test_alignment_noop_without_head_form(self):
+        # text 无剥首突变 → 三键原样（对齐零触碰）。
+        segments = [seg(0, 2000, "然后呢我们讲矩阵的乘法的运算规则")]
+        stats = apply_display_cleaning(segments, [])
+        self.assertEqual(stats["as13_aligned"], 0)
+        self.assertEqual(segments[0]["clean_text"], "我们讲矩阵的乘法的运算规则")
+
+
 class RunnerStageTests(unittest.TestCase):
     """runner 终界接线钉：_apply_display_cleaning_stage 就地落键+遥测计数。"""
 
@@ -455,6 +593,59 @@ class ContractIntegrationTests(unittest.TestCase):
         clean = sanitize_display_fields(cue)
         self.assertNotIn("clean_text", clean)
         self.assertEqual(clean["text"], "然后呢我们讲矩阵")
+
+
+class ByteIdentityAndDistributionTests(unittest.TestCase):
+    """V010-SUBTITLE-CLEAN-R2 钉：全管线 byte-identity 恒等+删词比分布不变量。"""
+
+    # 合成垫词密集语料（V010-SUBTITLE-D4 样本A 同族通识虚构，零真实语料）。
+    _SYNTHETIC_CORPUS = (
+        "呃今天呢我们来讲这个级数收敛的判别法对吧",
+        "就是说呢先看这个正项级数啊",
+        "比较判别法呢就是说呃两个级数比一比对吧",
+        "然后呢收敛的级数呢它有这个好的性质",
+        "呃比值判别法也就是达朗贝尔判别法懂吧",
+        "就是后一项比前一项然后呢取这个极限",
+        "呃极限小于一呢它就收敛对不对",
+        "然后呢大于一呢就是说它发散啊",
+        "这个呢根值判别法就是说柯西判别法",
+        "呃就是n次开方然后呢取极限啊",
+        "然后呢积分判别法呢就是说看这个反常积分",
+        "呃收敛还是发散这个呢跟p有关对吧",
+        "好今天就讲到这里然后呢下节课讲幂级数",
+    )
+
+    def test_full_pipeline_byte_identity_except_trio(self):
+        # 忠实层构造性保证（byte-identity 恒等钉）：清洗只新增三键，剥键
+        # 后快照与拍前全等（text/时间轴/全部既有字段逐字节恒等）。
+        segments = [
+            seg(0, 2000, "呃然后呢我们讲矩阵的乘法对吧"),
+            seg(2000, 4000, "判别式大于零时方程有两个不相等的实数根。"),
+        ]
+        snapshot = json.dumps(segments, ensure_ascii=False)
+        apply_display_cleaning(segments, [])
+        stripped = [
+            {k: v for k, v in item.items()
+             if k not in ("clean_text", "clean_source", "clean_del_ratio")}
+            for item in segments
+        ]
+        self.assertEqual(json.dumps(stripped, ensure_ascii=False), snapshot)
+
+    def test_del_ratio_distribution_within_cap(self):
+        # 删词比分布不变量：合成语料任意清洗结果删词比 ≤ Tier1 帽（超帽
+        # =不落键）；U1 贪心后清洗覆盖面只增不减（至少 10/13 行受益）。
+        from shared.subtitle_display_contract import clean_del_ratio_of
+
+        ratios = []
+        for text in self._SYNTHETIC_CORPUS:
+            segments = [seg(0, 2000, text)]
+            apply_display_cleaning(segments, [])
+            cue = segments[0]
+            if "clean_text" in cue:
+                ratio = clean_del_ratio_of(cue["text"], cue["clean_text"])
+                self.assertLessEqual(ratio, CLEAN_TIER1_MAX_DEL_RATIO)
+                ratios.append(ratio)
+        self.assertGreaterEqual(len(ratios), 10)
 
 
 if __name__ == "__main__":

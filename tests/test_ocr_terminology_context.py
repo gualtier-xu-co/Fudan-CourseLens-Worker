@@ -219,7 +219,8 @@ class RunnerOrderTests(unittest.TestCase):
         )
 
         def fake_summary(api_key, *, title, transcript, ppt_pages, prior_checkpoint, checkpoint,
-                         usage_sink=None, progress=None):
+                         usage_sink=None, progress=None, slide_pack=None):
+            # slide_pack 是 V010-SLIDEALIGN-1 的加性参数：课件第二源（试点）。
             checkpoint({
                 "stage": "summary",
                 "completed_chunks": 1,

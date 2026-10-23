@@ -18,6 +18,7 @@ import requests
 from .formats import normalize_segments
 from .glossary import apply_glossary
 from .retry import LadderExhausted, LadderFailure, run_ladder
+from .slide_alignment import assign_pack_windows
 from .subtitle_clean import CLEAN_MAX_OPS_PER_SEGMENT, validate_tier2_dels
 from .summary_contract import (
     SCHEMA_VER,
@@ -215,7 +216,7 @@ _PROOFREAD_INSTRUCTIONS = (
     # 未过门整段回退 Tier1，fail-closed。
     '此外每项也可以形如 {"id":"p0","del":"要删除的填充词"}：'
     "仅当 text 中出现纯口头禅、语气词或无实义的垫词（如 嗯、啊、呃、然后、"
-    "那个、就是说、对吧）时输出；del 必须逐字出现在该 text 中，只删不改；"
+    "那个、就是说、其实、那么、对吧）时输出；del 必须逐字出现在该 text 中，只删不改；"
     "实义内容、数字、单位、公式、否定词一律不得作为 del；无法确定时不要输出该项。"
 )
 # Evidence fields copied from the chosen primary candidate.  tokens and
@@ -1630,6 +1631,34 @@ _SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING = (
     _SUMMARY_MERGE_PROMPT_DOC_TEACHING + "；" + _EVIDENCE_RULES
 )
 
+# ---- V010-SLIDEALIGN-1：课件（幻灯）对齐第二源（试点） ----------------------
+# 转写源结构性缺公式（BANQI-QUAL U1：老师不念公式，零公式讲次幻灯数学行
+# 57-61）。slide_pack 在场时：窗口源以去重对齐 deck 替代重复帧、附逐窗公式
+# 行，合并输入附讲级公式单；提示词只经「+ 后缀」新常量（旧串逐位不动，
+# 299/300 防膨胀钉与既有变体 startswith/endswith 钉零触）。slide_pack=None
+# 时全部路径逐位旧行为（试点对照组语义）。纪律边界：slide_pack 是与
+# ppt_pages 同源的 OCR 文本（本地闭集抽取，零外发），指令明确「转写未提
+# 及≠不存在；只记 slide 数据内事实，禁编造」。
+_WINDOW_SLIDE_SUFFIX = (
+    "输入中的 slide_deck 是本讲课件逐页文本（已去重）、slide_formulas 是其中"
+    "疑似公式行：公式与符号以 slide 数据为准转写（LaTeX），转写未提及≠不存在；"
+    "只记 slide 数据内事实，与其冲突时并列不裁决。"
+)
+_MERGE_SLIDE_RULES = (
+    "输入含 slide_formulas（本讲课件公式行清单）：doc 各 section 的 formulas"
+    "应把归属本节的课件公式逐条转写（latex 不含定界符，anchor_ms 取该节"
+    "start_ms 或输入内合法锚），转写未提及≠不存在；清单外公式不编造。"
+)
+_SUMMARY_MERGE_PROMPT_TEACHING_SLIDE = (
+    _SUMMARY_MERGE_PROMPT_TEACHING + "；" + _MERGE_SLIDE_RULES
+)
+_SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING_SLIDE = (
+    _SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING + "；" + _MERGE_SLIDE_RULES
+)
+# V010-SLIDEALIGN-1：合并输入公式单条数帽（prompt 经济；build_slide_pack 已
+# 帽 48，此处对讲级清单二次收紧到合并窗经济区间）。
+MAX_MERGE_SLIDE_FORMULAS = 40
+
 
 # RR-QWIN-1 Q1（AI-RESEARCH-1 P1）：takeaway 时间戳锚本地派生——零提示词
 # 零新调用（merge 提示词顶在 ≤300 防膨胀钉上，指令通道走不通）。候选文本池
@@ -2026,6 +2055,7 @@ def create_summary(
     glossary: tuple[str, ...] = (),
     usage_sink: list[dict[str, Any]] | None = None,
     progress: Callable[[str, int, int], None] | None = None,
+    slide_pack: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """摘要/知识生成。
 
@@ -2038,10 +2068,15 @@ def create_summary(
     ``progress``（N8）非 None 时逐批发射 ("summary", completed, total)：
     total 含 merge 位（与 completed_chunks=total_chunks+1 检查点语义对齐），
     降级跳过的窗也计数推进（进度诚实=含跳过），merge 完成发终值。
+    ``slide_pack``（V010-SLIDEALIGN-1 试点）为课件对齐第二源
+    （slide_alignment.build_slide_pack 产物）：非 None 时窗口以去重对齐
+    deck 替代重复帧并附 slide_formulas、合并输入附讲级公式单（见
+    _WINDOW_SLIDE_SUFFIX/_MERGE_SLIDE_RULES）；None 时逐位旧行为。
     """
     packet = evidence_packet if isinstance(evidence_packet, dict) else None
     if packet is not None and not packet.get("usable"):
         packet = None
+    slide = slide_pack if isinstance(slide_pack, dict) and slide_pack.get("deck") else None
     context = validate_course_context(course_context) if course_context is not None else {}
     terms = [str(term).strip() for term in (glossary or ()) if str(term).strip()][:200]
     # SUMMARY-FIX-1：思考档显式决策（缺省 disabled，env 闭集覆写）；思考档
@@ -2065,6 +2100,19 @@ def create_summary(
     transcript_windows = [transcript[start:start + 120] for start in range(0, len(transcript), 120)]
     if not transcript_windows:
         transcript_windows = [[] for _ in range(max(1, (len(ppt_pages) + 19) // 20))]
+    # V010-SLIDEALIGN-1：课件第二源的窗口级对齐（一次全局分配，与窗口切分
+    # 同序；无页窗=None=该窗按既有路径回退）。slide 缺席时零额外计算。
+    slide_slices: list[dict[str, Any] | None] = [None] * len(transcript_windows)
+    if slide is not None:
+        slide_bounds = [
+            (
+                int(window[0].get("start_ms") or 0),
+                int(window[-1].get("end_ms") or int(window[0].get("start_ms") or 0)),
+            )
+            if window else (0, 0)
+            for window in transcript_windows
+        ]
+        slide_slices = assign_pack_windows(slide, slide_bounds)
     sources = []
     for index, transcript_window in enumerate(transcript_windows):
         if transcript_window:
@@ -2080,6 +2128,12 @@ def create_summary(
         # 计划指纹不哈希载荷键序（检查点续跑语义不变）；防膨胀钉=只许搬移
         # 禁止加字；语义等价由盲评 A/B（输出差 ≤5%）验证。
         source = {"transcript": transcript_window, "ppt_pages": pages}
+        # 课件第二源（试点）：有对齐 slice 的窗以去重 deck 替代重复帧并附
+        # 公式行；无 slice 的窗维持既有页面（fail-closed 不造空 slide 源）。
+        slide_slice = slide_slices[index] if slide is not None else None
+        if slide_slice:
+            source["ppt_pages"] = slide_slice["deck"]
+            source["slide_formulas"] = slide_slice["formulas"]
         if terms and transcript_window:
             source = {"glossary": terms, **source}
         sources.append(source)
@@ -2121,6 +2175,10 @@ def create_summary(
         # V010-STEM-P0-1：教学保真后缀统一追加（机制/推导链与幻灯图像事实
         # 保留）；基础串本体一字不改，后缀内容见 _WINDOW_TEACHING_SUFFIX。
         window_prompt = window_prompt + _WINDOW_TEACHING_SUFFIX
+        # V010-SLIDEALIGN-1：课件第二源后缀仅随 slide_pack 在场追加（新常量，
+        # 旧串逐位不动）。
+        if window.get("slide_formulas") is not None:
+            window_prompt = window_prompt + _WINDOW_SLIDE_SUFFIX
         messages = [
             {"role": "system", "content": window_prompt},
             {"role": "user", "content": json.dumps(window, ensure_ascii=False)},
@@ -2208,14 +2266,25 @@ def create_summary(
         # V4NONTHINK-1 件6：合并调用术语表走数据通道（merge 提示词顶在 ≤300
         # 防膨胀钉上不增字；窗口提示词已带「以 glossary 表为准」指令）。
         merge_input["glossary"] = terms
+    if slide is not None and slide.get("formulas"):
+        # V010-SLIDEALIGN-1：讲级课件公式单走数据通道（合并提示词防膨胀钉
+        # 不动，指令经 _MERGE_SLIDE_RULES 后缀变体）。
+        merge_input["slide_formulas"] = list(slide["formulas"])[:MAX_MERGE_SLIDE_FORMULAS]
     merge_input["parts"] = parts
     # SUMMARY-FIX-1：合并调用显式思考档+提额帽；content 空/坏 JSON/空 markdown
     # （C2 实锤形态）先抢救再重试 1 次，仍败 fail-closed 抛出。
-    merge_messages = [
-        {"role": "system", "content": (
+    if slide is not None and slide.get("formulas"):
+        merge_prompt = (
+            _SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING_SLIDE if packet is not None
+            else _SUMMARY_MERGE_PROMPT_TEACHING_SLIDE
+        )
+    else:
+        merge_prompt = (
             _SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING if packet is not None
             else _SUMMARY_MERGE_PROMPT_TEACHING
-        )},
+        )
+    merge_messages = [
+        {"role": "system", "content": merge_prompt},
         {"role": "user", "content": json.dumps(merge_input, ensure_ascii=False)},
     ]
     def attempt_fn(attempt: int) -> dict[str, Any]:
@@ -2483,6 +2552,8 @@ def create_summary(
     _emit_telemetry(
         f"stage=summary windows={len(sources)}/{len(sources)} "
         f"resumed={completed} evidence_windows={len(evidence_windows)} "
+        f"slide_windows={sum(1 for item in slide_slices if item)} "
+        f"slide_formulas={len((slide or {}).get('formulas') or ())} "
         f"events={len(events)} events_rejected={rejected} "
         f"takeaways={len(takeaways)} "
         f"takeaway_anchors={sum(1 for item in takeaway_anchors if item is not None)} "

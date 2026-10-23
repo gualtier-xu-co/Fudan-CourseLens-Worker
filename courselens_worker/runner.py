@@ -704,6 +704,7 @@ def _process_materialized_job(
         from .lecture_ir import build_lecture_ir
         from .llm import LLMError, create_summary
         from .ocr import process_slides
+        from .slide_alignment import build_slide_pack
 
         payload = dict(job.get("payload") or {})
         transcript = list(payload.get("transcript") or [])
@@ -715,6 +716,13 @@ def _process_materialized_job(
             prior_checkpoint=prior,
             checkpoint=checkpoint_writer,
         ) if slides else (list(prior.get("ppt_pages") or []), dict(prior.get("ppt_skipped") or {}))
+        # V010-SLIDEALIGN-1：课件第二源（本地闭集从 OCR 页整理去重 deck+公式
+        # 单；无可用页= None=既有路径逐位执行）。推导失败绝不致命。
+        try:
+            slide_pack = build_slide_pack(pages)
+        except Exception:  # noqa: BLE001 - slide 源属增值面，故障不挡总结
+            slide_pack = None
+            warnings.append("slide_pack_build_failed")
 
         def summary_checkpoint(value: dict[str, Any]) -> None:
             if checkpoint_writer is not None:
@@ -748,6 +756,10 @@ def _process_materialized_job(
         if glossary:
             # V4NONTHINK-1 件6：摘要窗口/合并输入携带课程术语表（笔记写法保险）。
             summary_args["glossary"] = glossary
+        if slide_pack is not None:
+            # V010-SLIDEALIGN-1：课件第二源仅在有可用 deck 时传（老 job 逐字
+            # 兼容；llm_pending 回执不带 slide_pack，客户端领回路径不受影响）。
+            summary_args["slide_pack"] = slide_pack
         # RR-ACCOUNT2-1：摘要链（窗口+合并，含失败尝试）统一账本，任务级
         # metrics 汇总真实 token（纯观测计数）。
         summary_usage: list[dict[str, Any]] = []
@@ -894,6 +906,7 @@ def _process_materialized_job(
         from .glossary import build_glossary
         from .llm import LLMError, answer_question, create_summary, drain_call_log, proofread_segments
         from .ocr import process_slides
+        from .slide_alignment import build_slide_pack
 
         payload = dict(job.get("payload") or {})
         requested = set(job.get("requested_outputs") or [])
@@ -1097,6 +1110,16 @@ def _process_materialized_job(
             if pack_terms:
                 # V4NONTHINK-1 件6：learning_pack 摘要同享术语表注入（含 OCR 词表）。
                 summary_args["glossary"] = pack_terms
+            if wants_slides and pages:
+                # V010-SLIDEALIGN-1：learning_pack 摘要同享课件第二源（增值面
+                # 推导失败不致命，与 summary 分支同纪律）。
+                try:
+                    slide_pack = build_slide_pack(pages)
+                except Exception:  # noqa: BLE001 - slide 源属增值面，故障不挡总结
+                    slide_pack = None
+                    warnings.append("slide_pack_build_failed")
+                if slide_pack is not None:
+                    summary_args["slide_pack"] = slide_pack
             # RR-ACCOUNT2-1：摘要链（窗口+合并，含失败尝试）统一账本，任务级
             # metrics 汇总真实 token（纯观测计数）。
             summary_usage: list[dict[str, Any]] = []
