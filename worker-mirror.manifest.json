@@ -590,8 +590,8 @@
       {
         "mode": "100644",
         "path": "tests/test_slide_alignment.py",
-        "sha256": "026255a21a6e76f6202b8fe75c8a1db2db0f6df3cbc066ca46f4515ed3e97cc8",
-        "size": 12771
+        "sha256": "9c2d1ef281d881cb9ab96821a1e7015ebce6b4461b86a34699af7e231408ffdc",
+        "size": 12975
       },
       {
         "mode": "100644",
@@ -720,8 +720,8 @@
         "size": 10522
       }
     ],
-    "git_tree": "812e148cbf5e51363c5d3f8e3bc8450861149b95",
-    "tree_sha256": "9c2deec777207c57bc8cff6a6883b6e4a811b0d5002d7fcc0b0c9291ab5c0081"
+    "git_tree": "0b8a03852a156f8c5c208a5a7c77f479983f6b27",
+    "tree_sha256": "a609e9a6c1b3ca8de3f73243335e90acef284fafe34b1760febd4fa13c4371bd"
   },
   "protocol": {
     "supported_versions": [
@@ -730,8 +730,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "b797584b1137cced4398193d33cf7099c75f86a8",
+    "commit": "0714551b510e9120052e716accd0f608e567e592",
     "repository": "gualtier-xu-co/Fudan-CourseLens-Private",
-    "worker_tree": "bcef4fe198b89847fc444efacf31b7c6f40c7e3a"
+    "worker_tree": "96622b743010c79cf5d4ead5e2559b68ecbd1389"
   }
 }

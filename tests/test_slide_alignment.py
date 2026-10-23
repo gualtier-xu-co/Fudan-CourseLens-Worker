@@ -11,8 +11,6 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
-import pytest
-
 from courselens_worker.llm import (
     _MERGE_SLIDE_RULES,
     _SUMMARY_MERGE_PROMPT,
@@ -284,5 +282,10 @@ def test_prompt_variant_family_pins():
 
 
 if __name__ == "__main__":
+    # pytest 仅直跑入口需要（镜像 CI=unittest 发现面无 pytest，顶层导入会
+    # 炸整模块收集：r14 环 CI 实证，r15 环随形修——测试体纯 assert 零依赖）。
     import sys
+
+    import pytest
+
     sys.exit(pytest.main([__file__, "-q"]))
