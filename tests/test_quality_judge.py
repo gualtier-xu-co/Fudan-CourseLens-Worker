@@ -126,7 +126,8 @@ class PromptPinTests(unittest.TestCase):
             )),
             (_JUDGE_ADJ_SUBTITLE_PROMPT, (
                 "确认或否决", "补漏", "没有问题输出空 findings", "禁止编造输入外的问题",
-                "零自由文本", "segment", "term_fidelity", "readability",
+                "零自由文本", "segment", "position=segments 0 基下标",
+                "term_fidelity", "readability",
                 "glossary_violation", "homophone_suspect", "term_inconsistent",
                 "broken_flow", "garbled", "warn", "info",
             )),
@@ -139,7 +140,8 @@ class PromptPinTests(unittest.TestCase):
             )),
             (_JUDGE_ADJ_SUMMARY_PROMPT, (
                 "确认或否决", "补漏", "没有问题输出空 findings", "禁止编造输入外的问题",
-                "零自由文本", "chapter", "takeaway", "body", "factuality",
+                "零自由文本", "chapter", "takeaway", "body", "position=0基下标",
+                "body=0", "章题自查", "factuality",
                 "alignment", "readability", "no_source_support",
                 "contradicts_source", "chapter_mislabel", "duplicate_content",
                 "empty_section", "warn", "info",
@@ -465,10 +467,12 @@ class JudgeCallTests(unittest.TestCase):
         self.assertEqual(
             report["stages"],
             {
-                "subtitle": {"flash_findings": 1, "adjudicated": True},
-                "summary": {"flash_findings": 2, "adjudicated": True},
+                "subtitle": {"flash_findings": 1, "flash_dropped": 0,
+                             "adjudicated": True, "adj_dropped": 0},
+                "summary": {"flash_findings": 2, "flash_dropped": 0,
+                            "adjudicated": True, "adj_dropped": 0},
             },
-            "stages 加性键逐 mode 记筛出数与是否裁")
+            "stages 加性键逐 mode 记筛出数与是否裁+分段无效丢弃（ADJFIX-1）")
         final = [line for line in lines if line.startswith("stage=quality-judge ")]
         self.assertEqual(len(final), 1, lines)
         self.assertIn("subtitle_findings=1", final[0])
@@ -481,6 +485,35 @@ class JudgeCallTests(unittest.TestCase):
         self.assertIn("findings_invalid_dropped=0", final[0])
         for leaked in ("链式聚合", "凝胶化", "本讲讲", "k"):
             self.assertNotIn(leaked, final[0], "遥测零内容零账号值")
+
+    def test_adj_invalid_drops_counted_per_stage_and_telemetry(self):
+        # ADJFIX-1：分段无效丢弃计数入 stages 报告与闭集遥测（r2 实账裁段
+        # 218-241/掷=最大单点浪费，此即修前修后对照面；聚合键原样保留）。
+        flash_payload = {"findings": [
+            {"target": "segment", "position": 1, "dimension": "term_fidelity",
+             "code": "homophone_suspect", "severity": "warn"},
+            {"target": "bogus", "position": 0, "dimension": "term_fidelity",
+             "code": "homophone_suspect", "severity": "warn"},
+        ]}
+        adj_payload = {"findings": [
+            {"target": "segment", "position": 99, "dimension": "readability",
+             "code": "garbled", "severity": "info"},
+            {"target": "segment", "position": 0, "dimension": "bogus",
+             "code": "garbled", "severity": "info"},
+        ]}
+        report, _, _, lines = self._run(
+            [json.dumps(flash_payload), json.dumps(adj_payload)])
+        self.assertEqual(
+            report["stages"]["subtitle"],
+            {"flash_findings": 1, "flash_dropped": 1,
+             "adjudicated": True, "adj_dropped": 2},
+            "分段丢弃计数：筛段 1（越集 target）+裁段 2（越界/越集）")
+        self.assertEqual(report["subtitle"]["findings"], [], "裁段全否决→空 findings")
+        final = [line for line in lines if line.startswith("stage=quality-judge ")]
+        self.assertEqual(len(final), 1, lines)
+        self.assertIn("findings_invalid_dropped=3", final[0])
+        self.assertIn("findings_invalid_dropped_flash=1", final[0])
+        self.assertIn("findings_invalid_dropped_adj=2", final[0])
 
     def test_glossary_travels_data_channel_and_empty_omits_key(self):
         capture: dict = {}
@@ -505,7 +538,8 @@ class JudgeCallTests(unittest.TestCase):
         self.assertIsNone(report["summary"])
         self.assertEqual(calls, {"subtitle": 1, "summary": 0}, "筛段零 findings→裁段零调用")
         self.assertEqual(
-            report["stages"]["subtitle"], {"flash_findings": 0, "adjudicated": False})
+            report["stages"]["subtitle"],
+            {"flash_findings": 0, "flash_dropped": 0, "adjudicated": False})
 
     def test_adjudication_input_carries_flash_findings(self):
         capture: dict = {}
@@ -526,14 +560,18 @@ class JudgeCallTests(unittest.TestCase):
         self.assertEqual(capture["adj_input"]["segments"], _SEGMENTS)
         self.assertEqual(report["subtitle"]["findings"], [], "裁段 deny 修剪误报")
         self.assertEqual(
-            report["stages"]["subtitle"], {"flash_findings": 1, "adjudicated": True})
+            report["stages"]["subtitle"],
+            {"flash_findings": 1, "flash_dropped": 0,
+             "adjudicated": True, "adj_dropped": 0})
 
     def test_adjudication_degrades_to_flash_on_shape_failure(self):
         report, calls, usage, lines = self._run(
             [json.dumps(_SUBTITLE_FINDINGS), "垃圾一"])
         self.assertEqual(len(report["subtitle"]["findings"]), 1, "裁段两败降级保留筛段")
         self.assertEqual(
-            report["stages"]["subtitle"], {"flash_findings": 1, "adjudicated": False})
+            report["stages"]["subtitle"],
+            {"flash_findings": 1, "flash_dropped": 0,
+             "adjudicated": False, "adj_dropped": 0})
         self.assertEqual(calls, {"subtitle": 3, "summary": 0}, "筛 1+裁 2（attempts=2）")
         self.assertEqual(len(usage), 3, "失败尝试也落账")
         degraded = [line for line in lines if line.startswith("stage=quality-judge-adj-degraded")]

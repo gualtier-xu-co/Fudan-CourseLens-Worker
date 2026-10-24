@@ -281,6 +281,129 @@ def test_prompt_variant_family_pins():
     assert FORMULA_LINE_CAP == 160
 
 
+# ---- 面4：用户导入材料第二源（V010-SHUJI-SLIDES-1 S2） ---------------------
+
+class TestDocumentPagesToPptPages:
+    def _doc_page(self, num, text, start_ms=0, sha=None, visual=None):
+        row = {"page_num": num, "text": text}
+        if start_ms is not None:
+            row["start_ms"] = start_ms
+        if sha is not None:
+            row["text_hash"] = sha
+        if visual is not None:
+            row["visual_hash"] = visual
+        return row
+
+    def test_aligned_pages_map_created_sec_and_identity(self):
+        from courselens_worker.slide_alignment import document_pages_to_ppt_pages
+
+        pages = document_pages_to_ppt_pages([
+            self._doc_page(1, "阈值电压\nV_TH = V_FB + 2φ_F", start_ms=229_432, sha="a" * 64),
+            self._doc_page(2, "电流方程 I_D = ½μC(W/L)(V_GS−V_TH)²", start_ms=450_610, sha="b" * 64),
+        ])
+        assert pages[0]["created_sec"] == 229
+        assert pages[1]["created_sec"] == 450
+        assert pages[0]["source_sha256"] == "a" * 64
+        assert pages[0]["text"].startswith("阈值电压")
+
+    def test_missing_or_malformed_start_ms_falls_to_zero(self):
+        from courselens_worker.slide_alignment import (
+            assign_pack_windows,
+            build_slide_pack,
+            document_pages_to_ppt_pages,
+        )
+
+        pages = document_pages_to_ppt_pages([
+            self._doc_page(1, "无对齐页", start_ms=None),
+            {"page_num": 2, "text": "畸形时间", "start_ms": "not-a-number"},
+            {"page_num": 3, "text": "负时间", "start_ms": -50},
+        ])
+        assert [page["created_sec"] for page in pages] == [0, 0, 0]
+        # 0 秒页按 assign_pack_windows 近邻兜底归窗，内容不丢。
+        slices = assign_pack_windows(build_slide_pack(pages), [(100_000, 200_000)])
+        assert {page["page_num"] for page in slices[0]["deck"]} == {1, 2, 3}
+
+    def test_non_dict_and_empty_text_rows_dropped(self):
+        from courselens_worker.slide_alignment import document_pages_to_ppt_pages
+
+        pages = document_pages_to_ppt_pages([
+            None,
+            "junk",
+            self._doc_page(1, ""),
+            self._doc_page(2, "   "),
+            self._doc_page(3, "有效页"),
+        ])
+        assert len(pages) == 1
+        assert pages[0]["page_num"] == 3
+
+    def test_visual_hash_fallback_and_str_page_num(self):
+        from courselens_worker.slide_alignment import document_pages_to_ppt_pages
+
+        pages = document_pages_to_ppt_pages([
+            {"page_num": "7", "text": "仅有视觉哈希", "visual_hash": "c" * 32},
+        ])
+        assert pages[0]["page_num"] == 7
+        assert pages[0]["dhash"] == "c" * 32
+        assert pages[0]["source_sha256"] == ""
+
+    def test_empty_input_fail_closed(self):
+        from courselens_worker.slide_alignment import document_pages_to_ppt_pages
+
+        assert document_pages_to_ppt_pages(None) == []
+        assert document_pages_to_ppt_pages([]) == []
+        assert document_pages_to_ppt_pages([None, {"page_num": 1, "text": ""}]) == []
+
+
+class TestBuildDocumentSlidePack:
+    def _documents(self):
+        return [
+            {"page_num": 1, "text": "I_C = I_CBO", "text_hash": "a" * 64, "start_ms": 10_000},
+            {"page_num": 2, "text": "I_C = I_CBO（重复）", "text_hash": "b" * 64, "start_ms": 30_000},
+            {"page_num": 3, "text": "", "text_hash": "c" * 64, "start_ms": 40_000},
+        ]
+
+    def test_pack_from_document_pages(self):
+        from courselens_worker.slide_alignment import build_document_slide_pack
+
+        pack = build_document_slide_pack(self._documents())
+        assert pack is not None
+        assert pack["deck_pages"] == 2
+        # raw_frames=变换后行数：空文本页在 document_pages_to_ppt_pages 的
+        # fail-closed 层已被丢弃，不进入 build_slide_pack 输入。
+        assert pack["raw_frames"] == 2
+        assert pack["formulas"].count("I_C = I_CBO") == 1
+        assert pack["deck"][0]["formulas"] == ["I_C = I_CBO"]
+
+    def test_same_text_identity_dedupes_across_pages(self):
+        from courselens_worker.slide_alignment import build_document_slide_pack
+
+        pack = build_document_slide_pack([
+            {"page_num": 1, "text": "同文页", "text_hash": "d" * 64, "start_ms": 1_000},
+            {"page_num": 2, "text": "同文页", "text_hash": "d" * 64, "start_ms": 2_000},
+        ])
+        assert pack["deck_pages"] == 1
+        assert pack["deck"][0]["repeat_count"] == 1
+
+    def test_fail_closed_none(self):
+        from courselens_worker.slide_alignment import build_document_slide_pack
+
+        assert build_document_slide_pack(None) is None
+        assert build_document_slide_pack([]) is None
+        assert build_document_slide_pack([{"page_num": 1, "text": ""}]) is None
+
+    def test_end_to_end_windows_from_aligned_documents(self):
+        from courselens_worker.slide_alignment import (
+            assign_pack_windows,
+            build_document_slide_pack,
+        )
+
+        pack = build_document_slide_pack(self._documents())
+        slices = assign_pack_windows(pack, [(0, 20_000), (20_000, 60_000)])
+        assert slices[0]["deck"][0]["page_num"] == 1
+        assert slices[1]["deck"][0]["page_num"] == 2
+        assert slices[0]["formulas"] == ["I_C = I_CBO"]
+
+
 if __name__ == "__main__":
     # pytest 仅直跑入口需要（镜像 CI=unittest 发现面无 pytest，顶层导入会
     # 炸整模块收集：r14 环 CI 实证，r15 环随形修——测试体纯 assert 零依赖）。

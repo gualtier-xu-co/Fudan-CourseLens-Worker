@@ -101,6 +101,71 @@ def extract_formula_lines(text: str) -> list[str]:
     return lines
 
 
+def document_pages_to_ppt_pages(
+    document_pages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """用户导入材料页（客户端已提取+已对齐）→ ppt_pages 兼容形状。
+
+    V010-SHUJI-SLIDES-1 S2：平台课件腿缺失的讲次（现网 ppt_pages=0），用户
+    自有导入材料（courseware 文档，学习库 ``learning_document_pages`` ×
+    ``document_alignments`` 投影）可作 slide pack 第二源。行契约：
+    ``{page_num, text, text_hash|source_sha256, visual_hash|dhash, start_ms}``。
+
+    - ``created_sec = start_ms // 1000``（缺失/畸形/负值 → 0；窗口指派按
+      近邻兜底归窗，内容不丢——与平台 OCR 页 0 秒页同语义）；
+    - 身份键优先 ``source_sha256``/``text_hash``（页面文本身份），次
+      ``dhash``/``visual_hash``；同文页由既有 exact-duplicate 折叠收敛；
+    - fail-closed：非 dict 行、无文本行丢弃（文本 deck 对它们无消费价值）；
+      全空输入 → ``[]``（调用方按无 slide 源路径执行）；
+    - 讲位映射（哪份文档归哪一讲）由导入面对齐层负责，本层只做逐页形状
+      变换，绝不跨讲硬塞。
+    """
+    pages: list[dict[str, Any]] = []
+    for raw in document_pages or []:
+        if not isinstance(raw, dict):
+            continue
+        text = str(raw.get("text") or "").strip()
+        if not text:
+            continue
+        sha = str(raw.get("source_sha256") or raw.get("text_hash") or "").strip().lower()
+        dhash = str(raw.get("dhash") or raw.get("visual_hash") or "").strip().lower()
+        try:
+            start_ms = int(float(raw.get("start_ms") or 0))
+        except (TypeError, ValueError):
+            start_ms = 0
+        try:
+            page_num = int(float(raw.get("page_num") or 0))
+        except (TypeError, ValueError):
+            page_num = 0
+        pages.append({
+            "page_num": max(1, page_num or len(pages) + 1),
+            "created_sec": max(0, start_ms // 1000),
+            "text": text,
+            "source_sha256": sha,
+            "dhash": dhash,
+        })
+    return pages
+
+
+def build_document_slide_pack(
+    document_pages: list[dict[str, Any]] | None,
+    *,
+    max_deck_pages: int = MAX_DECK_PAGES,
+    max_formulas: int = MAX_FORMULAS,
+) -> dict[str, Any] | None:
+    """用户导入材料 → 讲级 slide pack；不可用 → ``None``（fail-closed）。
+
+    与 ``build_slide_pack`` 同形状同帽（deck ≤``MAX_DECK_PAGES`` 页、公式单
+    ≤``MAX_FORMULAS`` 条），下游窗口指派/提示词接线零特判。
+    """
+    pages = document_pages_to_ppt_pages(document_pages)
+    if not pages:
+        return None
+    return build_slide_pack(
+        pages, max_deck_pages=max_deck_pages, max_formulas=max_formulas,
+    )
+
+
 def build_slide_pack(
     ppt_pages: list[dict[str, Any]] | None,
     *,

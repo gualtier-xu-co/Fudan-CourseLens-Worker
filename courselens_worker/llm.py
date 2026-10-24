@@ -2874,6 +2874,9 @@ _JUDGE_FINDINGS_CAP = 24
 # confirm/deny 并补漏——筛段零 findings 的多数讲第二段零调用。成本期望
 # ~0.06× 单段思考档现状、最坏 ~1.06×，召回不降（裁段档位不变）。四条提示
 # 词同守 ≤300 防膨胀钉与底线词家规。
+# ADJFIX-1（JUDGESAMP-D 跨切 B）：裁段双提示词补 position 语义（flash 同款）
+# ——r2 实账裁段每掷 218-241 条无效丢弃（发射 ~242-265 条 90%+ 被闭集校验
+# 丢弃），既饱和输出帽又让终局集依赖锚串模糊拯救；对齐后零 token 收敛。
 _JUDGE_FLASH_SUBTITLE_PROMPT = (
     "质检员。只依据输入样本段与 glossary；存疑即标、宁多勿漏；"
     "没有问题输出空 findings；禁止编造输入外的问题。{\"findings\":["
@@ -2886,8 +2889,8 @@ _JUDGE_FLASH_SUBTITLE_PROMPT = (
 _JUDGE_ADJ_SUBTITLE_PROMPT = (
     "字幕质检复核员。初筛 findings 逐条确认或否决并补漏；没有问题输出空 "
     "findings；禁止编造输入外的问题。输出{\"findings\":[{target,position,"
-    "dimension,code,severity}]}，target=segment，dimension=term_fidelity/"
-    "readability，code=glossary_violation/homophone_suspect/"
+    "dimension,code,severity}]}，target=segment，position=segments 0 基下标，"
+    "dimension=term_fidelity/readability，code=glossary_violation/homophone_suspect/"
     "term_inconsistent/broken_flow/garbled，severity=warn/info。零自由文本。"
 )
 _JUDGE_FLASH_SUMMARY_PROMPT = (
@@ -2901,9 +2904,10 @@ _JUDGE_FLASH_SUMMARY_PROMPT = (
 )
 _JUDGE_ADJ_SUMMARY_PROMPT = (
     "复核员。初筛findings逐条确认或否决并补漏；没有问题输出空 findings；"
-    "禁止编造输入外的问题。输出{\"findings\":[{target,position,dimension,"
-    "code,severity}]}，target=chapter/takeaway/body，dimension=factuality/"
-    "alignment/readability，code=no_source_support/contradicts_source/"
+    "禁止编造输入外的问题。{\"findings\":[...]}，target=chapter/takeaway/body，"
+    "position=0基下标，body=0，章题自查，"
+    "dimension=factuality/alignment/readability，"
+    "code=no_source_support/contradicts_source/"
     "chapter_mislabel/duplicate_content/empty_section，severity=warn/info。"
     "零自由文本。"
 )
@@ -3246,6 +3250,9 @@ def _run_mode_cascade(
       裁一跳失败归零，也不把可恢复的瞬态放大成整任务失败（summary 链同哲
       学）；筛段 mode 无效（两败置 None）→ 不触发裁段，语义与单段版逐位同。
     dropped/truncated 两段累加（诊断口径：被闭集校验丢弃/截断的总面）。
+    ADJFIX-1：stages 加性键 flash_dropped/adj_dropped=分段无效丢弃计数
+    （r2 实账 adj 段 218-241/掷=最大单点浪费，修前修后对照面；聚合值与
+    findings_invalid_dropped 遥测不变，加性键不破消费者）。
     """
     flash_usage: list[dict[str, Any]] = []
     flash_mode, dropped, truncated = _judge_mode_call(
@@ -3261,7 +3268,8 @@ def _run_mode_cascade(
     usage.extend(flash_usage)
     flash_findings = list((flash_mode or {}).get("findings") or [])
     stages: dict[str, int | bool] = {
-        "flash_findings": len(flash_findings), "adjudicated": False,
+        "flash_findings": len(flash_findings), "flash_dropped": dropped,
+        "adjudicated": False,
     }
     if flash_mode is not None and flash_findings:
         adj_tier = tier
@@ -3284,6 +3292,7 @@ def _run_mode_cascade(
         )
         _tag_judge_usage(adj_usage, "adj")
         usage.extend(adj_usage)
+        stages["adj_dropped"] = adj_dropped
         dropped += adj_dropped
         truncated += adj_truncated
         if adj_mode is not None:
@@ -3307,7 +3316,8 @@ def judge_lecture_quality(
     词）；仅筛出非空 findings 才追加一次精裁（档位=既有 vars
     COURSELENS_JUDGE_THINKING 缺省链）。终版 findings 仍是 P11 冻结闭集
     （schema_version/subtitle/summary 形状逐位不变）；报告加性键
-    stages={mode: {flash_findings, adjudicated}}，usage_sink 记录带
+    stages={mode: {flash_findings, flash_dropped, adjudicated[, adj_dropped]}}
+    （ADJFIX-1：分段无效丢弃计数，修前修后对照面），usage_sink 记录带
     stage=flash|adj 标签（成本账按段可查，不加新账面）。mode 形状无效置
     null（调用方计 judge_mode_invalid），全部被评 mode 同败 fail-closed 抛
     LLMError。遥测仅计数（零内容零 URL 零账号值）。
@@ -3396,6 +3406,14 @@ def judge_lecture_quality(
     summary_findings = report["summary"]["findings"] if report["summary"] else []
     subtitle_stages = report["stages"].get("subtitle") or {}
     summary_stages = report["stages"].get("summary") or {}
+    flash_dropped = (
+        int(subtitle_stages.get("flash_dropped") or 0)
+        + int(summary_stages.get("flash_dropped") or 0)
+    )
+    adj_dropped = (
+        int(subtitle_stages.get("adj_dropped") or 0)
+        + int(summary_stages.get("adj_dropped") or 0)
+    )
     _emit_telemetry(
         "stage=quality-judge "
         f"subtitle_findings={len(subtitle_findings)} "
@@ -3405,7 +3423,9 @@ def judge_lecture_quality(
         f"summary_flash_findings={int(summary_stages.get('flash_findings') or 0)} "
         f"summary_adjudicated={int(bool(summary_stages.get('adjudicated')))} "
         f"findings_truncated={stats['truncated']} "
-        f"findings_invalid_dropped={stats['invalid_dropped']}"
+        f"findings_invalid_dropped={stats['invalid_dropped']} "
+        f"findings_invalid_dropped_flash={flash_dropped} "
+        f"findings_invalid_dropped_adj={adj_dropped}"
     )
     return report
 
