@@ -259,13 +259,15 @@ class SubtitleValidationTests(unittest.TestCase):
             {"target": "segment", "position": True, "dimension": "readability",
              "code": "garbled", "severity": "warn"},
             {"target": "segment", "position": "1", "dimension": "readability",
-             "code": "garbled", "severity": "warn"},
+             "code": "garbled", "severity": "warn"},  # D3FIX 数字串转正=合法
             {"target": "segment", "position": 1, "dimension": "readability",
              "code": "garbled", "severity": "info"},
         ]}
         mode, dropped, truncated = _validate_judge_subtitle(candidate, sample_size=2)
-        self.assertEqual(dropped, 8)
-        self.assertEqual([item["position"] for item in mode["findings"]], [1])
+        self.assertEqual(dropped, 7)
+        self.assertEqual(
+            [item["position"] for item in mode["findings"]], [1, 1],
+            "数字串 position 转正（D3FIX），bool/越界仍拒")
         self.assertEqual((truncated, mode["targets_total"]), (0, 2))
 
     def test_non_list_or_non_dict_findings_null_the_mode(self):
@@ -331,6 +333,100 @@ class SummaryValidationTests(unittest.TestCase):
         self.assertEqual(mode["targets_total"], 1)
         self.assertEqual(dropped, 1)
         self.assertEqual(mode["findings"], [])
+
+
+class SummaryPositionSalvageTests(unittest.TestCase):
+    """D3FIX：真实课盲评实证模型把 position 发射成章题/要义串（1 掷 69/69、
+    89/89），修前闭集 100% 丢弃=抽检等效失明。锚串唯一映射转正、映射不明
+    丢弃计数不静默、无锚面行为与修前逐位兼容。"""
+
+    ANCHORS = [["开场", "链式聚合"], ["凝胶化", "临界转化率"]]
+    TAKEAWAY_ANCHORS = [["链式聚合逐步进行"], ["凝胶化有临界转化率"]]
+
+    def _f(self, target, position, code="chapter_mislabel",
+           dimension="alignment", severity="warn"):
+        return {"target": target, "position": position, "dimension": dimension,
+                "code": code, "severity": severity}
+
+    def _run(self, findings, **kwargs):
+        return _validate_judge_summary(
+            {"findings": findings}, chapters_total=2, takeaways_total=2, **kwargs)
+
+    def test_title_summary_and_containment_anchors_map_to_index(self):
+        mode, dropped, _ = self._run([
+            self._f("chapter", "凝胶化"),                       # 章题精确
+            self._f("chapter", "链式聚合", code="no_source_support",
+                    dimension="factuality"),                    # 要义精确
+            self._f("chapter", "本章要点：凝胶化", code="empty_section",
+                    dimension="readability", severity="info"),  # 唯一包含
+            self._f("takeaway", "凝胶化有临界转化率",
+                    code="contradicts_source", dimension="factuality"),
+            self._f("body", "正文总述有误", code="contradicts_source",
+                    dimension="factuality"),                    # body 串恒 0
+            self._f("chapter", "1", code="chapter_mislabel"),   # 数字串转正
+        ], chapter_anchors=self.ANCHORS, takeaway_anchors=self.TAKEAWAY_ANCHORS)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(
+            [item["position"] for item in mode["findings"]], [1, 0, 1, 1, 0, 1])
+
+    def test_unmappable_and_ambiguous_dropped_and_counted(self):
+        mode, dropped, _ = self._run([
+            self._f("chapter", "完全不存在的章题"),
+            self._f("chapter", "开场"),  # 双章同题=歧义，映射不明
+            self._f("chapter", "999", code="no_source_support",
+                    dimension="factuality"),  # 数字串越界
+        ], chapter_anchors=[["开场", "一"], ["开场", "二"]],
+            takeaway_anchors=[["甲"]])
+        self.assertEqual(mode["findings"], [])
+        self.assertEqual(dropped, 3, "映射不明/歧义/越界全部丢弃且计数（不静默）")
+
+    def test_target_input_array_alias_normalized(self):
+        # D3FIX 残余诊断（1 掷 6/6 实证）：模型把 target 发射成输入数组名。
+        mode, dropped, _ = self._run([
+            self._f("key_takeaways", 1, code="contradicts_source",
+                    dimension="factuality"),
+            self._f("  TAKEAWAYS ", 0, code="contradicts_source",
+                    dimension="factuality"),
+            self._f("chapters", 0),
+            self._f("transcript", 0, code="no_source_support",
+                    dimension="factuality"),  # 非别名越集照旧丢弃
+        ], chapter_anchors=self.ANCHORS, takeaway_anchors=self.TAKEAWAY_ANCHORS)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(
+            [(item["target"], item["position"]) for item in mode["findings"]],
+            [("takeaway", 1), ("takeaway", 0), ("chapter", 0)],
+            "输入数组名归一回闭集枚举，落盘仍是枚举值")
+
+    def test_digit_only_coercion_without_anchors_matches_pre_fix(self):
+        # 历史调用方（无锚面）：数字串转正、章题串照旧丢弃——逐位兼容。
+        mode, dropped, _ = self._run([
+            self._f("chapter", "1"),
+            self._f("chapter", "凝胶化", code="no_source_support",
+                    dimension="factuality"),
+            self._f("body", "任意串", code="contradicts_source",
+                    dimension="factuality"),
+        ])
+        self.assertEqual(
+            [(item["target"], item["position"]) for item in mode["findings"]],
+            [("chapter", 1), ("body", 0)])
+        self.assertEqual(dropped, 1)
+
+    def test_cascade_end_to_end_title_strings_land_as_ints(self):
+        flash = json.dumps({"findings": [
+            {"target": "chapter", "position": "凝胶化", "dimension": "alignment",
+             "code": "chapter_mislabel", "severity": "warn"}]})
+        _chat, _ = _judge_responder([], [flash, flash])
+        usage: list[dict] = []
+        with patch("courselens_worker.llm._chat", side_effect=_chat), \
+                patch("time.sleep"):
+            report = judge_lecture_quality(
+                "k", subtitle_sample=None, summary_pack=_SUMMARY_PACK,
+                usage_sink=usage)
+        summary = report["summary"]
+        self.assertEqual(
+            [item["position"] for item in summary["findings"]], [1],
+            "筛/裁两段全发章题串，终版仍落 0 基 int（drop storm 修复）")
+        self.assertTrue(report["stages"]["summary"]["adjudicated"])
 
 
 class JudgeCallTests(unittest.TestCase):

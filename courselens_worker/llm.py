@@ -22,6 +22,9 @@ from .slide_alignment import assign_pack_windows
 from .subtitle_clean import CLEAN_MAX_OPS_PER_SEGMENT, validate_tier2_dels
 from .summary_contract import (
     SCHEMA_VER,
+    _BLOCK_FLOOR_MS,
+    _CHAPTER_COUNT_CAP,
+    _DOC_MIN_SECTIONS,
     annotate_assessment_events,
     build_chapters_v2,
     build_summary_doc,
@@ -2042,6 +2045,65 @@ def _derive_review_views(
         return None, stats
 
 
+# ---- V010-QUAL-FIX-1：doc 侧章节数量纪律（SHUJI-QUAL 移交①根修）------------
+# chapters 板级已过 enforce_chapter_count（CONTENT-IMPL-1 件3），doc.sections
+# 漏施加同款纪律=代码不对称：659766/681269 实测 51/52 章超帽产出（LLM doc 候
+# 选镜像窗级碎章 1:1，本地兜底长讲切块同可超）。帽与合并语义镜像既有裁决，
+# 施加点=doc 组装后落键前（生成时收敛，非事后丢弃；validator/探针 20 帽保持
+# 双保险不动）。
+def _enforce_doc_section_cap(
+    doc: dict[str, Any] | None, duration_ms: int,
+) -> tuple[dict[str, Any] | None, int]:
+    """doc.sections 章节数量纪律：区间帽=max(≥3 地板, min(时长//3 分钟地板,
+    20))——与 enforce_chapter_count 同式同源（常量自 summary_contract 单源
+    引入）。超帽=反复「时间最近邻合并」（最小 start 间隙对，并列取最左）直至
+    ≤帽：points/formulas 逐条拼接（内容零删改逐字保留，锚白名单值不丢形）、
+    title/start_ms/source 取先者、example 单例取先者缺省继后（schema 约束，
+    禁虚构）；≤帽按 start_ms 稳定排序原样透传（键集零变化，幂等）。纯本地
+    确定性规则，零新调用，fail-closed 不造假。返回 (doc, 合并次数)。"""
+    if not isinstance(doc, dict):
+        return None, 0
+    raw_sections = doc.get("sections")
+    sections = [
+        item for item in raw_sections or [] if isinstance(item, dict)
+    ]
+    merged = sorted(sections, key=lambda item: int(item.get("start_ms") or 0))
+    duration = max(0, int(duration_ms or 0))
+    cap = max(
+        _DOC_MIN_SECTIONS, min(duration // _BLOCK_FLOOR_MS, _CHAPTER_COUNT_CAP)
+    )
+    merge_count = 0
+    while len(merged) > cap:
+        best_index = 0
+        best_gap: int | None = None
+        for position in range(len(merged) - 1):
+            gap = (
+                int(merged[position + 1].get("start_ms") or 0)
+                - int(merged[position].get("start_ms") or 0)
+            )
+            if best_gap is None or gap < best_gap:
+                best_gap = gap
+                best_index = position
+        first, second = merged[best_index], merged[best_index + 1]
+        combined = dict(first)
+        combined["points"] = (
+            list(first.get("points") or []) + list(second.get("points") or [])
+        )
+        combined["formulas"] = (
+            list(first.get("formulas") or []) + list(second.get("formulas") or [])
+        )
+        if not combined.get("example") and second.get("example"):
+            combined["example"] = second["example"]
+        merged[best_index] = combined
+        del merged[best_index + 1]
+        merge_count += 1
+    if merge_count == 0 and merged == raw_sections:
+        return doc, 0  # ≤帽且本已时序有序：逐位原样透传（旧路径零漂移）。
+    doc = dict(doc)
+    doc["sections"] = merged
+    return doc, merge_count
+
+
 def create_summary(
     api_key: str,
     *,
@@ -2162,6 +2224,10 @@ def create_summary(
                 break
             common += 1
         completed = min(completed, common)
+    if completed:
+        # V010-TOKFIX-1（D1 败掷分项遥测行）：重派续跑可归因——每次掷真实
+        # 记「从第 N/M 窗恢复」，败掷账可分项（重掷全款重付 vs 续跑尾付）。
+        _emit_telemetry(f"stage=summary-resume windows={completed}/{len(sources)}")
 
     def summarize_window(index: int) -> dict[str, Any]:
         nonlocal window_retries
@@ -2549,6 +2615,10 @@ def create_summary(
         anchor_text_pool=anchor_text_pool, drop_stats=doc_drop_stats,
     )
     doc = llm_doc or build_summary_doc(value["markdown"], chapters_v2, takeaways)
+    # V010-QUAL-FIX-1：doc 侧章节数量纪律（生成时收敛——与 chapters 板级
+    # enforce_chapter_count 同式同施加点纪律；659766/681269 51/52 章超帽产出
+    # 的代码不对称根修）。合并次数随遥测归档（闭集计数器）。
+    doc, doc_sections_cap_merged = _enforce_doc_section_cap(doc, duration_ms)
     _emit_telemetry(
         f"stage=summary windows={len(sources)}/{len(sources)} "
         f"resumed={completed} evidence_windows={len(evidence_windows)} "
@@ -2560,6 +2630,7 @@ def create_summary(
         f"chapters={len(chapters)} chapter_anchors_derived={chapters_anchor_derived} "
         f"chapter_dup_dropped={chapters_dup_dropped} "
         f"chapters_cap_merged={chapters_cap_merged} "
+        f"doc_sections_cap_merged={doc_sections_cap_merged} "
         f"knowledge_points={len(knowledge_points)} "
         f"citations_rejected={int(point_meta.get('rejected') or 0)} "
         f"thinking={deep_usage['thinking']} window_retries={window_retries} "
@@ -2804,9 +2875,10 @@ _JUDGE_FINDINGS_CAP = 24
 # ~0.06× 单段思考档现状、最坏 ~1.06×，召回不降（裁段档位不变）。四条提示
 # 词同守 ≤300 防膨胀钉与底线词家规。
 _JUDGE_FLASH_SUBTITLE_PROMPT = (
-    "字幕质检员。只依据输入样本段与 glossary 找问题；存疑即标、宁多勿漏；"
-    "没有问题输出空 findings；禁止编造输入外的问题。输出{\"findings\":["
+    "质检员。只依据输入样本段与 glossary；存疑即标、宁多勿漏；"
+    "没有问题输出空 findings；禁止编造输入外的问题。{\"findings\":["
     "{target,position,dimension,code,severity}]}，target=segment，"
+    "position=segments 0 基下标，"
     "dimension=term_fidelity/readability，code=glossary_violation/"
     "homophone_suspect/term_inconsistent/broken_flow/garbled，"
     "severity=warn/info。零自由文本。"
@@ -2819,12 +2891,13 @@ _JUDGE_ADJ_SUBTITLE_PROMPT = (
     "term_inconsistent/broken_flow/garbled，severity=warn/info。零自由文本。"
 )
 _JUDGE_FLASH_SUMMARY_PROMPT = (
-    "笔记质检员。只依据输入找问题；存疑即标、宁多勿漏；没有问题输出空 "
-    "findings；禁止编造输入外的问题。输出{\"findings\":[{target,position,"
-    "dimension,code,severity}]}，target=chapter/takeaway/body，dimension="
-    "factuality/alignment/readability，code=no_source_support/"
-    "contradicts_source/chapter_mislabel/duplicate_content/empty_section，"
-    "severity=warn/info。零自由文本。"
+    "只依据输入；存疑即标、宁多勿漏；没有问题输出空 findings；"
+    "禁止编造输入外的问题。{\"findings\":[...]}，"
+    "target=chapter/takeaway/body，position=chapters/key_takeaways "
+    "0基下标，body=0，章题自查，"
+    "dimension=factuality/alignment/readability，"
+    "code=no_source_support/contradicts_source/chapter_mislabel/"
+    "duplicate_content/empty_section，severity=warn/info。零自由文本。"
 )
 _JUDGE_ADJ_SUMMARY_PROMPT = (
     "复核员。初筛findings逐条确认或否决并补漏；没有问题输出空 findings；"
@@ -2902,6 +2975,68 @@ def _judge_findings_kept(valid: list[dict[str, Any]]) -> tuple[list[dict[str, An
     return kept, len(valid) - len(kept)
 
 
+_JUDGE_TARGET_ALIASES = {
+    # D3FIX 残余 drop 诊断（1 掷实证）：模型把 target 发射成输入数组名
+    # （key_takeaways 6/6 实证），按名归一回闭集枚举；非别名越集照旧丢弃计数。
+    "chapters": "chapter",
+    "key_takeaways": "takeaway",
+    "takeaways": "takeaway",
+    "segments": "segment",
+}
+
+
+def _normalize_judge_target(target: Any) -> Any:
+    """输入数组名→闭集枚举的零 token 归一（非字符串/非别名原样返回）。"""
+    if isinstance(target, str):
+        return _JUDGE_TARGET_ALIASES.get(target.strip().lower(), target)
+    return target
+
+
+def _coerce_judge_position(
+    position: Any,
+    *,
+    anchors: list[list[str]] | None = None,
+    body_zero: bool = False,
+) -> int | None:
+    """D3FIX：judge findings 的 position 形态漂移矫正（零 token 本地映射）。
+
+    真实课盲评实证（D3 道：1 掷 69/69、截样 1 掷 89/89）模型把 position 发射
+    成章题/要义字符串而非 0 基 int，闭集校验 100% 丢弃=抽检等效失明。矫正规
+    则：int 原样返回（bool 冒充仍拒，越界由调用方闭集判）；纯数字串→int；
+    body 目标任意非数字串→0（body 位置恒 0）；其余串按 anchors 锚串组
+    （章题/章要义）先唯一精确、再唯一包含映射→下标；映射不明返回 None，由
+    调用方按越界丢弃并计入既有 dropped 计数（findings_invalid_dropped 遥测
+    可见，不静默）。无锚面（字幕段）只做数字串转正。
+    """
+    if isinstance(position, bool):
+        return None
+    if isinstance(position, int):
+        return position
+    if not isinstance(position, str):
+        return None
+    text = position.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    if body_zero:
+        return 0
+    if not anchors:
+        return None
+    groups = [
+        [a.strip() for a in group if isinstance(a, str) and a.strip()]
+        for group in anchors
+    ]
+    exact = [i for i, group in enumerate(groups) if text in group]
+    if len(exact) == 1:
+        return exact[0]
+    loose = [
+        i for i, group in enumerate(groups)
+        if any(text in a or a in text for a in group)
+    ]
+    return loose[0] if len(loose) == 1 else None
+
+
 def _validate_judge_subtitle(
     candidate: Any,
     *,
@@ -2911,8 +3046,10 @@ def _validate_judge_subtitle(
 
     findings 非 list 或元素非 dict → mode 整体置 None（judge_mode_invalid）；
     target/dimension/code/severity/position 逐项对闭集，越界条目丢弃并计数；
-    只保留五个冻结键（零自由文本——任何 note/quote 附加字段都进不了报告）；
-    数量帽截断保 warn 优先。返回 (mode 结果|None, invalid_dropped, truncated)。
+    position 数字串先转正（D3FIX 同类形态漂移防御），其余映射不明条目同样
+    丢弃并计数；只保留五个冻结键（零自由文本——任何 note/quote 附加字段都
+    进不了报告）；数量帽截断保 warn 优先。返回 (mode 结果|None, invalid_dropped,
+    truncated)。
     """
     raw = candidate.get("findings") if isinstance(candidate, dict) else None
     if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
@@ -2920,20 +3057,20 @@ def _validate_judge_subtitle(
     valid: list[dict[str, Any]] = []
     dropped = 0
     for item in raw:
-        position = item.get("position")
+        position = _coerce_judge_position(item.get("position"))
+        target = _normalize_judge_target(item.get("target"))
         if (
-            item.get("target") not in _JUDGE_SUBTITLE_TARGETS
+            target not in _JUDGE_SUBTITLE_TARGETS
             or item.get("dimension") not in _JUDGE_SUBTITLE_DIMENSIONS
             or item.get("code") not in _JUDGE_SUBTITLE_CODES
             or item.get("severity") not in _JUDGE_SEVERITIES
-            or isinstance(position, bool)
-            or not isinstance(position, int)
+            or position is None
             or not 0 <= position < sample_size
         ):
             dropped += 1
             continue
         valid.append({
-            "target": item["target"],
+            "target": target,
             "position": position,
             "dimension": item["dimension"],
             "code": item["code"],
@@ -2952,28 +3089,40 @@ def _validate_judge_summary(
     *,
     chapters_total: int,
     takeaways_total: int,
+    chapter_anchors: list[list[str]] | None = None,
+    takeaway_anchors: list[list[str]] | None = None,
 ) -> tuple[dict[str, Any] | None, int, int]:
     """总结 mode 闭集校验（同上纪律）：body 恒 position 0；chapter/takeaway
-    position 各自越界丢弃；targets_total=chapters+takeaways+1（正文）。"""
+    position 各自越界丢弃；targets_total=chapters+takeaways+1（正文）。
+    D3FIX：position 形态漂移矫正——章题/要义串经锚串组（chapter_anchors=
+    每章 [章题, 要义]、takeaway_anchors=每条 [原文]）唯一映射转 0 基下标；
+    数字串直接转正；target 输入数组名（chapters/key_takeaways）按别名归一
+    回闭集枚举（1 掷 6/6 实证形态）；映射不明条目照旧丢弃并计入 dropped
+    （遥测可见不静默）；锚面缺省（历史调用方）时仅数字串转正，行为与修前
+    逐位兼容。"""
     raw = candidate.get("findings") if isinstance(candidate, dict) else None
     if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
         return None, 0, 0
     valid: list[dict[str, Any]] = []
     dropped = 0
     for item in raw:
-        target = item.get("target")
-        position = item.get("position")
+        target = _normalize_judge_target(item.get("target"))
+        anchors = None
+        body_zero = False
         if target == "body":
-            position_ok = (
-                isinstance(position, int)
-                and not isinstance(position, bool)
-                and position == 0
-            )
+            body_zero = True
+        elif target == "chapter":
+            anchors = chapter_anchors
+        elif target == "takeaway":
+            anchors = takeaway_anchors
+        position = _coerce_judge_position(
+            item.get("position"), anchors=anchors, body_zero=body_zero)
+        if target == "body":
+            position_ok = position == 0
         else:
             bound = chapters_total if target == "chapter" else takeaways_total
             position_ok = (
-                isinstance(position, int)
-                and not isinstance(position, bool)
+                position is not None
                 and 0 <= position < bound
             )
         if (
@@ -3226,6 +3375,11 @@ def judge_lecture_quality(
                 candidate,
                 chapters_total=len(chapters),
                 takeaways_total=len(takeaways),
+                chapter_anchors=[
+                    [str(c.get("title") or ""), str(c.get("summary") or "")]
+                    for c in chapters
+                ],
+                takeaway_anchors=[[t] for t in takeaways],
             ),
             usage=usage,
         )

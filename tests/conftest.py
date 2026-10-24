@@ -15,7 +15,21 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from pathlib import Path
 from unittest.mock import Mock
+
+# V010-TESTHYG-2：装配缝补齐（pytest 车道自装配；unittest 正典 harness 不加载
+# conftest、零影响）。worker tests 需双导入路径：``courselens_worker``←worker/、
+# ``shared``←仓根（CI 正典=PYTHONPATH="worker;<根>" + unittest discover）。此前
+# 车道 pytest 单路径装配各缺一半（FIN B/B2 实证）——此处按 conftest 位置反推
+# worker/ 与仓根并按 CI 同序前置，任何 cwd/无 PYTHONPATH 调用形态均可收集。
+_HERE = Path(__file__).resolve().parent
+_WORKER_DIR = str(_HERE.parent)
+_REPO_ROOT = str(_HERE.parent.parent)
+for _path in (_REPO_ROOT, _WORKER_DIR):
+    if _path in sys.path:
+        sys.path.remove(_path)
+    sys.path.insert(0, _path)
 
 
 def _stub_if_missing(module_name: str) -> None:

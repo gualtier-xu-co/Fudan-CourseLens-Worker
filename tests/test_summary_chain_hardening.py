@@ -15,6 +15,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+from courselens_worker import llm
 from courselens_worker.llm import (
     _SUMMARY_MERGE_MAX_TOKENS,
     _SUMMARY_WINDOW_MAX_TOKENS,
@@ -401,6 +402,212 @@ class UsageSinkTests(unittest.TestCase):
         for token in ("thinking=disabled", "window_retries=0", "window_skipped=0",
                       "merge_retries=0", "llm_calls=2", "completion_tokens=10"):
             self.assertIn(token, final[0])
+
+
+class DocSectionCountDisciplineTests(unittest.TestCase):
+    """V010-QUAL-FIX-1（SHUJI-QUAL 移交①+U4 定谳）：doc 侧章节数量纪律根修钉。
+
+    659766/681269 实录：doc.sections 51/52 章超帽产出——chapters 板级已过
+    enforce_chapter_count（CONTENT-IMPL-1 件3，20 区间帽）而 doc 路径
+    （coerce_llm_doc 候选/本地兜底组装）漏施加同款纪律=代码不对称。本钉以
+    合成超长 doc 候选（51 段，锚全在白名单）重放真实生成链，断言落键
+    doc.sections 收敛 ≤20（帽=区间帽：时长//3 分钟地板与 20 取小、≥3 地板）
+    且合并计数随遥测归档——生成时收敛，非事后丢弃。"""
+
+    @staticmethod
+    def _long_transcript() -> list[dict]:
+        # 80 段 × 1 分钟 = 80 分钟讲次 → 区间帽=min(4_800_000//180_000, 20)=20。
+        return [
+            {"start_ms": index * 60_000, "end_ms": (index + 1) * 60_000,
+             "text": f"第{index}分钟的内容。"}
+            for index in range(80)
+        ]
+
+    @staticmethod
+    def _overcap_merge_payload(count: int = 51) -> dict:
+        # 659766 形态重放：doc 候选 51 段细粒度碎章（LLM 镜像窗级碎章 1:1 的
+        # 失控形态）；chapters 空表（板级纪律已有独立钉，本钉只盯 doc 侧）。
+        sections = [
+            {
+                "start_ms": index * 60_000,
+                "title": f"碎章{index}",
+                "source": "semantic",
+                "points": [{"text": f"要点{index}", "anchor_ms": index * 60_000}],
+                "formulas": [],
+            }
+            for index in range(count)
+        ]
+        return {
+            "markdown": "合并笔记",
+            "chapters": [],
+            "doc": {"overview": "总述。", "sections": sections,
+                    "terms": [], "summary_notes": []},
+        }
+
+    def test_overcap_doc_sections_converge_to_cap_with_telemetry(self):
+        lines: list[str] = []
+
+        def fake_chat(api_key, messages, **kwargs):
+            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
+                return json.dumps(self._overcap_merge_payload())
+            return json.dumps(_part("窗口笔记"))
+
+        with (
+            patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False),
+            patch("courselens_worker.llm._chat", side_effect=fake_chat),
+            patch("courselens_worker.llm._emit_telemetry", side_effect=lines.append),
+        ):
+            result = create_summary(
+                "k", title="t", transcript=self._long_transcript(), ppt_pages=[],
+            )
+        sections = result["doc"]["sections"]
+        self.assertLessEqual(len(sections), 20)
+        self.assertGreaterEqual(len(sections), 3)
+        starts = [item["start_ms"] for item in sections]
+        self.assertEqual(starts, sorted(starts))  # 按时间有序
+        # 内容零丢：51 条要点全数保留（合并拼接不删字，锚白名单值不丢形）。
+        self.assertEqual(sum(len(item["points"]) for item in sections), 51)
+        final = [line for line in lines if line.startswith("stage=summary ")]
+        self.assertEqual(len(final), 1, lines)
+        self.assertIn("doc_sections_cap_merged=", final[0])
+
+    def test_undercap_doc_sections_passthrough_unchanged(self):
+        # 同族常态（12-15 章）零行为漂移：≤帽 doc 原样透传（键集零变化）。
+        lines: list[str] = []
+
+        def fake_chat(api_key, messages, **kwargs):
+            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
+                return json.dumps(self._overcap_merge_payload(count=12))
+            return json.dumps(_part("窗口笔记"))
+
+        with (
+            patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False),
+            patch("courselens_worker.llm._chat", side_effect=fake_chat),
+            patch("courselens_worker.llm._emit_telemetry", side_effect=lines.append),
+        ):
+            result = create_summary(
+                "k", title="t", transcript=self._long_transcript(), ppt_pages=[],
+            )
+        self.assertEqual(len(result["doc"]["sections"]), 12)
+        final = [line for line in lines if line.startswith("stage=summary ")]
+        self.assertIn("doc_sections_cap_merged=0", final[0])
+
+
+class EnforceDocSectionCapUnitTests(unittest.TestCase):
+    """V010-QUAL-FIX-1 单元钉：doc 侧章节数量纪律（镜像 enforce_chapter_count
+    语义；单源常量自 summary_contract 引入）。"""
+
+    @staticmethod
+    def _sections(count: int) -> list[dict]:
+        return [
+            {
+                "start_ms": index * 60_000,
+                "title": f"碎章{index}",
+                "source": "semantic",
+                "points": [{"text": f"要点{index}", "anchor_ms": index * 60_000}],
+                "formulas": [],
+            }
+            for index in range(count)
+        ]
+
+    def test_over_cap_merges_nearest_neighbor_with_zero_content_loss(self):
+        # 681269 形态（52 章）/80 分钟讲次 → 帽=20；52 条要点全数保留。
+        doc = {"overview": "总述。", "sections": self._sections(52)}
+        merged, count = llm._enforce_doc_section_cap(doc, 80 * 60_000)
+        self.assertEqual(len(merged["sections"]), 20)
+        self.assertEqual(count, 32)
+        self.assertEqual(
+            sum(len(item["points"]) for item in merged["sections"]), 52)
+        starts = [item["start_ms"] for item in merged["sections"]]
+        self.assertEqual(starts, sorted(starts))  # 按时间有序
+        self.assertEqual(merged["sections"][0]["title"], "碎章0")  # 合并对取先者
+        # 输入不回写（纯函数）。
+        self.assertEqual(len(doc["sections"]), 52)
+
+    def test_under_cap_passthrough_is_identity(self):
+        doc = {"overview": "总述。", "sections": self._sections(12)}
+        result, count = llm._enforce_doc_section_cap(doc, 80 * 60_000)
+        self.assertIs(result, doc)  # 逐位原样透传（旧路径零漂移）
+        self.assertEqual(count, 0)
+
+    def test_none_and_malformed_sections_fail_closed(self):
+        self.assertEqual(llm._enforce_doc_section_cap(None, 80 * 60_000), (None, 0))
+        doc = {"overview": "总述。", "sections": ["坏形状", {"start_ms": 0}]}
+        result, count = llm._enforce_doc_section_cap(doc, 80 * 60_000)
+        self.assertEqual(result["sections"], [{"start_ms": 0}])  # 非法项剔除
+        self.assertEqual(count, 0)
+
+    def test_merged_points_and_formulas_are_concatenated(self):
+        # 21 段碎章（最小间隙对=首对）/59 分钟讲次 → 帽=19；points/formulas
+        # 逐条拼接零删改（合并不删字，锚白名单值不丢形）。
+        over = [
+            {
+                "start_ms": index * 1_000,
+                "title": f"章{index}",
+                "source": "semantic",
+                "points": [{"text": f"点{index}", "anchor_ms": index * 1_000}],
+                "formulas": [{"latex": f"L{index}", "anchor_ms": index * 1_000}],
+            }
+            for index in range(21)
+        ]
+        merged, count = llm._enforce_doc_section_cap(
+            {"overview": "总述。", "sections": over}, 59 * 60_000)
+        self.assertEqual(len(merged["sections"]), 19)
+        self.assertEqual(count, 2)
+        self.assertEqual(sum(len(i["points"]) for i in merged["sections"]), 21)
+        self.assertEqual(sum(len(i["formulas"]) for i in merged["sections"]), 21)
+        first = merged["sections"][0]
+        self.assertEqual([p["text"] for p in first["points"]], ["点0", "点1"])
+        self.assertEqual([f["latex"] for f in first["formulas"]], ["L0", "L1"])
+
+    def test_example_singleton_inherits_first_then_second(self):
+        sections = [
+            {"start_ms": 0, "title": "甲", "source": "semantic",
+             "points": [{"text": "甲点", "anchor_ms": 0}], "formulas": [],
+             "example": {"text": "先例"}},
+            {"start_ms": 1_000, "title": "乙", "source": "semantic",
+             "points": [{"text": "乙点", "anchor_ms": 1_000}], "formulas": [],
+             "example": {"text": "后例"}},
+        ]
+        # 触发合并需超帽：复制 21 段把首对挤到最近邻——最小间隙对=首对
+        # （0 与 1000），其余 19 段间隙 60_000。
+        padded = sections + [
+            {"start_ms": (index + 2) * 60_000, "title": f"章{index}",
+             "source": "semantic",
+             "points": [{"text": f"点{index}",
+                         "anchor_ms": (index + 2) * 60_000}],
+             "formulas": []}
+            for index in range(19)
+        ]
+        merged, _ = llm._enforce_doc_section_cap(
+            {"overview": "总述。", "sections": padded}, 80 * 60_000)
+        self.assertEqual(len(merged["sections"]), 20)
+        first = merged["sections"][0]
+        self.assertEqual(first["title"], "甲")
+        self.assertEqual(first["points"][0]["text"], "甲点")
+        self.assertEqual(first["points"][1]["text"], "乙点")  # 拼接零丢
+        self.assertEqual(first["example"]["text"], "先例")  # 单例取先者
+        no_example = dict(padded[0])
+        no_example.pop("example")
+        padded2 = [no_example] + padded[1:]
+        merged2, _ = llm._enforce_doc_section_cap(
+            {"overview": "总述。", "sections": padded2}, 80 * 60_000)
+        self.assertEqual(merged2["sections"][0]["example"]["text"], "后例")
+
+    def test_discipline_output_is_idempotent(self):
+        doc = {"overview": "总述。", "sections": self._sections(51)}
+        once, _ = llm._enforce_doc_section_cap(doc, 45 * 60_000)
+        twice, count = llm._enforce_doc_section_cap(once, 45 * 60_000)
+        self.assertEqual(count, 0)
+        self.assertEqual(once, twice)
+
+    def test_unsorted_undercap_input_is_time_ordered(self):
+        sections = list(reversed(self._sections(5)))
+        doc = {"overview": "总述。", "sections": sections}
+        result, count = llm._enforce_doc_section_cap(doc, 80 * 60_000)
+        self.assertEqual(count, 0)
+        starts = [item["start_ms"] for item in result["sections"]]
+        self.assertEqual(starts, sorted(starts))
 
 
 if __name__ == "__main__":
