@@ -193,6 +193,12 @@ class IssueMailbox:
                 return self.read(task_id)
             except MailboxError as exc:
                 last_error = str(exc)
+                # AGENTISSUE-ROOTFIX-1：HTTP 401=凭证永久失效（token 被撤销/
+                # 过期），重试到 10 分钟超时只会白烧计费 runner 时间（10-23
+                # 五连败同族每单 ~10m30s 等满）。快败让 run 立即收口，客户端
+                # 重派/重跑会重新注入环境 secret（新 attempt 拿新 token）。
+                if "HTTP 401" in last_error:
+                    raise
                 time.sleep(max(0.2, poll_seconds))
         raise MailboxError(last_error)
 

@@ -207,3 +207,38 @@ def apply_glossary(segments: list[dict[str, Any]], glossary: tuple[str, ...]) ->
         updated["correction"] = GLOSSARY_APPLIED_STATUS
         output.append(updated)
     return output
+
+
+# V010-WORKER-QUAL-1（2026-10-26，W3 术语讲内混用）：总结 markdown 的讲内
+# 同文种变体统一——与 apply_glossary 同一 trusted-pairing 纪律（唯一映射+
+# 全文出现≥2），作用面=单条文本（markdown/doc 字段）。跨文种混用（Kirk↔科克）
+# 编辑距离无法配对，走提示词统一指令（llm._STEM_TEACHING_RULES）。
+_UNIFY_TEXT_MIN_OCCURRENCES = 2
+
+
+def unify_text_terms(text: str, glossary: tuple[str, ...]) -> str:
+    """单条文本的讲内术语变体统一（确定性、零 token、零外联）。
+
+    只在中文连续段内配对（LaTeX/代码/英文天然不在替换面）；变体须唯一映射到
+    词表词且全文出现≥2 次（一次出现宁留原样=宁漏勿错删）。glossary 空=原样
+    返回（零行为变化）。"""
+    if not text or not glossary:
+        return str(text or "")
+    source = str(text)
+    counts: Counter = Counter()
+    piece_terms: dict[str, set[str]] = {}
+    for run in re.findall(r"[\u4e00-\u9fa5]{2,}", source):
+        for piece, term in _candidate_variants(run, glossary):
+            piece_terms.setdefault(piece, set()).add(term)
+            counts[piece] += run.count(piece)
+    trusted = {
+        piece: next(iter(terms))
+        for piece, terms in piece_terms.items()
+        if len(terms) == 1 and counts[piece] >= _UNIFY_TEXT_MIN_OCCURRENCES
+    }
+    if not trusted:
+        return source
+    replaced = source
+    for piece, term in trusted.items():
+        replaced = replaced.replace(piece, term)
+    return replaced

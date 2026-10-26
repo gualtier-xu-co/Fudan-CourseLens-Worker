@@ -93,10 +93,13 @@ class TestSummaryDocContract:
         no_points = _good_doc()
         no_points["sections"][0]["points"] = []
         assert validate_summary_doc(no_points) is None
-        # formula 缺 latex=拒。
+        # formula 缺 latex/坏式=丢条不拒段（V010-WORKER-QUAL-1 W1：一条残渣
+        # 不再核爆整个 LLM doc；段级形状门仍拒段级坏形）。
         bad_formula = _good_doc()
         bad_formula["sections"][0]["formulas"] = [{"caption": "无正文"}]
-        assert validate_summary_doc(bad_formula) is None
+        doc = validate_summary_doc(bad_formula)
+        assert doc is not None
+        assert doc["sections"][0]["formulas"] == []
         # 闭集常量冻结钉。
         assert DOC_SECTION_SOURCES == ("slides", "upload", "semantic")
         assert EVENT_CONFIDENCES == ("high", "low")

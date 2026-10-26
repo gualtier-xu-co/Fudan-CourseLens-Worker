@@ -47,15 +47,22 @@ class MergeTeachingPromptPins(unittest.TestCase):
         self.assertIn("key_takeaways", _SUMMARY_MERGE_PROMPT)
         self.assertIn("assessment_events", _SUMMARY_MERGE_PROMPT)
 
-    def test_gate_directives_present_with_evidence_citation(self):
-        # 课型自门控：判定推导型理工须引用材料证据，判定写进笔记首行。
-        for needle in (
-            "先判定本讲是否推导型理工内容",
-            "证据",
-            "笔记首行",
-            "≤40字",
-        ):
-            self.assertIn(needle, _STEM_TEACHING_RULES)
+    def test_gate_is_internal_without_meta_discourse(self):
+        # V010-WORKER-QUAL-1（W5，2026-10-26）：课型自门控保留，判定改为内部
+        # 完成——旧版「判定写进笔记首行」指示即 W5 元话语泄漏根因（27738 实测
+        # 「判定：推导型理工内容；证据：分波法…」概览直出），钉面反转为禁令。
+        self.assertIn("先判定本讲是否推导型理工内容", _STEM_TEACHING_RULES)
+        self.assertIn("判定在内部完成", _STEM_TEACHING_RULES)
+        self.assertIn("元话语", _STEM_TEACHING_RULES)
+        self.assertNotIn("笔记首行", _STEM_TEACHING_RULES)
+        self.assertNotIn("写出判定结论与证据", _STEM_TEACHING_RULES)
+        self.assertNotIn("≤40字", _STEM_TEACHING_RULES)
+
+    def test_term_unification_directive_present(self):
+        # V010-WORKER-QUAL-1（W3，2026-10-26）：讲内术语/人名统一写法指令
+        # （Kirk↔科克、Early↔厄利 实测混用；跨文种配对无法确定性校验）。
+        self.assertIn("同一种写法", _STEM_TEACHING_RULES)
+        self.assertIn("不中英交替", _STEM_TEACHING_RULES)
 
     def test_non_stem_defaults_to_generic_format(self):
         # 默认路径（回归钉的提示词面）：非推导型/证据不足=既有通用格式零变化。

@@ -1,6 +1,6 @@
 {
   "exporter": {
-    "allowlist_sha256": "692cd040b48da874f91d370d3572e5eacc4012f34e9867ccbf1f15d2c32fb22c",
+    "allowlist_sha256": "abfddf1f4c0a3fcbb18dd6394db5e679da6f4ae4a01dda794e13e0aaa20fe469",
     "version": "1.0.0"
   },
   "payload": {
@@ -128,8 +128,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/glossary.py",
-        "sha256": "5e491a1990ce06442728f51289796e386c1a3e7031291042494f5fdcd8ccd018",
-        "size": 9714
+        "sha256": "e459226163388a6b1260341084b0d67be93d350065bd899cc3d62d50d4e7b71c",
+        "size": 11277
       },
       {
         "mode": "100644",
@@ -152,14 +152,14 @@
       {
         "mode": "100644",
         "path": "courselens_worker/llm.py",
-        "sha256": "92eed740014f361f1001f2de30333c74b0a5299ee0099498785a8149b49fd141",
-        "size": 171790
+        "sha256": "f0e2745ab1ec8adbc7b41db3fb3c7318f82d95e945f3559d86dc3572d34068ea",
+        "size": 174889
       },
       {
         "mode": "100644",
         "path": "courselens_worker/mailbox.py",
-        "sha256": "13dfb3f0c004bc699df184ed818a724717192749413e47c29143241473c4e8d6",
-        "size": 11769
+        "sha256": "bf58c8a66da634a2bd2ce1fbd85577ef16f1ccdc7bb62f34a657b10cf415519c",
+        "size": 12216
       },
       {
         "mode": "100644",
@@ -194,14 +194,14 @@
       {
         "mode": "100644",
         "path": "courselens_worker/runner.py",
-        "sha256": "8e540cb2f8b76ea976db0e0059b5233632a1e56ee2af20c68b6c7ccea0c21686",
-        "size": 72377
+        "sha256": "09b27a274da14485facc7e5934d39b25c22c25bc87d86244005b09ddcd0768bf",
+        "size": 73284
       },
       {
         "mode": "100644",
         "path": "courselens_worker/slide_alignment.py",
-        "sha256": "421ee49ecfed3712126e525ca56453662d08f793f92dbcf62d721848bab88670",
-        "size": 11357
+        "sha256": "7589f2bca2711931220129546f35e6733be725c2efffe33537d0d7d6a89a0cb6",
+        "size": 11891
       },
       {
         "mode": "100644",
@@ -248,8 +248,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/summary_contract.py",
-        "sha256": "1396dded532acb820b1de0fd8cd34760b2055a1e3acba08a04170ec463cf8a13",
-        "size": 30337
+        "sha256": "ea9e0db000add01d61a32a0f066b97162713325d82c9059a1226919377dc9fc0",
+        "size": 42763
       },
       {
         "mode": "100644",
@@ -301,6 +301,12 @@
       },
       {
         "mode": "100644",
+        "path": "scripts/plan_summary_reprocess.py",
+        "sha256": "d5bca86b46c73c73b6f80bccb5a1fd4a4e59781e514f10db33aecb531112c7b4",
+        "size": 8803
+      },
+      {
+        "mode": "100644",
         "path": "scripts/punct_inference_proof.py",
         "sha256": "085eeba5933ce27d3db1d72146110727a84ee16a61e1ca056ea4aaf0c0569b4e",
         "size": 8518
@@ -346,6 +352,12 @@
         "path": "shared/protocol/wire.py",
         "sha256": "dcb2b6be1ce0a84a1c60507db347c553f8957c0e0a467a4035e8a2168eebc5ec",
         "size": 19463
+      },
+      {
+        "mode": "100644",
+        "path": "shared/subtitle_date_guard.py",
+        "sha256": "ebc66f2690acebc3c799197296e3db8f3df0b7a13a9e4c89bb1e218a3364adbc",
+        "size": 16273
       },
       {
         "mode": "100644",
@@ -488,8 +500,8 @@
       {
         "mode": "100644",
         "path": "tests/test_mailbox.py",
-        "sha256": "e89204568d8ab07b23d3250de3f012cf92df9a3ec871e089258ae8c17778f64d",
-        "size": 15985
+        "sha256": "a6a908dca32d04f9f9aa477e8efcd0bb1a2d94e76ce488d909c9aebce208d979",
+        "size": 16794
       },
       {
         "mode": "100644",
@@ -578,8 +590,8 @@
       {
         "mode": "100644",
         "path": "tests/test_runner_failure_matrix.py",
-        "sha256": "b0ec6cf2cd0d56dc4a7605cbba28949089eeca0cf00aa0184b51647a8578ef6c",
-        "size": 12824
+        "sha256": "bb91365650e6454e385acb780047f8d1abc029f9ea358a1c79b710350009f72d",
+        "size": 16533
       },
       {
         "mode": "100644",
@@ -602,8 +614,8 @@
       {
         "mode": "100644",
         "path": "tests/test_stem_teaching_prompts.py",
-        "sha256": "faa0f89f2d3c53d01992868b4c5ab8acc3282ab11c9042cbaccf864938931db5",
-        "size": 13271
+        "sha256": "e7d9fa38eef2e0c1e05aa28be4397eb4e0b2cc5639921a439742e76a5c6e3dcc",
+        "size": 14046
       },
       {
         "mode": "100644",
@@ -662,8 +674,8 @@
       {
         "mode": "100644",
         "path": "tests/test_summary_contract_v3.py",
-        "sha256": "3e7092f7b43fd893b5db8c17bfe7b912f99faf73cf0fcdc1c44592b5084f7dcb",
-        "size": 30787
+        "sha256": "2be5831c41d08e02b15071fa85c4e290e52c6ac4034927c0e48f4dd94f5e7a74",
+        "size": 30995
       },
       {
         "mode": "100644",
@@ -709,6 +721,12 @@
       },
       {
         "mode": "100644",
+        "path": "tests/test_workerqual1_quality_gates.py",
+        "sha256": "3f6b814e1e428bee6a7a660447aeb5447e69c492b9180f73fad9aae6a487ad90",
+        "size": 26969
+      },
+      {
+        "mode": "100644",
         "path": "tests/test_workflows.py",
         "sha256": "76869918b7dfff6827d3f4f9716143b19a472e665637393b84e3374c1c734c77",
         "size": 9633
@@ -720,8 +738,8 @@
         "size": 10522
       }
     ],
-    "git_tree": "a9c6937501d3bed0fab3c994f64d96bd83803f3e",
-    "tree_sha256": "9cd35ffd285201e4eab9436c1f383de7174f6b39354d48bc7fc74587ee98e93d"
+    "git_tree": "894a6f7a0201dd622a60377dfae00f4b26f8fc8e",
+    "tree_sha256": "7b539c886cf49de9de4d628c084205c6d86185a6e6638d341221194e650c267a"
   },
   "protocol": {
     "supported_versions": [
@@ -730,8 +748,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "56e5edf1c3c9072f6762ac73ace81d443a7b1959",
+    "commit": "17bdd330a4678cb425a403e25074c07609f47e14",
     "repository": "gualtier-xu-co/Fudan-CourseLens-Private",
-    "worker_tree": "cac1996617f631e6397698d231b9b670bed7365c"
+    "worker_tree": "229793da5c499c8337ca57e5519ee25da47c6bd7"
   }
 }

@@ -42,6 +42,7 @@ V010-CONTENT-IMPL-1（CONTENT-R1 兑现道，2026-10-22）三期 1 增量：
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # ---- 期 0 schema 冻结闭集（唯一权威；schema 变更走协议包流程）--------------
@@ -78,6 +79,212 @@ _NOTES_MAX = 5  # 合同「3-5 条小结」；key_takeaways(3-6) 头部截取
 # 同式实现（与 _boundary_similarity 同族字符二元组 Dice）。fail-closed 语义
 # 零放宽：白名单外锚先派生、派生不达阈值宁可丢段/丢点，绝不编锚。
 _DOC_ANCHOR_MIN_SCORE = 0.22
+
+# ---- V010-WORKER-QUAL-1（2026-10-26，用户令「总结文字质量」七项根修）--------
+# 文字质量确定性守卫闭集：全部零 LLM、逐条目 fail-closed（丢条不丢段、丢段
+# 不丢档），判据=CONTENT-QUAL-1 全库取证的真实缺陷形态（680954/27738/39178）。
+
+# W1 公式残渣门（新生成守卫；存量=重处理方案另批）：latex 字段四类显然坏式
+# 逐条丢弃——中文入式（\beta不宜太高）、悬垂尾符（nco =）、双等号（IB==70\mu A）、
+# 自指（Icbo =(1+β)Icbo，左式单标识符在右式标识符集中原样再现，len≥2 防
+# v=v_0+at 误伤）。合法式（f_T=1/(2π\tau_F)）零触碰。
+_LATEX_CJK_RE = re.compile(r"[\u4e00-\u9fa5]")
+_LATEX_DANGLING_TAIL_RE = re.compile(r"[=+*,;:\\/\-]\s*$")
+_LATEX_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_LATEX_SELF_REF_MIN_TOKEN = 2
+
+
+def sane_latex(latex: Any) -> bool:
+    """公式 latex 字段健全性门：显然坏式=False（丢弃该条，不影响所在段）。"""
+    text = str(latex or "").strip()
+    if not text:
+        return False
+    if _LATEX_CJK_RE.search(text):
+        return False
+    if text.startswith("=") or "==" in text:
+        return False
+    if _LATEX_DANGLING_TAIL_RE.search(text):
+        return False
+    if "=" in text:
+        left, right = text.split("=", 1)
+        left_idents = _LATEX_IDENT_RE.findall(left)
+        if len(left_idents) == 1 and len(left_idents[0]) >= _LATEX_SELF_REF_MIN_TOKEN:
+            if left_idents[0] in set(_LATEX_IDENT_RE.findall(right)):
+                return False
+    return True
+
+
+# W2 caption 占位过滤：模型把输入描述「课件公式行」逐条回填为 caption
+# （680954 实测 39/39）。闭集匹配占位词=丢 caption 键保 latex（不丢整条）。
+_FORMULA_CAPTION_PLACEHOLDERS = frozenset({"课件公式行", "课件公式", "公式行", "公式"})
+
+
+def sane_formula_caption(caption: Any) -> bool:
+    """caption 占位判定：命中占位闭集（或纯占位词+页码尾）=False。"""
+    text = str(caption or "").strip()
+    if not text:
+        return False
+    if text in _FORMULA_CAPTION_PLACEHOLDERS:
+        return False
+    base = re.sub(r"[\s\d#．.、]+$", "", text)
+    return base not in _FORMULA_CAPTION_PLACEHOLDERS
+
+
+# W4 要点页码噪声：纯页码/目录/标题枚举句无结论价值（CONTENT-QUAL-1 W4 实
+# 样「第 5 页标题：…」「p688–p689 为第二章目录」）。闭集保守匹配=丢点不丢段。
+_NOISE_POINT_PATTERNS = (
+    re.compile(r"^第\s*\d+\s*页(标题|内容|目录)?\s*[：:]"),
+    re.compile(r"^第\s*\d+\s*页$"),
+    re.compile(r"^p\d+\s*[–—~\-]\s*p?\d+", re.IGNORECASE),
+    re.compile(r"^(课件|幻灯|slide)\s*(第\s*\d+\s*页)?\s*[（(]?(标题|目录)", re.IGNORECASE),
+)
+
+
+def is_noise_point_text(text: Any) -> bool:
+    """要点文本=纯页码/目录/标题枚举句判定（保守闭集，宁漏勿错删）。"""
+    candidate = str(text or "").strip()
+    if not candidate:
+        return False
+    return any(pattern.search(candidate) for pattern in _NOISE_POINT_PATTERNS)
+
+
+# W5 元话语剥除（守卫层；主修=提示词判定内部化）：「判定：…；证据：…」是
+# 课型自门控的内部结构词，禁止上屏（27738 实测概览开头直出）。闭集限定：
+# 只剥「判定+证据」成对结构（含全/半角冒号），证据段以句读为界（防吞同句
+# 正文），成对结构不齐=不动（正文正常讨论「判定」的讲次零误伤）。
+# V010-REPROC-QUALFOLLOWUP-1 扩边（2026-10-26 六讲重处理实录归纳）：模型
+# 实际发射的形态族超出原三形——「判定：短词（括注）。〔证据：…。〕」括注形
+# （括注内依据/证据段分号配对不再必需）与判定句+证据句连写形，且元话语可落
+# 在课程头之后的引用行（659504 实录 `> 判定：…（依据 …）`）——剥除窗口从
+# 首行扩到头 _META_SCAN_HEAD_LINES 行。行界纪律：首行保留原宽松形（行中
+# 60 字内先导词不阻剥，既有行为逐位保留）；行 2+ 只接「锚定形」——判定：
+# 必须行首（容 H1/引用前缀），正文句中提及（「正文提到判定：…」）零误伤
+# （既有钉边界原样保留）。黏连无句号界定的前缀不动（保守闭集纪律不变）。
+_META_PAREN_RE = re.compile(
+    r"[（(]\s*判定\s*[:：][^（）()]{0,120}[；;]\s*证据\s*[:：][^（）()]{0,200}[）)]"
+)
+_META_LINE_RE = re.compile(
+    r"^\s*#{0,6}[^\n]{0,60}判定\s*[:：][^；;\n]{0,120}[；;]\s*证据\s*[:：]"
+    r"[^；;\n。]{0,200}[。；;.]?\s*$"
+)
+_META_PREFIX_RE = re.compile(
+    r"^\s*#{0,6}\s*判定\s*[:：][^；;\n]{0,120}[；;]\s*证据\s*[:：]"
+    r"[^；;\n。]{0,200}[。；;.]?\s*"
+)
+_META_LINE_ANCHORED_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:>[^\S\n]*)*判定\s*[:：][^；;\n]{0,120}[；;]\s*证据\s*[:：]"
+    r"[^；;\n。]{0,200}[。；;.]?\s*$"
+)
+_META_PREFIX_ANCHORED_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:>[^\S\n]*)*判定\s*[:：][^；;\n]{0,120}[；;]\s*证据\s*[:：]"
+    r"[^；;\n。]{0,200}[。；;.]?\s*"
+)
+_META_SCAN_HEAD_LINES = 6
+# 形四（括注形，自带行首锚定）：判定：短词（括注）。〔证据：…。〕——短词=
+# 判定值（如「推导型」「本讲为推导型理工内容」≤16 字且无句读/括号）；括注=
+# 依据/证据段（无嵌套括号）；句号/行界为元话语段右界，防吞同句正文。
+_META_PAREN_KW_RE = re.compile(
+    r"^(?P<lead>\s*(?:#{1,6}\s*)?(?:>[^\S\n]*)*)"
+    r"判定\s*[:：]\s*[^（()）\n。；;]{1,16}\s*"
+    r"[（(][^（）()\n]{0,200}[）)]\s*[。.]?"
+    r"(?:\s*证据\s*[:：][^；;\n。]{0,200}[。.]?)?"
+)
+
+
+def _strip_keyword_paren_meta(line: str) -> str:
+    """形四/五剥除：整行=元话语删行（含 H1/引用前缀形）；句号界定的前缀段
+    只剥元话语段留正文；黏连无句号界定（「判定：X（Y）正文」）不动。"""
+    match = _META_PAREN_KW_RE.match(line)
+    if not match:
+        return line
+    rest = line[match.end():]
+    if not rest.strip():
+        return ""
+    if match.group(0).rstrip().endswith(("。", ".")):
+        return match.group("lead") + rest.lstrip()
+    return line
+
+
+def _strip_head_line(line: str, *, allow_loose: bool) -> str:
+    """单行元话语剥除。allow_loose=首行宽松闭集（既有三形原样）；行 2+ 只接
+    行首锚定形（_META_LINE_ANCHORED/_META_PAREN_KW/_META_PREFIX_ANCHORED）。"""
+    cleaned = _META_PAREN_RE.sub("", line).rstrip()
+    stripped = cleaned.strip()
+    if _META_LINE_ANCHORED_RE.match(stripped):
+        return ""
+    if allow_loose and _META_LINE_RE.match(stripped):
+        return ""
+    cleaned = _strip_keyword_paren_meta(cleaned)
+    if allow_loose:
+        return _META_PREFIX_RE.sub("", cleaned, count=1)
+    return _META_PREFIX_ANCHORED_RE.sub("", cleaned, count=1)
+
+
+def strip_meta_discourse(markdown: Any) -> str:
+    """头部元话语剥除（守卫层五形态闭集）：①H1 尾「（判定：…；证据：…）」
+    括注；②整行判定元话语（分号配对形）；③行首判定前缀；④判定：短词（括注）
+    形；⑤判定句+证据句连写形。窗口=头 6 行（元话语可落课程头之后），行 2+
+    仅锚定形，证据段以句读为界，同句正文零吞并。"""
+    text = str(markdown or "")
+    lines = text.splitlines()
+    for index, line in enumerate(lines[:_META_SCAN_HEAD_LINES]):
+        if not line.strip():
+            continue
+        lines[index] = _strip_head_line(line, allow_loose=(index == 0))
+    return "\n".join(lines)
+
+
+# W7 相邻近重复章节合并门：39178 实测「线性电源的结构与原理」(7:17) 与
+# 「线性电源：结构与原理」(7:51) 连排。精确归一化去重（llm 链既有）只接同键，
+# 标点/虚词差异漏过——本门用与边界感知贪心同族 Dice 相似度，相邻对归一化标题
+# 相似度≥阈值=合并（保留先者锚/要点，后者摘要拼接）。
+_NEAR_DUP_TITLE_MIN_SCORE = 0.75
+
+
+def _title_dice(left: str, right: str) -> float:
+    def bigrams(value: str) -> set[str]:
+        cleaned = "".join(
+            ch for ch in str(value or "").lower()
+            if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"
+        )
+        return {cleaned[i:i + 2] for i in range(max(0, len(cleaned) - 1))}
+
+    left_grams, right_grams = bigrams(left), bigrams(right)
+    if not left_grams or not right_grams:
+        return 0.0
+    return 2.0 * len(left_grams & right_grams) / (len(left_grams) + len(right_grams))
+
+
+def merge_near_duplicate_titles(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """相邻近重复标题合并（就地语义、返回新列表与合并次数）。
+
+    仅相邻对判定（Dice≥0.75）；合并=保留先者全量字段、后者 ``summary``/
+    ``points``/``formulas`` 类列表字段拼接进先者（与 enforce_chapter_count
+    同式：内容零删改逐字保留、锚取先者）。输入须已按 start_ms 升序。"""
+    merged: list[dict[str, Any]] = []
+    merge_count = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        if merged and title:
+            previous = merged[-1]
+            previous_title = str(previous.get("title") or "").strip()
+            if previous_title and _title_dice(previous_title, title) >= _NEAR_DUP_TITLE_MIN_SCORE:
+                for list_key in ("points", "formulas"):
+                    if isinstance(item.get(list_key), list):
+                        previous[list_key] = list(previous.get(list_key) or []) + list(item[list_key])
+                previous_summary = str(previous.get("summary") or "").strip()
+                item_summary = str(item.get("summary") or "").strip()
+                if item_summary:
+                    combined = (previous_summary + "；" + item_summary).strip("；")
+                    previous["summary"] = combined[:_CHAPTER_MERGED_SUMMARY_CAP]
+                merge_count += 1
+                continue
+        if isinstance(item, dict):
+            merged.append(dict(item))
+    return merged, merge_count
+
 
 
 def _clean_text(value: Any, cap: int) -> str:
@@ -127,14 +334,16 @@ def _validate_doc_section(item: Any) -> dict[str, Any] | None:
         if not isinstance(formula, dict):
             return None
         latex = _clean_text(formula.get("latex"), 300)
-        if not latex:
-            return None
+        # W1 公式残渣门：显然坏式逐条丢弃（不丢整段；共享门=双路径同守卫）。
+        if not sane_latex(latex):
+            continue
         entry: dict[str, Any] = {"latex": latex}
         anchor = _valid_ms(formula.get("anchor_ms"))
         if anchor is not None:
             entry["anchor_ms"] = anchor
         caption = _clean_text(formula.get("caption"), 200)
-        if caption:
+        # W2 占位过滤：「课件公式行」类占位词不上屏（保 latex 丢 caption）。
+        if caption and sane_formula_caption(caption):
             entry["caption"] = caption
         formulas.append(entry)
     section: dict[str, Any] = {
@@ -507,8 +716,13 @@ def coerce_llm_doc(
     - ``drop_stats``（可选，闭集计数器）：raw_missing/sections_dropped_title/
       sections_dropped_start/sections_anchor_rescued/sections_dropped_points/
       points_dropped_text/points_dropped_anchor/points_anchor_rescued/
-      sections_empty/validate_rejected/accepted_sections——拒因归档遥测（夜10-C
-      同纪律：计数器零内容），供 685785 重生成轮实证落点条款。"""
+      points_dropped_noise/sections_empty/sections_near_dup_merged/
+      formulas_dropped_unsane/
+      captions_dropped_placeholder/validate_rejected/accepted_sections——拒因
+      归档遥测（夜10-C 同纪律：计数器零内容），供 685785 重生成轮实证落点条款。
+    - V010-WORKER-QUAL-1 文字质量守卫（全部逐条目 fail-closed）：W4 纯页码/
+      目录枚举点丢弃；W1 残渣 latex 逐条丢弃；W2 占位 caption 丢键保式；
+      W5 overview 元话语剥除；W7 相邻近重复段标题合并。"""
     stats = drop_stats if isinstance(drop_stats, dict) else None
 
     def _bump(key: str) -> None:
@@ -550,6 +764,10 @@ def coerce_llm_doc(
             if not text:
                 _bump("points_dropped_text")
                 continue
+            # W4 要点噪声门：纯页码/目录/标题枚举句无结论价值=丢点不丢段。
+            if is_noise_point_text(text):
+                _bump("points_dropped_noise")
+                continue
             anchor = _valid_ms(point.get("anchor_ms"))
             if anchor is None or anchor not in valid_anchors:
                 derived = _derive_doc_anchor_ms(text, anchor_text_pool)
@@ -571,13 +789,20 @@ def coerce_llm_doc(
                 latex = _clean_text(formula.get("latex"), 300)
                 if not latex:
                     continue
+                # W1 公式残渣门：显然坏式逐条丢弃（680954 实测 ~20% 残渣形态）。
+                if not sane_latex(latex):
+                    _bump("formulas_dropped_unsane")
+                    continue
                 entry: dict[str, Any] = {"latex": latex}
                 anchor = _valid_ms(formula.get("anchor_ms"))
                 if anchor is not None and anchor in valid_anchors:
                     entry["anchor_ms"] = anchor
                 caption = _clean_text(formula.get("caption"), 200)
-                if caption:
+                # W2 占位过滤：「课件公式行」类占位词不上屏（保 latex 丢 caption）。
+                if caption and sane_formula_caption(caption):
                     entry["caption"] = caption
+                elif caption:
+                    _bump("captions_dropped_placeholder")
                 formulas.append(entry)
         section: dict[str, Any] = {
             "start_ms": start_ms,
@@ -599,8 +824,23 @@ def coerce_llm_doc(
     if not sections:
         _bump("sections_empty")
         return None
+    # W7 相邻近重复段标题合并（39178「线性电源的结构与原理/线性电源：结构与
+    # 原理」连排形态）：逐对 Dice≥0.75 合并，保先者锚、列表字段拼接。
+    sections, near_dup_merged = merge_near_duplicate_titles(sections)
+    if near_dup_merged and stats is not None:
+        stats["sections_near_dup_merged"] = (
+            stats.get("sections_near_dup_merged", 0) + near_dup_merged
+        )
+    # W5 元话语剥除（守卫层）：overview 承载自 markdown 首段，继承同款剥除。
+    raw_overview_value = raw.get("overview")
+    if isinstance(raw_overview_value, str):
+        raw_overview_value = strip_meta_discourse(raw_overview_value)
+    elif isinstance(raw_overview_value, list):
+        raw_overview_value = [
+            strip_meta_discourse(par) for par in raw_overview_value
+        ]
     validated = validate_summary_doc({
-        "overview": raw.get("overview") if raw.get("overview") is not None else "",
+        "overview": raw_overview_value if raw_overview_value is not None else "",
         "sections": sections,
         "terms": raw.get("terms") if raw.get("terms") is not None else [],
         "summary_notes": raw.get("summary_notes") if raw.get("summary_notes") is not None else [],

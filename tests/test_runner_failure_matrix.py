@@ -7,8 +7,11 @@ source-session 收口排列、进度发布器闭集状态 coercion。
 from __future__ import annotations
 
 import io
+import os
+import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 with patch.dict("sys.modules", {"sherpa_onnx": Mock()}):
@@ -297,6 +300,79 @@ class SignedProgressPublisherClosedSetTests(unittest.TestCase):
             publisher.update("asr", status=status, force=True)
             publisher.close()
             self.assertEqual(messages[-1]["status"], status)
+
+
+class ResultPublishDegradedTests(unittest.TestCase):
+    """AGENTISSUE-ROOTFIX-1（8df79689 复放钉，2026-10-26）：真实任务在全部处理
+    完成后，最终状态 PATCH 因邮箱凭证中途失效（MailboxError HTTP 401）把
+    conclusion 打成 failure——客户端随即删一次性结果密钥、已上传的结果
+    artifact 变废料、28 分钟算力整单重跑。根修=最终发布降级 best-effort：
+    结果已落盘 artifact（客户端导入路径读 artifact），邮箱之死不否决成果。
+    本钉=失败日志最小复放：publish_status 全程 401 形态下 run() 仍成功收口。
+    """
+
+    def test_dead_mailbox_at_final_publish_still_returns_zero_with_result_on_disk(self):
+        from courselens_worker import runner as runner_module
+        from courselens_worker.mailbox import MailboxError
+
+        task_id = "8df79689c0514760a618061c66369e8d"
+        with tempfile.TemporaryDirectory() as tmp:
+            result_path = Path(tmp) / "result.box.json"
+
+            class DeadStatusMailbox:
+                """publish_status 恒 401（邮箱 token 中途失效形态）；评论 POST 正常。"""
+
+                def __init__(self, repo, token, **kwargs):
+                    self.status_calls = 0
+                    self.control_calls = 0
+
+                def wait(self, task_id, timeout_seconds=600, poll_seconds=2.0):
+                    return {"envelope": "stub"}
+
+                def publish_status(self, sequence, sealed):
+                    self.status_calls += 1
+                    raise MailboxError("GitHub mailbox returned HTTP 401 (REPLAY-8DF7)")
+
+                def publish_control(self, sequence, sealed):
+                    self.control_calls += 1
+
+            fake_job = {
+                "task_id": task_id,
+                "job_kind": "summary",
+                "input_hash": "0" * 64,
+                "result_public_key": "stub-key",
+                "pipeline": {"version": "v2"},
+            }
+            fake_result = {"schema": "result", "task_id": task_id, "status": "completed"}
+
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+            with patch.dict(
+                "os.environ",
+                {
+                    "COURSELENS_TASK_ID": task_id,
+                    "COURSELENS_PROTOCOL_VERSION": PROTOCOL_VERSION,
+                    "COURSELENS_RESULT_PATH": str(result_path),
+                },
+            ), patch.object(runner_module, "IssueMailbox", DeadStatusMailbox), patch.object(
+                runner_module, "_required", lambda name: os.environ.get(name, "stub")
+            ), patch.object(
+                runner_module, "open_job", lambda envelope, key: dict(fake_job)
+            ), patch.object(
+                runner_module, "process_job", lambda job, **kwargs: dict(fake_result)
+            ), patch.object(
+                runner_module, "seal_result", lambda result, key, key2: {"sealed": "result"}
+            ), patch.object(
+                runner_module, "seal_control", lambda value, key, key2: {"sealed": "control"}
+            ), redirect_stderr(stderr), redirect_stdout(stdout):
+                exit_code = runner_module.run()
+
+            output = stderr.getvalue()
+            self.assertEqual(exit_code, 0, "邮箱死亡不否决已完成成果：仍成功收口")
+            self.assertTrue(result_path.exists(), "结果 artifact 已落盘（workflow if:always() 必上传）")
+            self.assertIn("result_publish_degraded type=MailboxError", output)
+            self.assertIn("stage=result_ready", stdout.getvalue())
+            self.assertNotIn("worker_failed", output)
 
 
 if __name__ == "__main__":

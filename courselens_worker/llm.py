@@ -16,7 +16,7 @@ from typing import Any, Callable
 import requests
 
 from .formats import normalize_segments
-from .glossary import apply_glossary
+from .glossary import apply_glossary, unify_text_terms
 from .retry import LadderExhausted, LadderFailure, run_ladder
 from .slide_alignment import assign_pack_windows
 from .subtitle_clean import CLEAN_MAX_OPS_PER_SEGMENT, validate_tier2_dels
@@ -30,6 +30,8 @@ from .summary_contract import (
     build_summary_doc,
     coerce_llm_doc,
     enforce_chapter_count,
+    merge_near_duplicate_titles,
+    strip_meta_discourse,
 )
 from .course_knowledge import (
     coverage_summary,
@@ -39,6 +41,7 @@ from .course_knowledge import (
     validate_knowledge_points,
     validate_topic_candidates,
 )
+from shared.subtitle_date_guard import annotate_segments, summary_prompt_suffix
 
 API_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-flash"  # N5A-P6：官方 2026-07-24 停用 deepseek-chat 别名
@@ -1596,9 +1599,26 @@ _WINDOW_TEACHING_SUFFIX = (
     "结构/流程归类记事实（坐标/单位/区域/方向），只记输入内事实。"
     "公式一律用 LaTeX 记写：行内 \\(…\\)、独立 \\[…\\]，禁用单个 $ 包裹。"
 )
+
+
+def _window_date_guard_suffix(transcript: Any) -> str:
+    """ASR-CORRECT-R1：总结窗日期存疑后缀（确定性守卫，零新 LLM 调用）。
+
+    本窗字幕带自纠锚批注（老师「说错了」改口的日期主张）时，把「修正
+    不静默」标注义务注入窗 prompt——笔记引用纠正值必须带「字幕原文作…」
+    括注，直接回应「经过 AI 处理后根本看不出来有问题」的用户痛点。
+    fail-open：守卫任何异常返回空串（零增字，行为与既有逐位一致）。
+    """
+    try:
+        if not isinstance(transcript, list):
+            return ""
+        return summary_prompt_suffix(annotate_segments(transcript))
+    except Exception:
+        return ""
 _STEM_TEACHING_RULES = (
     "先判定本讲是否推导型理工内容（公式推导/器件/电路类）：依据 title、"
-    "course_context 与笔记证据判定，并在笔记首行写出判定结论与证据（≤40字）。"
+    "course_context 与笔记证据判定；判定在内部完成，正文禁写「判定：」「证据：」"
+    "「课型：」等元话语（学生只见学习内容，不自述处理过程）。"
     "非推导型或证据不足：按既有通用格式输出，不加骨架。判定为推导型："
     "markdown 用教学骨架——材料含课件图像时六段「问题与位置/图像直觉/机制/"
     "递进推导（含假设与边界）/适用条件与反例/实例」，图像直觉段只写材料实际"
@@ -1613,6 +1633,10 @@ _STEM_TEACHING_RULES = (
     # 自门控并列而非置于骨架分支内。
     "无论课型，公式一律用 LaTeX 记写：行内 \\(…\\)、独立 \\[…\\] 或 $$…$$，"
     "禁用单个 $ 包裹（不渲染）。"
+    # V010-WORKER-QUAL-1（2026-10-26）：W3 讲内术语统一（Kirk↔科克/Early↔厄利
+    # 实测混用；跨文种配对无法确定性校验=提示词面主修）。
+    "同一术语/人名/概念全篇只用同一种写法（优先 glossary 写法，不中英交替；"
+    "首次出现可括注另一种写法，此后统一）。"
 )
 _SUMMARY_MERGE_PROMPT_TEACHING = _SUMMARY_MERGE_PROMPT + "；" + _STEM_TEACHING_RULES
 
@@ -1624,8 +1648,11 @@ _SUMMARY_MERGE_PROMPT_TEACHING = _SUMMARY_MERGE_PROMPT + "；" + _STEM_TEACHING_
 _SUMMARY_DOC_RULES = (
     "另输出doc字段：overview为2-4段总述；sections与chapters一一对应，每项含"
     "title、start_ms（取自chapters）、source恒填semantic、points（1-8条，每条"
-    "text≤120字+anchor_ms取输入start_ms）、formulas（可空，每条latex+"
-    "anchor_ms+caption，latex不含定界符）；summary_notes为3-5条一句话小结。"
+    "text≤120字+anchor_ms取输入start_ms，只写结论与机制句，禁纯页码/目录/"
+    "标题枚举句）、formulas（可空，每条latex+anchor_ms+caption：latex不含"
+    "定界符，caption=该公式的含义短名（如「特征频率」），无把握就省略caption）；"
+    "summary_notes为3-5条一句话小结；terms为3-12条，每项name（术语中文名）+"
+    "symbol（符号或英文缩写，可空）+note（一句话含义），取本讲核心概念。"
 )
 _SUMMARY_MERGE_PROMPT_DOC_TEACHING = (
     _SUMMARY_MERGE_PROMPT_TEACHING + "；" + _SUMMARY_DOC_RULES
@@ -1650,7 +1677,8 @@ _WINDOW_SLIDE_SUFFIX = (
 _MERGE_SLIDE_RULES = (
     "输入含 slide_formulas（本讲课件公式行清单）：doc 各 section 的 formulas"
     "应把归属本节的课件公式逐条转写（latex 不含定界符，anchor_ms 取该节"
-    "start_ms 或输入内合法锚），转写未提及≠不存在；清单外公式不编造。"
+    "start_ms 或输入内合法锚，caption=公式的物理含义短名，禁回填「课件公式行」"
+    "等占位词，无含义就省略），转写未提及≠不存在；清单外公式不编造。"
 )
 _SUMMARY_MERGE_PROMPT_TEACHING_SLIDE = (
     _SUMMARY_MERGE_PROMPT_TEACHING + "；" + _MERGE_SLIDE_RULES
@@ -2245,6 +2273,11 @@ def create_summary(
         # 旧串逐位不动）。
         if window.get("slide_formulas") is not None:
             window_prompt = window_prompt + _WINDOW_SLIDE_SUFFIX
+        # ASR-CORRECT-R1：日期主张交叉验证（修正不静默）——本窗字幕带自纠
+        # 锚批注时追加标注义务后缀（确定性守卫零新调用；无批注窗零增字）。
+        date_suffix = _window_date_guard_suffix(window.get("transcript"))
+        if date_suffix:
+            window_prompt = window_prompt + "\n" + date_suffix
         messages = [
             {"role": "system", "content": window_prompt},
             {"role": "user", "content": json.dumps(window, ensure_ascii=False)},
@@ -2390,6 +2423,13 @@ def create_summary(
     )
     if not _valid_summary_part(value):
         raise LLMError("summary merge response has an invalid shape")
+    # V010-WORKER-QUAL-1：markdown 定稿守卫（零 LLM，全部在下游消费前收口）——
+    # W5 元话语剥除（「判定：…；证据：…」不上屏，chapters/要点/doc/复习视图
+    # 派生全部继承干净文本）+ W3 讲内术语统一（同文种变体 trusted-pairing，
+    # 词表缺席=逐位原样）。
+    value["markdown"] = unify_text_terms(
+        strip_meta_discourse(value["markdown"]), tuple(terms)
+    )
     if progress is not None:
         progress("summary", len(sources) + 1, len(sources) + 1)
     valid_anchors = {int(item.get("start_ms") or 0) for item in transcript}
@@ -2440,6 +2480,11 @@ def create_summary(
     # V010-CONTENT-IMPL-1 件3（CONTENT-R1 B2 实证 0-59 失控）：章节数量纪律
     # ——区间帽（时长//3 分钟地板与 20 帽取小、≥3 地板），超帽按时间最近邻
     # 合并，≤帽按 start_ms 稳定排序透传（锚白名单值不丢形，幂等零新调用）。
+    # V010-WORKER-QUAL-1（W7）：相邻近重复章节合并门在帽纪律前收口——精确
+    # 归一化去重只接同键，标点/虚词差异漏过（39178「线性电源的结构与原理/
+    # 线性电源：结构与原理」连排实测），Dice≥0.75 逐对合并（保先者锚，摘要
+    # 拼接），合并次数随遥测归档。
+    chapters, chapters_near_dup_merged = merge_near_duplicate_titles(chapters)
     duration_ms = max(
         [0]
         + [
@@ -2629,6 +2674,7 @@ def create_summary(
         f"takeaway_anchors={sum(1 for item in takeaway_anchors if item is not None)} "
         f"chapters={len(chapters)} chapter_anchors_derived={chapters_anchor_derived} "
         f"chapter_dup_dropped={chapters_dup_dropped} "
+        f"chapters_near_dup_merged={chapters_near_dup_merged} "
         f"chapters_cap_merged={chapters_cap_merged} "
         f"doc_sections_cap_merged={doc_sections_cap_merged} "
         f"knowledge_points={len(knowledge_points)} "

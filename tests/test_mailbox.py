@@ -216,6 +216,21 @@ class MailboxTests(unittest.TestCase):
         with self.assertRaisesRegex(MailboxError, "not available"):
             _mailbox(session).wait(TASK_ID, timeout_seconds=1, poll_seconds=0.2)
 
+    def test_wait_fails_fast_on_permanent_token_rejection(self):
+        """AGENTISSUE-ROOTFIX-1：HTTP 401=凭证永久失效（撤销/过期），快败收口
+        而不是烧满超时窗（10-23 五连败同族每单 ~10m30s 白烧计费 runner）。
+        客户端重派的新 attempt 会重新注入环境 secret（新 token），重试语义
+        在客户端有界重试面，不在 runner 死等面。"""
+        session = FakeSession()
+        session.expect(
+            "GET", "/repos/student/jobs/issues",
+            FakeResponse(401, None, request_id="REQ-401"),
+        )
+        box = _mailbox(session)
+        with self.assertRaisesRegex(MailboxError, "HTTP 401"):
+            box.wait(TASK_ID, timeout_seconds=60, poll_seconds=0.2)
+        self.assertEqual(len(session.calls), 1)
+
     def test_publish_control_requires_issue_and_posts_numbered_parts(self):
         box = _mailbox(FakeSession())
         with self.assertRaisesRegex(MailboxError, "job issue is not available"):

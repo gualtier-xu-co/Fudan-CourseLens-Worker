@@ -97,6 +97,13 @@ def extract_formula_lines(text: str) -> list[str]:
         if not candidate or len(candidate) > FORMULA_LINE_CAP:
             continue
         if MATH_LINE_RE.search(candidate) or LATEXISH_LINE_RE.search(candidate):
+            # V010-WORKER-QUAL-1（W1 输入侧守卫）：显然坏式不进模型输入——
+            # 悬垂尾符（「nco =」）与双等号（「IB==70\mu A」）行是 OCR 残渣，
+            # 投喂后会被「以 slide 数据为准转写」忠实回显进 latex 字段
+            # （680954 实测 ~20% 残渣的源头之一）。召回网其余面零收紧。
+            stripped = candidate.rstrip()
+            if stripped.endswith(("=", "+", "-", ",", ";", "*")) or "==" in stripped:
+                continue
             lines.append(candidate[:FORMULA_LINE_CAP])
     return lines
 

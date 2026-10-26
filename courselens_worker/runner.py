@@ -1507,10 +1507,21 @@ def run() -> int:
     temporary = output.with_suffix(output.suffix + ".tmp")
     temporary.write_text(json.dumps(sealed, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     os.replace(temporary, output)
-    publish_control("progress", {
-        "stage": "result", "status": "completed", "completed": 1,
-        "total": 1, "error_code": "",
-    }, mutable=True)
+    # AGENTISSUE-ROOTFIX-1（8df79689 定谳 2026-10-26）：结果 artifact 已在上一行
+    # 落盘，llm.yml 的上传步（if: always()）保证其必达；客户端正常导入路径读的
+    # 就是 artifact（coordinator._find_result_artifact），不依赖这条最终状态
+    # PATCH。邮箱凭证中途失效（401，如派发后客户端刷新授权使在途任务的
+    # COURSELENS_JOB_TOKEN 失效）时，让这条 PATCH 的 MailboxError 把 run 打成
+    # failure=客户端随即删一次性结果密钥、artifact 变废料、28 分钟算力整单重跑。
+    # 故最终状态发布降级为 best-effort：失败打印闭集遥测行后仍以成功收口，
+    # run conclusion=success → 客户端照常导入 artifact。
+    try:
+        publish_control("progress", {
+            "stage": "result", "status": "completed", "completed": 1,
+            "total": 1, "error_code": "",
+        }, mutable=True)
+    except Exception as exc:
+        print(f"result_publish_degraded type={type(exc).__name__}", file=sys.stderr, flush=True)
     checkpoint_publisher.close()
     print(f"task={task_id} stage=result_ready", flush=True)
     return 0
