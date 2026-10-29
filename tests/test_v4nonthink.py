@@ -518,10 +518,13 @@ class SummaryGlossaryTests(unittest.TestCase):
         merge = {"markdown": "# 笔记", "chapters": [], "key_takeaways": ["要点"]}
         _chat, calls = self._chat_recorder([window, merge])
         # 本钉=window 提示词变体与 merge 数据通道（视图派生在 test_review_views.py）。
+        # RXFIX-3：注入面只带「转写有证」词——能带图在转写内有证→流转；
+        # 电势零证→过滤（课件专属词不以权威写法名义带偏生成面，669766 伤型）。
         with patch("courselens_worker.llm._chat", _chat), \
                 patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             create_summary(
-                "key", title="t", transcript=[{"start_ms": 0, "end_ms": 900, "text": "内容"}],
+                "key", title="t",
+                transcript=[{"start_ms": 0, "end_ms": 900, "text": "内容讲能带图"}],
                 ppt_pages=[], glossary=("能带图", "电势"),
             )
         self.assertEqual(len(calls), 2)
@@ -529,9 +532,35 @@ class SummaryGlossaryTests(unittest.TestCase):
         self.assertEqual(calls[0][0]["content"],
                          _SUMMARY_WINDOW_PROMPT_WITH_GLOSSARY + _WINDOW_TEACHING_SUFFIX)
         window_payload = json.loads(calls[0][1]["content"])
-        self.assertEqual(window_payload["glossary"], ["能带图", "电势"])
+        self.assertEqual(window_payload["glossary"], ["能带图"])
         merge_payload = json.loads(calls[1][1]["content"])
-        self.assertEqual(merge_payload["glossary"], ["能带图", "电势"])
+        self.assertEqual(merge_payload["glossary"], ["能带图"])
+
+    def test_glossary_fully_unattested_is_dropped_from_prompt_face(self):
+        """RXFIX-3：词表全零证→提示词面不带 glossary（退基础串+教学后缀路径）。"""
+        from courselens_worker.llm import (
+            _SUMMARY_WINDOW_PROMPT,
+            _WINDOW_TEACHING_SUFFIX,
+            REVIEW_VIEWS_ENV,
+            create_summary,
+        )
+
+        window = {"markdown": "笔记", "chapters": []}
+        merge = {"markdown": "# 笔记", "chapters": [], "key_takeaways": ["要点"]}
+        _chat, calls = self._chat_recorder([window, merge])
+        with patch("courselens_worker.llm._chat", _chat), \
+                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
+            create_summary(
+                "key", title="t",
+                transcript=[{"start_ms": 0, "end_ms": 900, "text": "内容"}],
+                ppt_pages=[], glossary=("能带图", "电势"),
+            )
+        self.assertEqual(calls[0][0]["content"],
+                         _SUMMARY_WINDOW_PROMPT + _WINDOW_TEACHING_SUFFIX)
+        window_payload = json.loads(calls[0][1]["content"])
+        self.assertNotIn("glossary", window_payload)
+        merge_payload = json.loads(calls[1][1]["content"])
+        self.assertNotIn("glossary", merge_payload)
 
     def test_no_glossary_window_prompt_is_base_plus_teaching_suffix(self):
         from courselens_worker.llm import (

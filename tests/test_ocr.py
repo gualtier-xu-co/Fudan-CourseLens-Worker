@@ -451,6 +451,12 @@ class RunnerSlideWarningTests(unittest.TestCase):
             isinstance(summary, dict)
             and (summary.get("key_takeaways") or [t for t in (summary.get("doc") or {}).get("summary_notes") or [] if str(t or "").strip()])
         )
+        # TUNING-RXFIX-1：体量门降级警告判定同源导入（桩补齐；替身产物无
+        # deep_usage 旗标=零体量警告，警告真值面由 test_summary_tuning_rx 实钉）。
+        llm_stub.summary_md_volume_degraded = lambda summary: bool(
+            isinstance(summary, dict)
+            and (summary.get("deep_usage") or {}).get("md_volume_degraded")
+        )
         with patch.dict(
             sys.modules,
             {"courselens_worker.ocr": ocr_stub, "courselens_worker.llm": llm_stub},

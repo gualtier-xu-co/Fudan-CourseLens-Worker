@@ -250,6 +250,46 @@ def strip_meta_discourse(markdown: Any) -> str:
     return "\n".join(lines)
 
 
+# ---- V010-TUNING-RXFIX-1（TB-P1-1 生成侧根修，2026-10-29）：分隔符垃圾洗除
+# F9EVAL/TB 实采（15 讲产物全量扫）：『。；』589 处（列表项句号后游离分号，
+# v1 产物「……繁琐公式。；教师提供邮箱联系方式」形）+『：；；；』30 处（空
+# 列表项，「……剧增）：；；；」形）贯通总结/闪卡/搜索三学生可见面。生成侧
+# 单点根修（非渲染侧补丁）=定稿守卫族同位洗除，下游派生自净。闭集保守规则：
+#   ① {。；;} 二连以上跑段 → 归并为单分隔符（跑内含句号归『。』否则『；』）；
+#   ② 行尾『：；』空项形（冒号后仅分隔符=该列表项无内容）→ 剥分隔符留冒号；
+#   ③ LaTeX/行内码跨度豁免（\(…\)/\[…\]/$$…$$/`…`——半角分号是合法字符）；
+#   ④ 单分隔符（正常中文列表「a；b」）零触碰。零内容增益/删减，纯标点整形。
+_SEPARATOR_JUNK_RUN_RE = re.compile(r"[。；;]{2,}")
+_SEPARATOR_TAIL_EMPTY_RE = re.compile(r"([：:])[；;。]+(?=\s*(?:\n|$))")
+_SEPARATOR_PROTECTED_SPAN_RE = re.compile(
+    r"(\\\[.*?\\\]|\\\(.*?\\\)|\$\$.*?\$\$|`[^`\n]*`)", re.DOTALL
+)
+
+
+def _strip_separator_junk_span(text: str) -> str:
+    def _collapse(match: re.Match[str]) -> str:
+        return "。" if "。" in match.group(0) else "；"
+
+    cleaned = _SEPARATOR_JUNK_RUN_RE.sub(_collapse, text)
+    return _SEPARATOR_TAIL_EMPTY_RE.sub(r"\1", cleaned)
+
+
+def strip_separator_junk(text: Any) -> str:
+    """分隔符垃圾洗除（TB-P1-1 生成侧根修）：『。；』『；；；』族闭集整形。
+
+    生成产物（markdown/chapters/takeaways/doc 文本字段）定稿时统一过洗：
+    跑段归并+行尾空项剥除，LaTeX/行内码跨度豁免，单分隔符零触碰——下游
+    闪卡/搜索派生自净，存量 v1 脏产物走重生成路径（BATCH-35）。"""
+    value = str(text or "")
+    if not (_SEPARATOR_JUNK_RUN_RE.search(value) or _SEPARATOR_TAIL_EMPTY_RE.search(value)):
+        return value
+    parts = _SEPARATOR_PROTECTED_SPAN_RE.split(value)
+    return "".join(
+        part if index % 2 else _strip_separator_junk_span(part)
+        for index, part in enumerate(parts)
+    )
+
+
 # W7 相邻近重复章节合并门：39178 实测「线性电源的结构与原理」(7:17) 与
 # 「线性电源：结构与原理」(7:51) 连排。精确归一化去重（llm 链既有）只接同键，
 # 标点/虚词差异漏过——本门用与边界感知贪心同族 Dice 相似度，相邻对归一化标题

@@ -278,7 +278,11 @@ _UNIFY_TEXT_MIN_OCCURRENCES = 2
 
 
 def unify_text_terms(
-    text: str, glossary: tuple[str, ...], *, source_corpus: str | None = None
+    text: str,
+    glossary: tuple[str, ...],
+    *,
+    source_corpus: str | None = None,
+    evidence_text: str | None = None,
 ) -> str:
     """单条文本的讲内术语变体统一（确定性、零 token、零外联）。
 
@@ -288,10 +292,22 @@ def unify_text_terms(
 
     RXFIX-1：双守卫与 apply_glossary 同源——优势形（≥8 次）与源语料保护形
     （课件/课程名含该串）一律不改写。``source_corpus`` 显式传参供 create_summary
-    透传（其内部已把词表展平成普通列表，属性会丢失）；缺省读词表自带属性。"""
+    透传（其内部已把词表展平成普通列表，属性会丢失）；缺省读词表自带属性。
+
+    RXFIX-3（2026-10-29，669766 掷1 残留伤型根修）：``evidence_text``=讲内转写
+    全文时两道升级——
+    ①优势形守卫计频口径改为讲内转写（docstring「讲内」语义的真实现：老师真实
+    说的词形以转写为准；修 RXFIX-1 实现按「被统一文本内部」计频的口径错位，
+    该错位下提示词偏置先稀释 md 内词形、守卫随即失守）；
+    ③方向守卫（新增）：piece 转写有证（>0）而目标词转写零证（=0）→ 禁替换
+    （课件专属词永不「改正」老师真实说出的词；37355 实证伤型=电平〔课件词，
+    转写 0 次〕整改电路/水平/电导/电阻〔口语词，转写 6/…次〕）。合法纠错向
+    不受影响：OCR 字形变体（变換）转写零证、目标（变换）转写有证，方向守卫
+    不触发。``evidence_text`` 缺省 None=零行为变化（兼容旧调用方与测试）。"""
     if not text or not glossary:
         return str(text or "")
     corpus = str(source_corpus) if source_corpus is not None else _source_corpus(glossary)
+    evidence = str(evidence_text or "")
     source = str(text)
     counts: Counter = Counter()
     piece_terms: dict[str, set[str]] = {}
@@ -299,13 +315,29 @@ def unify_text_terms(
         for piece, term in _candidate_variants(run, glossary):
             piece_terms.setdefault(piece, set()).add(term)
             counts[piece] += run.count(piece)
-    trusted = {
-        piece: next(iter(terms))
-        for piece, terms in piece_terms.items()
-        if len(terms) == 1
-        and counts[piece] >= _UNIFY_TEXT_MIN_OCCURRENCES
-        and not _piece_blocked_as_variant(piece, corpus, counts[piece])
-    }
+    evidence_counts: dict[str, int] = {}
+    if evidence:
+        for piece, piece_terms_set in piece_terms.items():
+            evidence_counts[piece] = evidence.count(piece)
+            for term in piece_terms_set:
+                evidence_counts.setdefault(term, evidence.count(term))
+    trusted = {}
+    for piece, piece_terms_set in piece_terms.items():
+        if len(piece_terms_set) != 1:
+            continue
+        term = next(iter(piece_terms_set))
+        if counts[piece] < _UNIFY_TEXT_MIN_OCCURRENCES:
+            continue
+        if _piece_blocked_as_variant(piece, corpus, counts[piece]):
+            continue
+        if evidence:
+            # RXFIX-3 ①优势形守卫计频口径：讲内（转写）≥8=老师真实词形，绝不改写。
+            if evidence_counts.get(piece, 0) >= GLOSSARY_DOMINANT_FORM_MIN_OCCURRENCES:
+                continue
+            # RXFIX-3 ③方向守卫：口语有证词不被转写零证词「改正」。
+            if evidence_counts.get(piece, 0) > 0 and evidence_counts.get(term, 0) == 0:
+                continue
+        trusted[piece] = term
     if not trusted:
         return source
     replaced = source

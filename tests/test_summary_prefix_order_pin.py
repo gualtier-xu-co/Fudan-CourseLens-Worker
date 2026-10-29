@@ -66,7 +66,7 @@ class SummaryPrefixOrderPinTests(unittest.TestCase):
                 "k", title="t",
                 transcript=_TRANSCRIPT,
                 ppt_pages=[],
-                glossary=("肌动蛋白", "线粒体"),
+                glossary=("链式聚合", "凝胶化"),  # RXFIX-3：取转写有证词，钉身只锁键序
             )
         window_payloads = [
             json.loads(messages[1]["content"])
@@ -92,7 +92,7 @@ class SummaryPrefixOrderPinTests(unittest.TestCase):
                 "k", title="t",
                 transcript=_TRANSCRIPT,
                 ppt_pages=[],
-                glossary=("肌动蛋白",),
+                glossary=("凝胶化",),  # RXFIX-3：取转写有证词，钉身只锁键序
                 course_context={"course_title": "生物实验"},
             )
         merge_payloads = [

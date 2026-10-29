@@ -709,7 +709,7 @@ def _process_materialized_job(
     elif kind in {"summary", "chapters"}:
         from .course_knowledge import normalize_evidence_packet
         from .lecture_ir import build_lecture_ir
-        from .llm import LLMError, create_summary, summary_takeaways_missing
+        from .llm import LLMError, create_summary, summary_md_volume_degraded, summary_takeaways_missing
         from .ocr import process_slides
         from .slide_alignment import build_slide_pack
 
@@ -826,6 +826,10 @@ def _process_materialized_job(
             # 既有通道上屏；诚实空态可见，绝不静默——8 掷 5 空实证教训）。
             if summary_takeaways_missing(summary):
                 warnings.append("summary_takeaways_missing")
+            # TUNING-RXFIX-1：体量门降级闭集警告（同 RXFIX-2 通道：worker
+            # warnings → result_notices 上屏；「本版较简」可见，绝不静默）。
+            if summary_md_volume_degraded(summary):
+                warnings.append("summary_md_volume_degraded")
         # Additive, evidence-grounded Lecture IR view over the same
         # transcript/chapters/pages; it changes no pre-existing output.
         outputs["lecture_ir"] = build_lecture_ir(
@@ -915,7 +919,7 @@ def _process_materialized_job(
         from .formats import to_srt, to_vtt
         from .lecture_ir import build_lecture_ir
         from .glossary import build_glossary
-        from .llm import LLMError, answer_question, create_summary, drain_call_log, proofread_segments, summary_takeaways_missing
+        from .llm import LLMError, answer_question, create_summary, drain_call_log, proofread_segments, summary_md_volume_degraded, summary_takeaways_missing
         from .ocr import process_slides
         from .slide_alignment import build_slide_pack
 
@@ -1194,6 +1198,9 @@ def _process_materialized_job(
                 # RXFIX-2：要点面降级闭集警告（同 summary/chapters 站）。
                 if summary_takeaways_missing(summary):
                     warnings.append("summary_takeaways_missing")
+                # TUNING-RXFIX-1：体量门降级闭集警告（同 summary/chapters 站）。
+                if summary_md_volume_degraded(summary):
+                    warnings.append("summary_md_volume_degraded")
             if "chapters" in requested:
                 outputs["chapters"] = list(summary.get("chapters") or [])
             # Same additive Lecture IR view as the summary job, over the

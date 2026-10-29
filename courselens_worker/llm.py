@@ -33,6 +33,7 @@ from .summary_contract import (
     merge_near_duplicate_titles,
     strip_introspective_parens,
     strip_meta_discourse,
+    strip_separator_junk,
 )
 from .course_knowledge import (
     coverage_summary,
@@ -1526,6 +1527,156 @@ _SUMMARY_TAKEAWAY_RETRY_NUDGE = (
     " 3-5 条字符串数组，不得省略或置空。）"
 )
 
+# ---- V010-TUNING-RXFIX-1（TB-RX-A1/A3，2026-10-29）：md 体量预算门+骨架密度下限
+# 定谳依据（TUNING-BASE-1 专项一）：md 长度由单次合并调用即兴决定、无确定性
+# 控制——同讲同构建 6 掷 2492→29693（≈12×）全距；学生感知=同一讲今天 5 千字
+# 明天 3 万字。本门在合并梯内本地校验（零新 LLM 调用）：破下限→RXFIX-2 同款
+# 单点重试（user 侧补量指令）；末试仍破=降级出货+md_volume_degraded 闭集计数
+# （runner 转闭集警告经 result_notices 上屏，绝不静默烂产物）。
+# 门形态=时长比例地板与绝对地板取大（TB-RX-A1 原方）：不取「0.8× 旧版」形——
+# 旧版自身可为偶短掷（680954 基线 2396 实证），比例门会把坏基线放大成假门。
+# 激活下限=时长 ≥30 分钟：短录音素材本少、重掷无益（钉测替身微转写天然
+# 不适用=同一语义边界）。0.8× 旧版对照归 A4 版本回退联动（客户端导入漏斗）。
+_SUMMARY_MD_FLOOR_ABS_CHARS = 3_000            # 真讲义绝对地板（45 分钟以下兜底）
+_SUMMARY_MD_FLOOR_PER_MINUTE = 55              # 时长比例地板：分钟×55 字
+_SUMMARY_VOLUME_GATE_MIN_MS = 30 * 60_000      # 门激活下限（短录音不适用预算门）
+# 二态识别（TB 专项一实测全距留边）：骨架态 h2=6-10、通用态 h2=27-62 → h2 计数
+# 3-16 且 ≥2 个骨架段关键词命中=骨架，否则通用。骨架态联动 A3 密度下限：
+# 每个一级段 ≥300 字或 ≥3 条列点，过半段空壳才判门破（单薄段不烧重试，轻快律）。
+_SUMMARY_SKELETON_H2_RANGE = (3, 16)
+_SKELETON_SECTION_KEYWORDS = ("问题与位置", "图像直觉", "递进推导", "适用条件", "实例")
+_SKELETON_SECTION_MIN_CHARS = 300
+_SKELETON_SECTION_MIN_BULLETS = 3
+_SUMMARY_VOLUME_RETRY_NUDGE_FMT = (
+    "\n\n（上一响应正文过短，低于本讲体量预算下限（合计不少于 {min_chars} 字）："
+    "本次必须输出完整 markdown 学习笔记——覆盖全部章节时间轴，每个部分内容充实，"
+    "机制、推导与例子从输入素材充分展开，不得整段留白。）"
+)
+_HEADING2_LINE_RE = re.compile(r"^\s*##(?!#)\s*(?P<title>.*)$", re.MULTILINE)
+_H2_SECTION_SPLIT_RE = re.compile(r"^\s*##(?!#).*$", re.MULTILINE)  # 无捕获组=split 纯段体
+_BULLET_LINE_RE = re.compile(r"^\s*(?:[-*•]|\d{1,2}[.、)）]|[①②③④⑤⑥⑦⑧⑨⑩])")
+
+
+def summary_md_volume_floor(duration_ms: int) -> int:
+    """TB-RX-A1 体量下限：max(绝对地板, 时长分钟×55 字)。"""
+    minutes = max(0.0, float(duration_ms or 0) / 60_000.0)
+    return max(_SUMMARY_MD_FLOOR_ABS_CHARS, int(minutes * _SUMMARY_MD_FLOOR_PER_MINUTE))
+
+
+def summary_markdown_format_state(markdown: str) -> str:
+    """二态识别：skeleton（教学骨架六段式）| generic（通用逐章枚举）。"""
+    titles = [
+        str(match.group("title") or "").strip()
+        for match in _HEADING2_LINE_RE.finditer(str(markdown or ""))
+    ]
+    if not (_SUMMARY_SKELETON_H2_RANGE[0] <= len(titles) <= _SUMMARY_SKELETON_H2_RANGE[1]):
+        return "generic"
+    hits = sum(
+        1 for keyword in _SKELETON_SECTION_KEYWORDS
+        if any(keyword in title for title in titles)
+    )
+    return "skeleton" if hits >= 2 else "generic"
+
+
+def _skeleton_density_violations(markdown: str) -> tuple[int, int]:
+    """A3 骨架密度下限（TB-RX-A3 门级联动）：返回 (空壳段数, 计入段数)。
+
+    段体 ≥300 字或 ≥3 条列点=充实；两者皆缺=空壳。跳过 h2 前导语。"""
+    bodies = _H2_SECTION_SPLIT_RE.split(str(markdown or ""))[1:]
+    violations = 0
+    checked = 0
+    for body in bodies:
+        text = body.strip()
+        if not text:
+            continue
+        checked += 1
+        bullets = sum(
+            1 for line in text.splitlines() if _BULLET_LINE_RE.match(line)
+        )
+        if len(text) < _SKELETON_SECTION_MIN_CHARS and bullets < _SKELETON_SECTION_MIN_BULLETS:
+            violations += 1
+    return violations, checked
+
+
+def summary_md_volume_gate(markdown: str, duration_ms: int) -> dict[str, Any]:
+    """TB-RX-A1 体量预算门判定（零 LLM 纯本地，合并梯内收口）。
+
+    failed=True 的两种形态：①时长 ≥30 分钟且 md 长度破下限（十倍缩水短掷）；
+    ②骨架态过半一级段空壳（TB-RX-A3 密度联动，防「缩水骨架模式」）。
+    返回判定明细（闭集形状，供遥测与重试指令取数）。"""
+    text = str(markdown or "")
+    length = len(text)
+    state = summary_markdown_format_state(text)
+    floor = summary_md_volume_floor(duration_ms)
+    gate_active = int(duration_ms or 0) >= _SUMMARY_VOLUME_GATE_MIN_MS
+    below_floor = bool(gate_active and length < floor)
+    violations, checked = (0, 0)
+    if state == "skeleton":
+        violations, checked = _skeleton_density_violations(text)
+    density_failed = bool(checked >= 2 and violations * 2 > checked)
+    return {
+        "failed": below_floor or density_failed,
+        "below_floor": below_floor,
+        "density_failed": density_failed,
+        "length": length,
+        "floor": floor,
+        "state": state,
+        "density_violations": violations,
+        "density_sections": checked,
+    }
+
+
+def summary_md_volume_degraded(summary: dict[str, Any] | None) -> bool:
+    """落库前的体量降级判定（runner 转闭集警告，经 result_notices 上屏）。
+
+    权威=生成侧 deep_usage.md_volume_degraded 闭集计数（门在合并梯内已
+    单点重试过，末试仍破才置位）；形状健壮：非 dict/缺键=False（旧产物
+    零新警告，绝不误报历史产物）。"""
+    if not isinstance(summary, dict):
+        return False
+    return bool((summary.get("deep_usage") or {}).get("md_volume_degraded"))
+
+
+def _clean_separator_junk_surfaces(value: dict[str, Any]) -> None:
+    """TUNING-RXFIX-1（TB-P1-1 生成侧单点根修）：合并候选三文本面统一过洗。
+
+    chapters(title+summary)/key_takeaways/doc(overview+sections 的 title 与
+    points[].text+terms 的 name/note+summary_notes)——下游闪卡/搜索/复习视图
+    派生全部继承干净文本；markdown 走定稿链同位洗除（strip_meta_discourse 之
+    后，见 create_summary）。LaTeX/行内码跨度豁免（洗除器内建）；formulas 的
+    latex 字段不洗（LaTeX 无 CJK 分隔符语义）。就地修改，洗除纯标点整形
+    （『。；』『；；；』族归并/剥除，单分隔符零触碰）。"""
+    for item in value.get("chapters") or []:
+        if isinstance(item, dict):
+            item["title"] = strip_separator_junk(item.get("title"))
+            item["summary"] = strip_separator_junk(item.get("summary"))
+    takeaways = value.get("key_takeaways")
+    if isinstance(takeaways, list):
+        value["key_takeaways"] = [strip_separator_junk(item) for item in takeaways]
+    doc = value.get("doc")
+    if not isinstance(doc, dict):
+        return
+    overview = doc.get("overview")
+    if isinstance(overview, list):
+        doc["overview"] = [strip_separator_junk(par) for par in overview]
+    elif overview is not None:
+        doc["overview"] = strip_separator_junk(overview)
+    for section in doc.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        if section.get("title") is not None:
+            section["title"] = strip_separator_junk(section.get("title"))
+        for point in section.get("points") or []:
+            if isinstance(point, dict) and point.get("text") is not None:
+                point["text"] = strip_separator_junk(point.get("text"))
+    for term in doc.get("terms") or []:
+        if isinstance(term, dict):
+            term["name"] = strip_separator_junk(term.get("name"))
+            term["note"] = strip_separator_junk(term.get("note"))
+    notes = doc.get("summary_notes")
+    if isinstance(notes, list):
+        doc["summary_notes"] = [strip_separator_junk(item) for item in notes]
+
 
 def _merge_has_takeaways(candidate: Any) -> bool:
     """合并候选的要点面质量门：key_takeaways 或 doc.summary_notes 至少一面非空。"""
@@ -1663,6 +1814,11 @@ _STEM_TEACHING_RULES = (
     "参考方向再讲信号流向；波形图读横纵轴与特征点再讲成因；结构图读层级与"
     "电极再讲工作机制；流程图读起止与分支再讲输入输出），未出现的类型不写；"
     "无图像材料时四段「问题与位置/机制与递进推导/适用条件与反例/实例」。"
+    # V010-TUNING-RXFIX-1（TB-RX-A3 密度下限，2026-10-29）：压骨架短掷下缘
+    # （同讲 6 掷 2492→29693 实测=骨架态几乎全为短掷形态）；确定性回 门=
+    # summary_md_volume_gate 骨架密度分支。
+    "采用骨架时每个一级段至少 3 条要点或 300 字，整篇须覆盖全部章节时间轴，"
+    "禁整段留白。"
     "只重排已有素材，不增材料外事实。"
     # V010-CONTENT-IMPL-1 件1（CONTENT-R1 B1①）：LaTeX 记写指令映射到客户端
     # MATHRENDER 识别闭集（math-render.js：display=\[…\]/$$…$$、inline=\(…\)，
@@ -2208,6 +2364,18 @@ def create_summary(
     # RXFIX-1：源语料全文随词表进摘要定稿守卫（unify_text_terms 源语料保护形）。
     summary_glossary_corpus = str(getattr(glossary, "source_corpus", "") or "")
     terms = [str(term).strip() for term in (glossary or ()) if str(term).strip()][:200]
+    # RXFIX-3（669766 掷1 残留伤型根修）：①讲内转写全文=守卫证据底座（unify
+    # 优势形/方向守卫按老师真实说的计频）；②提示词注入面过滤——词表只注入
+    # 「转写有证」的词（课件专属词如「电平」〔转写 0 次〕不再以「权威写法」
+    # 名义带偏生成面；合法纠错词如「变换」〔ASR 转写有证〕保留）。定稿 unify
+    # 仍持全量词表做机械兜底（双守卫拦截）。
+    summary_evidence_text = "".join(
+        str(item.get("text") or "") for item in transcript if isinstance(item, dict)
+    )
+    if summary_evidence_text:
+        terms_prompt = [term for term in terms if term in summary_evidence_text]
+    else:
+        terms_prompt = terms
     # SUMMARY-FIX-1：思考档显式决策（缺省 disabled，env 闭集覆写）；思考档
     # 下窗口输出帽放大（推理计入 max_tokens）。
     tier = _resolve_summary_thinking()
@@ -2221,6 +2389,11 @@ def create_summary(
     window_skipped = 0
     merge_retries = 0
     merge_quality_degraded = 0
+    # V010-TUNING-RXFIX-1（A1）：体量门重试/降级计数（闭集计数器，零内容）+
+    # 重试指令栈（末次失败门集合，供下一掷 user 侧取用）。
+    merge_volume_retries = 0
+    merge_volume_degraded = 0
+    retry_nudges: list[str] = []
 
     def _drain_usage() -> None:
         # 每次窗口/合并调用（含失败尝试）后立即落账：HTTP 200 但 content 坏
@@ -2264,8 +2437,10 @@ def create_summary(
         if slide_slice:
             source["ppt_pages"] = slide_slice["deck"]
             source["slide_formulas"] = slide_slice["formulas"]
-        if terms and transcript_window:
-            source = {"glossary": terms, **source}
+        if terms_prompt and transcript_window:
+            # RXFIX-3：门与注入面同用 terms_prompt——全零证词表不带 glossary 键
+            # （禁空表注入；防「以 glossary 表为准」指令悬空）。
+            source = {"glossary": terms_prompt, **source}
         sources.append(source)
     # 文档页/题目正文不在 transcript/ppt 里，单独成窗；字幕与幻灯条目不重复投喂。
     evidence_windows = packet_windows(packet) if packet is not None else []
@@ -2302,7 +2477,9 @@ def create_summary(
         window = sources[index]
         if window.get("evidence"):
             window_prompt = _SUMMARY_EVIDENCE_WINDOW_PROMPT
-        elif terms:
+        elif terms_prompt:
+            # RXFIX-3：变体选择随注入面（terms_prompt）走——全零证词表不注入，
+            # 也不悬空「以 glossary 表为准」指令（退基础串路径）。
             window_prompt = _SUMMARY_WINDOW_PROMPT_WITH_GLOSSARY
         else:
             window_prompt = _SUMMARY_WINDOW_PROMPT
@@ -2401,10 +2578,11 @@ def create_summary(
     if context:
         # 课程上下文是调用方给的元信息（课程名/学期等），按透传处理但不作指令。
         merge_input["course_context"] = context
-    if terms:
+    if terms_prompt:
         # V4NONTHINK-1 件6：合并调用术语表走数据通道（merge 提示词顶在 ≤300
         # 防膨胀钉上不增字；窗口提示词已带「以 glossary 表为准」指令）。
-        merge_input["glossary"] = terms
+        # RXFIX-3：门随注入面（terms_prompt）——全零证词表不带 glossary 键。
+        merge_input["glossary"] = terms_prompt
     if slide is not None and slide.get("formulas"):
         # V010-SLIDEALIGN-1：讲级课件公式单走数据通道（合并提示词防膨胀钉
         # 不动，指令经 _MERGE_SLIDE_RULES 后缀变体）。
@@ -2425,12 +2603,33 @@ def create_summary(
     # RXFIX-2：重试请求在 user 侧追加补产指令（system 串逐位不动——既有测试
     # 以 system 内容精确路由替身，且 299/300 防膨胀钉只钉模块常量）。
     merge_user_content = json.dumps(merge_input, ensure_ascii=False)
+    # V010-TUNING-RXFIX-1（A1 门）：讲次时长上提到合并梯前（纯输入派生、确定性）
+    # ——体量预算门（时长比例地板）在梯内取时长；原梯后重复计算点改用本值。
+    duration_ms = max(
+        [0]
+        + [
+            max(int(item.get("end_ms") or 0), int(item.get("start_ms") or 0))
+            for item in transcript
+            if isinstance(item, dict)
+        ]
+        + [
+            int(item.get("created_sec") or 0) * 1000
+            for item in ppt_pages
+            if isinstance(item, dict)
+        ]
+    )
 
     def attempt_fn(attempt: int) -> dict[str, Any]:
-        nonlocal merge_retries, merge_quality_degraded
-        user_content = merge_user_content + (
-            _SUMMARY_TAKEAWAY_RETRY_NUDGE if attempt > 0 else ""
+        nonlocal merge_retries, merge_quality_degraded, merge_volume_degraded
+        nonlocal merge_volume_retries
+        # TUNING-RXFIX-1（A1）：重试指令=末次失败门集合（要点面/体量可叠加，
+        # 双缺时并串；retry_nudges 末项=上一掷失败集合，无记录兜底要点面指令）。
+        # system 串逐位不动（替身路由/防膨胀钉同 RXFIX-2 纪律）。
+        retry_nudge = (
+            (retry_nudges[-1] if retry_nudges else _SUMMARY_TAKEAWAY_RETRY_NUDGE)
+            if attempt > 0 else ""
         )
+        user_content = merge_user_content + retry_nudge
         try:
             raw = _chat(
                 api_key,
@@ -2453,17 +2652,39 @@ def create_summary(
         except LLMError:
             candidate = _salvage_summary_object(raw)
         if _valid_summary_part(candidate):
-            if _merge_has_takeaways(candidate):
+            takeaways_ok = _merge_has_takeaways(candidate)
+            # TUNING-RXFIX-1（A1）：要点面过门才评体量门（要点面失败优先——
+            # 该形态重试指令已含补产要求，单点梯不重复消耗）。
+            gate = (
+                summary_md_volume_gate(str(candidate.get("markdown") or ""), duration_ms)
+                if takeaways_ok else None
+            )
+            volume_ok = gate is None or not gate["failed"]
+            if takeaways_ok and volume_ok:
                 return candidate
-            # RXFIX-2：形状合法但要点面全空=质量门失败——单点重试一次；
-            # 末试仍缺=降级出货（诚实空态+闭集计数，绝不静默也绝不整单失败）。
+            # RXFIX-2/TUNING-RXFIX-1：形状合法但质量门失败（要点面全空或 md
+            # 体量破预算下限/骨架密度塌缩）——单点重试一次（user 侧追加对应
+            # 补产指令）；末试仍破=降级出货（闭集计数，绝不静默也绝不整单失败）。
             if attempt + 1 < _SUMMARY_MERGE_ATTEMPTS:
                 merge_retries += 1
-                _emit_telemetry(f"stage=summary-merge-quality-retry attempt={attempt + 1}")
+                nudges = ""
+                if not takeaways_ok:
+                    nudges += _SUMMARY_TAKEAWAY_RETRY_NUDGE
+                    _emit_telemetry(f"stage=summary-merge-quality-retry attempt={attempt + 1}")
+                if gate is not None and gate["failed"]:
+                    merge_volume_retries += 1
+                    nudges += _SUMMARY_VOLUME_RETRY_NUDGE_FMT.format(min_chars=gate["floor"])
+                    _emit_telemetry(
+                        f"stage=summary-merge-volume-retry attempt={attempt + 1} "
+                        f"md_chars={gate['length']} md_floor={gate['floor']} "
+                        f"md_state={gate['state']} density={gate['density_violations']}"
+                    )
+                retry_nudges.append(nudges)
                 raise LadderFailure(
-                    LLMError("summary merge response is missing takeaways/notes")
+                    LLMError("summary merge response failed the quality gate")
                 )
-            merge_quality_degraded = 1
+            merge_quality_degraded |= int(not takeaways_ok)
+            merge_volume_degraded |= int(not volume_ok)
             return candidate
         if attempt + 1 < _SUMMARY_MERGE_ATTEMPTS:
             merge_retries += 1
@@ -2484,16 +2705,28 @@ def create_summary(
     # RXFIX-2：末试要点面仍空（含抢救路径）=降级出货闭集计数（runner 转警告）。
     if not _merge_has_takeaways(value):
         merge_quality_degraded = 1
+    # TUNING-RXFIX-1（A1）：末试体量门复检（梯内已判则幂等零翻案；要点面缺
+    # 席路径未评门，此处补判=fail-closed 诚实计数）。
+    if not merge_volume_degraded:
+        merge_volume_degraded |= int(summary_md_volume_gate(
+            str(value.get("markdown") or ""), duration_ms
+        )["failed"])
+    # TUNING-RXFIX-1（TB-P1-1 生成侧根修）：chapters/takeaways/doc 文本面
+    # 分隔符垃圾统一过洗（markdown 在下方定稿链同位洗除）。
+    _clean_separator_junk_surfaces(value)
     # V010-WORKER-QUAL-1：markdown 定稿守卫（零 LLM，全部在下游消费前收口）——
     # W5 元话语剥除（「判定：…；证据：…」不上屏，chapters/要点/doc/复习视图
     # 派生全部继承干净文本）+ F9-FIX-1 包①内省括注剥除（模型自评括注同族
     # 不上屏，闭集关键词守卫）+ W3 讲内术语统一（同文种变体 trusted-pairing，
-    # 词表缺席=逐位原样）。
+    # 词表缺席=逐位原样）+ TUNING-RXFIX-1 分隔符垃圾洗除（『。；』『；；；』族，
+    # TB-P1-1 生成侧单点根修，单分隔符零触碰）。
     value["markdown"] = unify_text_terms(
-        strip_introspective_parens(strip_meta_discourse(value["markdown"])),
+        strip_separator_junk(strip_introspective_parens(strip_meta_discourse(value["markdown"]))),
         tuple(terms),
         # RXFIX-1：源语料保护形守卫透传（glossary 属性在 terms 展平时丢失）。
         source_corpus=summary_glossary_corpus,
+        # RXFIX-3：讲内转写全文=优势形/方向守卫证据底座（老师真实词形以转写为准）。
+        evidence_text=summary_evidence_text,
     )
     if progress is not None:
         progress("summary", len(sources) + 1, len(sources) + 1)
@@ -2550,19 +2783,7 @@ def create_summary(
     # 线性电源：结构与原理」连排实测），Dice≥0.75 逐对合并（保先者锚，摘要
     # 拼接），合并次数随遥测归档。
     chapters, chapters_near_dup_merged = merge_near_duplicate_titles(chapters)
-    duration_ms = max(
-        [0]
-        + [
-            max(int(item.get("end_ms") or 0), int(item.get("start_ms") or 0))
-            for item in transcript
-            if isinstance(item, dict)
-        ]
-        + [
-            int(item.get("created_sec") or 0) * 1000
-            for item in ppt_pages
-            if isinstance(item, dict)
-        ]
-    )
+    # TUNING-RXFIX-1：时长计算单源上提至合并梯前（A1 门取数），此处沿用。
     chapters_before_cap = len(chapters)
     chapters = enforce_chapter_count(chapters, duration_ms)
     chapters_cap_merged = chapters_before_cap - len(chapters)
@@ -2657,8 +2878,8 @@ def create_summary(
             # 无 packet 时整个键省略（合同 I8）。
             if packet is not None:
                 views_input["evidence_index"] = merge_input["evidence_index"]
-            if terms:
-                views_input["glossary"] = terms
+            if terms_prompt:
+                views_input["glossary"] = terms_prompt
             try:
                 review_views, view_stats = _derive_review_views(
                     api_key, views_input=views_input, tier=tier,
@@ -2706,6 +2927,10 @@ def create_summary(
         "views_retries": view_stats["retries"],
         # RXFIX-2：要点面降级闭集计数（0/1）——runner 据此转闭集警告上屏。
         "takeaways_missing": merge_quality_degraded,
+        # TUNING-RXFIX-1（A1）：体量门重试/降级闭集计数（0/1）——runner 据
+        # md_volume_degraded 转闭集警告上屏（降级=本版较简可见，绝不静默）。
+        "md_volume_retries": merge_volume_retries,
+        "md_volume_degraded": merge_volume_degraded,
     }
     if usage_sink is not None:
         usage_sink.extend(usage_records)
@@ -2748,6 +2973,13 @@ def create_summary(
         f"citations_rejected={int(point_meta.get('rejected') or 0)} "
         f"thinking={deep_usage['thinking']} window_retries={window_retries} "
         f"window_skipped={window_skipped} merge_retries={merge_retries} "
+        # TUNING-RXFIX-1（A1）：体量门观测（二态/地板/实长/重试/降级=闭集
+        # 计数与数字，零内容；TB-RX-A2 方差可观测化同面）。
+        f"md_state={summary_markdown_format_state(value.get('markdown') or '')} "
+        f"md_chars={len(value.get('markdown') or '')} "
+        f"md_floor={summary_md_volume_floor(duration_ms)} "
+        f"md_volume_retries={merge_volume_retries} "
+        f"md_volume_degraded={merge_volume_degraded} "
         f"llm_calls={deep_usage['calls']} "
         f"completion_tokens={deep_usage['completion_tokens']} "
         f"reasoning_tokens={deep_usage['reasoning_tokens']} "

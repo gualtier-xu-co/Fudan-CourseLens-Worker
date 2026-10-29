@@ -216,3 +216,58 @@ def test_rxfix1_unify_explicit_source_corpus_passthrough():
     assert unify_text_terms(text, tuple(glossary), source_corpus=glossary.source_corpus) == text
     # 无语料=守卫不生效（旧行为）。
     assert unify_text_terms(text, tuple(glossary)) != text or text.count("电流") < 2
+
+
+def _rxfix3_slide_glossary():
+    """37355 伤型镜像词表：电平=课件高频词（转写 0 次），电流族=口语词。"""
+    return build_glossary(([{"text": "输出电平与电平翻转"}] * 3) + [{"text": "集电极电流一瞥"}])
+
+
+def test_rxfix3_direction_guard_blocks_spoken_word_to_slide_only_term():
+    """RXFIX-3 ③方向守卫：口语有证词（电路转写 6 次）不被转写零证词（电平）改正。
+
+    669766 掷1 残留伤型实证（r19 代，run 40841877970）：md 电平 18 处含
+    电平线（水平）/电平率（电导率）/方块电平（方块电阻）族——提示词偏置 +
+    unify 机械面同向受染。evidence_text=转写全文后两方向全拦。"""
+    glossary = _rxfix3_slide_glossary()
+    evidence = "经电路放大，" * 3 + "水平线电导率方块电阻，" + "其余口语词。"
+    md = "经电路放大，电场为水平线，电导率与方块电阻。经电路放大。"
+    out = unify_text_terms(md, tuple(glossary), evidence_text=evidence)
+    assert "电路" in out and "水平线" in out, out
+    assert "电导率" in out and "方块电阻" in out, out
+    assert "电平" not in out, out
+
+
+def test_rxfix3_evidence_dominance_counts_transcript_not_text():
+    """RXFIX-3 ①计频口径：优势形按转写计（≥8）而非被统一文本内部计。
+
+    RXFIX-1 实现按 md 内部计频——提示词偏置先稀释 md 内词形、守卫随即失守；
+    口径改转写后，md 内稀疏的口语高频词（如电流）同样受守卫保护。"""
+    glossary = _rxfix3_slide_glossary()
+    # 转写：电流 ×9（≥8 优势形）；md：电流仅 2 次（<8，旧口径下不设防）。
+    evidence = "电流流过电路。" * 9
+    md = "电流与电流。"
+    assert unify_text_terms(md, tuple(glossary), evidence_text=evidence) == md
+    # 对照：转写低频（1 次）时方向守卫亦拦（电流转写有证、电平零证）。
+    low = unify_text_terms(md, tuple(glossary), evidence_text="电流一瞥")
+    assert low == md
+
+
+def test_rxfix3_legit_ocr_glyph_repair_unaffected():
+    """合法纠错向不受方向守卫影响：字形变体（变換）转写零证、目标（变换）
+    转写有证 → 照常统一（RXFIX-1 正例钉的 RXFIX-3 对应面）。"""
+    genuine_glossary = build_glossary(_pages("本讲主题是傅里叶变换"))
+    evidence = "傅里叶变换是线性算子，傅里叶变换可分离。"
+    md = "傅里叶变換出现两次傅里叶变換。"
+    out = unify_text_terms(md, tuple(glossary := tuple(genuine_glossary)), evidence_text=evidence)
+    assert out.count("傅里叶变换") == 2, out
+
+
+def test_rxfix3_no_evidence_text_zero_behavior_change():
+    """evidence_text 缺省=None：旧调用方（字幕链/旧测试）逐位零行为变化。"""
+    glossary = _rxfix3_slide_glossary()
+    genuine_glossary = build_glossary(_pages("本讲主题是傅里叶变换"))
+    dominant_text = "电流值得讲。" + "电流很重要，" * 8
+    assert unify_text_terms(dominant_text, tuple(glossary)) == dominant_text
+    genuine_text = "傅里叶变換出现两次傅里叶变換。"
+    assert unify_text_terms(genuine_text, tuple(genuine_glossary)).count("傅里叶变换") == 2
