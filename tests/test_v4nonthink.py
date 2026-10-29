@@ -513,7 +513,9 @@ class SummaryGlossaryTests(unittest.TestCase):
         )
 
         window = {"markdown": "笔记", "chapters": []}
-        merge = {"markdown": "# 笔记", "chapters": []}
+        # RXFIX-2：合并替身带 key_takeaways（要点面质量门过门=零质量重试，
+        # 本钉只锁提示词变体/数据通道，不加合并调用）。
+        merge = {"markdown": "# 笔记", "chapters": [], "key_takeaways": ["要点"]}
         _chat, calls = self._chat_recorder([window, merge])
         # 本钉=window 提示词变体与 merge 数据通道（视图派生在 test_review_views.py）。
         with patch("courselens_worker.llm._chat", _chat), \
@@ -539,7 +541,9 @@ class SummaryGlossaryTests(unittest.TestCase):
         )
 
         window = {"markdown": "笔记", "chapters": []}
-        merge = {"markdown": "# 笔记", "chapters": []}
+        # RXFIX-2：合并替身带 key_takeaways（要点面质量门过门=零质量重试，
+        # 本钉只锁提示词变体/数据通道，不加合并调用）。
+        merge = {"markdown": "# 笔记", "chapters": [], "key_takeaways": ["要点"]}
         _chat, calls = self._chat_recorder([window, merge])
         with patch("courselens_worker.llm._chat", _chat):
             create_summary(

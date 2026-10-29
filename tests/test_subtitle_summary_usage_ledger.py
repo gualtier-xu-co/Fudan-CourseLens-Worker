@@ -177,7 +177,7 @@ class SummaryUsageLedgerTests(unittest.TestCase):
             with llm_mod._USAGE_LOCK:
                 llm_mod._CALL_LOG.append(_usage_record(100, 50))
             if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT_TEACHING:
-                return json.dumps({"markdown": "combined", "chapters": []})
+                return json.dumps({"markdown": "combined", "chapters": [], "key_takeaways": ["要点"]})  # RXFIX-2 质量门
             return json.dumps({"markdown": "part", "chapters": []})
 
         # 本钉=窗口+合并两调用的账面形状（视图派生账面在 test_review_views.py）。

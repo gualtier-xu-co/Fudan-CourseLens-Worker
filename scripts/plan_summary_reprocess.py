@@ -77,7 +77,13 @@ def _dice(left: str, right: str) -> float:
 
 
 def audit_artifact(data: dict) -> dict:
-    """七项守卫原样复用（与 worker 校验器同一闭集）：缺陷计数。"""
+    """七项守卫原样复用（与 worker 校验器同一闭集）：缺陷计数。
+
+    F9-FIX-1 包①②扩审计（2026-10-29，判据=评判道 F9-1-R2 同口径）：
+    chapter_start_nonmonotonic / takeaway_zero_anchor / chapter_summary_empty /
+    hollow_content 四键随判据级计数入计划——存量旧代产物（CONTENT-IMPL-1
+    f87b1ca1 与 WORKER-QUAL-1 17419761 之前生成）不会自愈，重处理清单须
+    覆盖时间轴完整性与泄漏面，边界=候用户批准分批执行（处理新鲜度律）。"""
     md = str(data.get("markdown") or "")
     overview = data.get("overview")
     if overview is None:
@@ -104,6 +110,18 @@ def audit_artifact(data: dict) -> dict:
         1 for i in range(len(chapters) - 1)
         if _dice(chapters[i].get("title"), chapters[i + 1].get("title")) >= 0.75
     )
+    # F9-FIX-1 包②扩审计：时间轴完整性（F9 扫描同口径=None/0 皆计零锚）。
+    anchors = data.get("takeaway_anchors") or []
+    zero_anchors = sum(1 for value in anchors if value is None or value == 0)
+    nonmonotonic = sum(
+        1 for i in range(len(chapters) - 1)
+        if int(chapters[i].get("start_ms") or 0) > int(chapters[i + 1].get("start_ms") or 0)
+    )
+    chapter_summary_empty = sum(
+        1 for item in chapters if not str(item.get("summary") or "").strip()
+    )
+    takeaways = [str(item or "").strip() for item in (data.get("key_takeaways") or [])]
+    hollow = int(not chapters and not any(takeaways))
     meta_leak = bool(
         ("判定：" in md and "证据：" in md)
         or ("判定：" in overview_text and "证据：" in overview_text)
@@ -120,6 +138,10 @@ def audit_artifact(data: dict) -> dict:
         "markdown_head_needs_strip": int(
             strip_meta_discourse(first_line) != first_line
         ),
+        "chapter_start_nonmonotonic": nonmonotonic,
+        "takeaway_zero_anchor": zero_anchors,
+        "chapter_summary_empty": chapter_summary_empty,
+        "hollow_content": hollow,
     }
 
 
@@ -184,6 +206,11 @@ def main() -> int:
             audit["meta_leak"], int(audit["unsane_latex"] > 0),
             int(audit["placeholder_captions"] > 0), int(audit["noise_points"] > 0),
             int(audit["near_dup_chapter_pairs"] > 0),
+            # F9-FIX-1 包①②扩审计：时间轴完整性与结构空心面入计划判据。
+            int(audit["chapter_start_nonmonotonic"] > 0),
+            int(audit["takeaway_zero_anchor"] > 0),
+            int(audit["chapter_summary_empty"] > 0),
+            audit["hollow_content"],
         ])
         if defect_kinds < max(1, args.min_defects):
             continue

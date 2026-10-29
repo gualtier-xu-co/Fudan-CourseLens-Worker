@@ -1037,7 +1037,9 @@ class JudgeCoRunTests(unittest.TestCase):
             result = process_job(self._summary_job(payload))
         self.assertEqual(result["status"], "completed")
         self.assertNotIn("quality_judge", result["outputs"])
-        self.assertEqual(result["warnings"], [], "零材料静默跳过（漏斗兜底照旧）")
+        # RXFIX-2：空摘要=要点面缺失，闭集降级警告如实上屏（零材料质检跳过语义不变）
+        self.assertEqual(result["warnings"], ["summary_takeaways_missing"],
+                         "零材料静默跳过（漏斗兜底照旧）+要点面降级警告")
 
     def test_co_run_failure_warns_and_summary_survives(self):
         payload = {

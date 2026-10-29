@@ -118,14 +118,21 @@ def _merged_course_terms(
     payload: dict[str, Any],
     extra: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
-    """payload ``glossary`` ∪ env 术语文件 ∪ 调用方增补（OCR 词表），去重保序。"""
-    from .glossary import resolve_course_terms
+    """payload ``glossary`` ∪ env 术语文件 ∪ 调用方增补（OCR 词表），去重保序。
 
-    return tuple(dict.fromkeys(
+    RXFIX-1：extra 为 GlossaryTerms（build_glossary 产物）时保留其源语料
+    属性——摘要面 unify_text_terms 依赖它做「源语料保护形」守卫；普通元组
+    场景逐位不变。
+    """
+    from .glossary import GlossaryTerms, resolve_course_terms
+
+    merged = tuple(dict.fromkeys(
         str(term).strip()
         for term in (*resolve_course_terms(payload), *extra)
         if str(term).strip()
     ))
+    corpus = str(getattr(extra, "source_corpus", "") or "")
+    return GlossaryTerms(merged, corpus) if corpus else merged
 
 
 def _payload_memory_terms(payload: dict[str, Any]) -> tuple[str, ...]:
@@ -702,7 +709,7 @@ def _process_materialized_job(
     elif kind in {"summary", "chapters"}:
         from .course_knowledge import normalize_evidence_packet
         from .lecture_ir import build_lecture_ir
-        from .llm import LLMError, create_summary
+        from .llm import LLMError, create_summary, summary_takeaways_missing
         from .ocr import process_slides
         from .slide_alignment import build_slide_pack
 
@@ -815,6 +822,10 @@ def _process_materialized_job(
             outputs["chapters"] = list(summary.get("chapters") or [])
         else:
             outputs["summary"] = summary
+            # RXFIX-2：要点面降级闭集警告（worker warnings → result_notices
+            # 既有通道上屏；诚实空态可见，绝不静默——8 掷 5 空实证教训）。
+            if summary_takeaways_missing(summary):
+                warnings.append("summary_takeaways_missing")
         # Additive, evidence-grounded Lecture IR view over the same
         # transcript/chapters/pages; it changes no pre-existing output.
         outputs["lecture_ir"] = build_lecture_ir(
@@ -904,7 +915,7 @@ def _process_materialized_job(
         from .formats import to_srt, to_vtt
         from .lecture_ir import build_lecture_ir
         from .glossary import build_glossary
-        from .llm import LLMError, answer_question, create_summary, drain_call_log, proofread_segments
+        from .llm import LLMError, answer_question, create_summary, drain_call_log, proofread_segments, summary_takeaways_missing
         from .ocr import process_slides
         from .slide_alignment import build_slide_pack
 
@@ -1180,6 +1191,9 @@ def _process_materialized_job(
             )
             if "summary" in requested:
                 outputs["summary"] = summary
+                # RXFIX-2：要点面降级闭集警告（同 summary/chapters 站）。
+                if summary_takeaways_missing(summary):
+                    warnings.append("summary_takeaways_missing")
             if "chapters" in requested:
                 outputs["chapters"] = list(summary.get("chapters") or [])
             # Same additive Lecture IR view as the summary job, over the

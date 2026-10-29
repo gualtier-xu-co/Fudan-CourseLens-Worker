@@ -97,7 +97,8 @@ class TimeoutBudgetTests(unittest.TestCase):
         def fake_chat(api_key, messages, **kwargs):
             captured.append((messages, kwargs))
             if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT_TEACHING:
-                return json.dumps({"markdown": "combined", "chapters": []})
+                # RXFIX-2：合并替身带要点面（过质量门，超时预算钉不加质量重试）
+                return json.dumps({"markdown": "combined", "chapters": [], "key_takeaways": ["要点"]})
             return json.dumps({"markdown": "part", "chapters": []})
 
         segments = [

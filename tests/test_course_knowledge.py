@@ -401,6 +401,7 @@ class SummaryEvidenceTests(unittest.TestCase):
             json.dumps({"markdown": "窗口笔记", "chapters": []}),
             json.dumps(merge_payload if merge_payload is not None else {
                 "markdown": markdown, "chapters": [],
+                "key_takeaways": ["要点"],  # RXFIX-2 质量门：合并替身带要点面
                 "knowledge_points": points or [], "topic_candidates": topics or [],
             }),
         ]
@@ -425,7 +426,7 @@ class SummaryEvidenceTests(unittest.TestCase):
 
         def fake_chat(api_key, messages, **kwargs):
             payloads.append(messages)
-            return json.dumps({"markdown": "笔记", "chapters": []})
+            return json.dumps({"markdown": "笔记", "chapters": [], "key_takeaways": ["要点"]})  # RXFIX-2 质量门
 
         # 本钉面在视图派生之前的历史链形状（视图派生钉在 test_review_views.py）。
         with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
@@ -450,7 +451,7 @@ class SummaryEvidenceTests(unittest.TestCase):
 
         def fake_chat(api_key, messages, **kwargs):
             payloads.append(messages)
-            return json.dumps({"markdown": "笔记", "chapters": []})
+            return json.dumps({"markdown": "笔记", "chapters": [], "key_takeaways": ["要点"]})  # RXFIX-2 质量门
 
         with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
                 patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
@@ -518,7 +519,7 @@ class SummaryEvidenceTests(unittest.TestCase):
 
         def fake_chat(api_key, messages, **kwargs):
             payloads.append(messages)
-            return json.dumps({"markdown": "笔记", "chapters": []})
+            return json.dumps({"markdown": "笔记", "chapters": [], "key_takeaways": ["要点"]})  # RXFIX-2 质量门
 
         with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
                 patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
@@ -538,7 +539,7 @@ class SummaryCheckpointTests(unittest.TestCase):
 
         def fake_chat(api_key, messages, **kwargs):
             calls["count"] += 1
-            return json.dumps({"markdown": "笔记", "chapters": []})
+            return json.dumps({"markdown": "笔记", "chapters": [], "key_takeaways": ["要点"]})  # RXFIX-2 质量门
 
         with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
                 patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
@@ -556,9 +557,12 @@ class SummaryCheckpointTests(unittest.TestCase):
             create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES,
                            evidence_packet=packet)
         # 全量跑一遍拿到计划
-        with patch("courselens_worker.llm._chat",
-                   return_value=json.dumps({"markdown": "笔记", "chapters": []})), \
-                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
+        # RXFIX-2 质量门：合并替身带要点面
+        with (
+            patch("courselens_worker.llm._chat",
+                  return_value=json.dumps({"markdown": "笔记", "chapters": [], "key_takeaways": ["要点"]})),
+            patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}),
+        ):
             create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES,
                            evidence_packet=packet, checkpoint=capture)
         self.assertIsInstance(prior_plan["summary_window_plan"], list)
@@ -584,7 +588,7 @@ class SummaryCheckpointTests(unittest.TestCase):
         packet = self._packet(0)
         values = []
         with patch("courselens_worker.llm._chat",
-                   return_value=json.dumps({"markdown": "笔记", "chapters": []})):
+                   return_value=json.dumps({"markdown": "笔记", "chapters": [], "key_takeaways": ["要点"]})):
             create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES,
                            evidence_packet=packet, checkpoint=values.append)
         plan = values[-1]["summary_window_plan"]
@@ -593,7 +597,7 @@ class SummaryCheckpointTests(unittest.TestCase):
 
         def fake_chat(api_key, messages, **kwargs):
             calls["count"] += 1
-            return json.dumps({"markdown": "笔记", "chapters": []})
+            return json.dumps({"markdown": "笔记", "chapters": [], "key_takeaways": ["要点"]})  # RXFIX-2 质量门
 
         # 换成"仍有文档窗但内容变了"的包：文档窗重跑，字幕窗计数保留。
         other = normalize(all_packets()["conflicting_sources"])
@@ -632,7 +636,7 @@ class RunnerEvidenceTests(unittest.TestCase):
         def fake_summary(api_key, *, title, transcript, ppt_pages, prior_checkpoint,
                          checkpoint, usage_sink=None, progress=None):
             seen["kwargs"] = "legacy"
-            return {"markdown": "笔记", "chapters": []}
+            return {"markdown": "笔记", "chapters": [], "key_takeaways": ["要点"]}  # RXFIX-2 质量门
 
         with patch("courselens_worker.llm.create_summary", side_effect=fake_summary):
             result = _process_materialized_job(self._job({
@@ -676,7 +680,7 @@ class RunnerEvidenceTests(unittest.TestCase):
         def fake_summary(api_key, *, title, transcript, ppt_pages, prior_checkpoint,
                          checkpoint, usage_sink=None, progress=None):
             seen["legacy"] = True
-            return {"markdown": "笔记", "chapters": []}
+            return {"markdown": "笔记", "chapters": [], "key_takeaways": ["要点"]}  # RXFIX-2 质量门
 
         with patch("courselens_worker.llm.create_summary", side_effect=fake_summary):
             result = _process_materialized_job(self._job({
@@ -922,7 +926,9 @@ class EndToEndSummaryTests(unittest.TestCase):
 
         def counting_chat(api_key, messages, **kwargs):
             calls["count"] += 1
-            return json.dumps({"markdown": "笔记", "chapters": [], "knowledge_points": []})
+            # RXFIX-2 质量门：替身带要点面（续跑钉只数调用次数，不加质量重试）
+            return json.dumps({"markdown": "笔记", "chapters": [], "key_takeaways": ["要点"],
+                               "knowledge_points": []})
 
         with patch("courselens_worker.llm._chat", side_effect=counting_chat):
             _process_materialized_job(self._job(all_packets()["complete"]))

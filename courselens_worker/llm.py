@@ -31,6 +31,7 @@ from .summary_contract import (
     coerce_llm_doc,
     enforce_chapter_count,
     merge_near_duplicate_titles,
+    strip_introspective_parens,
     strip_meta_discourse,
 )
 from .course_knowledge import (
@@ -1513,6 +1514,42 @@ _SUMMARY_WINDOW_ATTEMPTS = 2                  # 窗口重试 1 次，再败降�
 _SUMMARY_MERGE_ATTEMPTS = 2                   # 合并重试 1 次，再败 fail-closed
 _SUMMARY_RETRY_BACKOFF_SECONDS = 1.0
 
+# RXFIX-2（2026-10-29，要点聚合 8 掷 5 空根修）：合并响应「形状合法但要点
+# 面全空」（key_takeaways 与 doc.summary_notes 双缺）不再静默出货——单点
+# 重试一次（重试请求 user 侧追加显式补产指令），仍缺=降级出货+闭集计数
+# （takeaways_missing 入 deep_usage，runner 转闭集警告经 result_notices 上屏）。
+# 实测依据：REPROC-BANQI-2 8 掷 5 空 62.5%，同构建同课重掷有恢复概率
+# （665055 二掷 sn 0→5）；重试成本=恰一次合并调用，绝不整单失败。
+_SUMMARY_TAKEAWAY_RETRY_NUDGE = (
+    "\n\n（上一响应缺少 key_takeaways 或 doc.summary_notes：本次必须完整输出"
+    "这两个字段——key_takeaways 为 3-6 条字符串数组，doc.summary_notes 为"
+    " 3-5 条字符串数组，不得省略或置空。）"
+)
+
+
+def _merge_has_takeaways(candidate: Any) -> bool:
+    """合并候选的要点面质量门：key_takeaways 或 doc.summary_notes 至少一面非空。"""
+    if not isinstance(candidate, dict):
+        return False
+    takeaways = candidate.get("key_takeaways")
+    if isinstance(takeaways, list) and any(str(item or "").strip() for item in takeaways):
+        return True
+    doc = candidate.get("doc")
+    if isinstance(doc, dict):
+        notes = doc.get("summary_notes")
+        if isinstance(notes, list) and any(str(item or "").strip() for item in notes):
+            return True
+    return False
+
+
+def summary_takeaways_missing(summary: dict[str, Any] | None) -> bool:
+    """落库前的要点面降级判定（runner 转闭集警告，经 result_notices 上屏）。
+
+    形状健壮：非 dict/缺键一律按「缺要点」处理（诚实空态可见，绝不静默）。"""
+    if not isinstance(summary, dict):
+        return True
+    return not _merge_has_takeaways(summary)
+
 
 def _resolve_summary_thinking() -> dict[str, str] | None:
     return _resolve_thinking(SUMMARY_THINKING_ENV, SUMMARY_THINKING)
@@ -2168,6 +2205,8 @@ def create_summary(
         packet = None
     slide = slide_pack if isinstance(slide_pack, dict) and slide_pack.get("deck") else None
     context = validate_course_context(course_context) if course_context is not None else {}
+    # RXFIX-1：源语料全文随词表进摘要定稿守卫（unify_text_terms 源语料保护形）。
+    summary_glossary_corpus = str(getattr(glossary, "source_corpus", "") or "")
     terms = [str(term).strip() for term in (glossary or ()) if str(term).strip()][:200]
     # SUMMARY-FIX-1：思考档显式决策（缺省 disabled，env 闭集覆写）；思考档
     # 下窗口输出帽放大（推理计入 max_tokens）。
@@ -2181,6 +2220,7 @@ def create_summary(
     window_retries = 0
     window_skipped = 0
     merge_retries = 0
+    merge_quality_degraded = 0
 
     def _drain_usage() -> None:
         # 每次窗口/合并调用（含失败尝试）后立即落账：HTTP 200 但 content 坏
@@ -2382,15 +2422,22 @@ def create_summary(
             _SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING if packet is not None
             else _SUMMARY_MERGE_PROMPT_TEACHING
         )
-    merge_messages = [
-        {"role": "system", "content": merge_prompt},
-        {"role": "user", "content": json.dumps(merge_input, ensure_ascii=False)},
-    ]
+    # RXFIX-2：重试请求在 user 侧追加补产指令（system 串逐位不动——既有测试
+    # 以 system 内容精确路由替身，且 299/300 防膨胀钉只钉模块常量）。
+    merge_user_content = json.dumps(merge_input, ensure_ascii=False)
+
     def attempt_fn(attempt: int) -> dict[str, Any]:
-        nonlocal merge_retries
+        nonlocal merge_retries, merge_quality_degraded
+        user_content = merge_user_content + (
+            _SUMMARY_TAKEAWAY_RETRY_NUDGE if attempt > 0 else ""
+        )
         try:
             raw = _chat(
-                api_key, merge_messages,
+                api_key,
+                [
+                    {"role": "system", "content": merge_prompt},
+                    {"role": "user", "content": user_content},
+                ],
                 max_tokens=_SUMMARY_MERGE_MAX_TOKENS, thinking=tier,
                 # N16：merge 吃全部 parts+32k 输出帽，慢速生成段在传输层
                 # 缺省 180s 下会超时→重试再超时→llm_pending 回炉（学生感知
@@ -2406,6 +2453,17 @@ def create_summary(
         except LLMError:
             candidate = _salvage_summary_object(raw)
         if _valid_summary_part(candidate):
+            if _merge_has_takeaways(candidate):
+                return candidate
+            # RXFIX-2：形状合法但要点面全空=质量门失败——单点重试一次；
+            # 末试仍缺=降级出货（诚实空态+闭集计数，绝不静默也绝不整单失败）。
+            if attempt + 1 < _SUMMARY_MERGE_ATTEMPTS:
+                merge_retries += 1
+                _emit_telemetry(f"stage=summary-merge-quality-retry attempt={attempt + 1}")
+                raise LadderFailure(
+                    LLMError("summary merge response is missing takeaways/notes")
+                )
+            merge_quality_degraded = 1
             return candidate
         if attempt + 1 < _SUMMARY_MERGE_ATTEMPTS:
             merge_retries += 1
@@ -2423,12 +2481,19 @@ def create_summary(
     )
     if not _valid_summary_part(value):
         raise LLMError("summary merge response has an invalid shape")
+    # RXFIX-2：末试要点面仍空（含抢救路径）=降级出货闭集计数（runner 转警告）。
+    if not _merge_has_takeaways(value):
+        merge_quality_degraded = 1
     # V010-WORKER-QUAL-1：markdown 定稿守卫（零 LLM，全部在下游消费前收口）——
     # W5 元话语剥除（「判定：…；证据：…」不上屏，chapters/要点/doc/复习视图
-    # 派生全部继承干净文本）+ W3 讲内术语统一（同文种变体 trusted-pairing，
+    # 派生全部继承干净文本）+ F9-FIX-1 包①内省括注剥除（模型自评括注同族
+    # 不上屏，闭集关键词守卫）+ W3 讲内术语统一（同文种变体 trusted-pairing，
     # 词表缺席=逐位原样）。
     value["markdown"] = unify_text_terms(
-        strip_meta_discourse(value["markdown"]), tuple(terms)
+        strip_introspective_parens(strip_meta_discourse(value["markdown"])),
+        tuple(terms),
+        # RXFIX-1：源语料保护形守卫透传（glossary 属性在 terms 展平时丢失）。
+        source_corpus=summary_glossary_corpus,
     )
     if progress is not None:
         progress("summary", len(sources) + 1, len(sources) + 1)
@@ -2639,6 +2704,8 @@ def create_summary(
         "window_skipped": window_skipped,
         "merge_retries": merge_retries,
         "views_retries": view_stats["retries"],
+        # RXFIX-2：要点面降级闭集计数（0/1）——runner 据此转闭集警告上屏。
+        "takeaways_missing": merge_quality_degraded,
     }
     if usage_sink is not None:
         usage_sink.extend(usage_records)

@@ -439,10 +439,18 @@ class RunnerSlideWarningTests(unittest.TestCase):
         ocr_stub.process_slides = Mock(return_value=slides_result)
         llm_stub = types.ModuleType("courselens_worker.llm")
         llm_stub.create_summary = Mock(
-            return_value={"markdown": "m", "chapters": [], "model": "deepseek-chat"}
+            return_value={
+                "markdown": "m", "chapters": [], "model": "deepseek-chat",
+                "key_takeaways": ["要点"],  # RXFIX-2：替身带要点面（runner 降级警告判定面）
+            }
         )
         # 夜10-C 第七波②：runner 现从 llm 模块同源导入 LLMError（llm_pending 面）
         llm_stub.LLMError = type("LLMError", (Exception,), {})
+        # RXFIX-2：runner 降级警告判定同源导入（桩补齐）
+        llm_stub.summary_takeaways_missing = lambda summary: not (
+            isinstance(summary, dict)
+            and (summary.get("key_takeaways") or [t for t in (summary.get("doc") or {}).get("summary_notes") or [] if str(t or "").strip()])
+        )
         with patch.dict(
             sys.modules,
             {"courselens_worker.ocr": ocr_stub, "courselens_worker.llm": llm_stub},

@@ -74,7 +74,8 @@ class ThinkingTierTests(unittest.TestCase):
                 "max_tokens": kwargs.get("max_tokens"),
             })
             if system == _SUMMARY_MERGE_PROMPT_TEACHING:
-                return json.dumps({"markdown": "combined", "chapters": []})
+                # RXFIX-2：合并替身带要点面（过质量门=零质量重试，本钉锁调用参数）。
+                return json.dumps({"markdown": "combined", "chapters": [], "key_takeaways": ["要点"]})
             return json.dumps(_part("part"))
 
         with patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False):
@@ -165,7 +166,7 @@ class WindowRetryTests(unittest.TestCase):
         bad = json.dumps({"markdown": "part-a", "chapters": "not-a-list"})
         fake = self._responder(
             [bad], json.dumps(_part("part-b")),
-            json.dumps({"markdown": "combined", "chapters": []}), calls,
+            json.dumps({"markdown": "combined", "chapters": [], "key_takeaways": ["要点"]}), calls,
         )
         with patch.dict(os.environ, {SUMMARY_THINKING_ENV: ""}, clear=False):
             with patch("courselens_worker.llm._chat", side_effect=fake):
@@ -235,17 +236,21 @@ class MergeRetryTests(unittest.TestCase):
     def test_empty_markdown_retries_once_then_succeeds(self):
         result, chat = self._run([
             json.dumps({"markdown": "", "chapters": []}),
-            json.dumps({"markdown": "combined", "chapters": []}),
+            json.dumps({"markdown": "combined", "chapters": [], "key_takeaways": ["要点"]}),
         ])
         self.assertEqual(chat.call_count, 3)  # 1 窗口 + 2 合并
         self.assertEqual(result["markdown"], "combined")
         self.assertEqual(result["deep_usage"]["merge_retries"], 1)
+        self.assertEqual(result["deep_usage"]["takeaways_missing"], 0)
 
     def test_truncated_merge_is_salvaged_without_retry(self):
+        # RXFIX-2 后语义：抢救层兜住截断（不烧坏形状重试），但抢救产物无
+        # key_takeaways → 触发一次要点面质量重试 → 同响应重掷 → 降级出货。
         result, chat = self._run(['{"markdown": "# 合并笔记", "chapters": [{"title"'])
-        self.assertEqual(chat.call_count, 2)  # 抢救层兜住，不再重试
+        self.assertEqual(chat.call_count, 3)  # 1 窗口 + 2 合并（第二次=质量重试）
         self.assertEqual(result["markdown"], "# 合并笔记")
-        self.assertEqual(result["deep_usage"]["merge_retries"], 0)
+        self.assertEqual(result["deep_usage"]["merge_retries"], 1)
+        self.assertEqual(result["deep_usage"]["takeaways_missing"], 1)
 
     def test_exhausted_merge_retries_fail_closed(self):
         with patch.dict(os.environ, {SUMMARY_THINKING_ENV: ""}, clear=False):
@@ -257,6 +262,87 @@ class MergeRetryTests(unittest.TestCase):
                     create_summary("k", title="t", transcript=_transcript(10), ppt_pages=[])
         self.assertIn("merge response has an invalid shape", str(raised.exception))
         self.assertEqual(chat.call_count, 3)
+
+
+class TakeawayQualityGateTests(unittest.TestCase):
+    """RXFIX-2（2026-10-29）：合并「形状合法但要点面全空」→ 单点质量重试 →
+    降级出货闭集计数。实测依据：REPROC-BANQI-2 要点面 8 掷 5 空（62.5%），
+    旧逻辑静默出货=缺陷；同构建重掷有恢复概率（665055 二掷 0→5）。
+    重试请求在 user 侧追加补产指令（system 串逐位不动=替身路由/300 钉不变）。"""
+
+    @staticmethod
+    def _run(merge_responses):
+        merge_payloads: list[dict] = []
+
+        def fake_chat(api_key, messages, **kwargs):
+            if messages[0]["content"] != _SUMMARY_MERGE_PROMPT_TEACHING:
+                return json.dumps(_part(f"part-{len(merge_payloads)}"))
+            merge_payloads.append({
+                "system": messages[0]["content"],
+                "user": messages[1]["content"],
+            })
+            response = merge_responses[min(len(merge_payloads) - 1, len(merge_responses) - 1)]
+            return response
+
+        with patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False):
+            with patch("courselens_worker.llm._chat", side_effect=fake_chat) as chat:
+                result = create_summary("k", title="t", transcript=_transcript(10), ppt_pages=[])
+        return result, chat, merge_payloads
+
+    def test_missing_takeaways_retried_once_with_nudge_then_recovered(self):
+        bad = json.dumps({"markdown": "combined", "chapters": []})
+        good = json.dumps({
+            "markdown": "combined", "chapters": [], "key_takeaways": ["要点一", "要点二"],
+        })
+        result, chat, payloads = self._run([bad, good])
+        self.assertEqual(chat.call_count, 3)  # 1 窗口 + 2 合并
+        self.assertEqual(result["key_takeaways"], ["要点一", "要点二"])
+        self.assertEqual(result["deep_usage"]["merge_retries"], 1)
+        self.assertEqual(result["deep_usage"]["takeaways_missing"], 0)
+        # 重试请求 system 逐位不动、user 侧携带补产指令。
+        self.assertEqual(payloads[1]["system"], payloads[0]["system"])
+        self.assertTrue(payloads[1]["user"].startswith(payloads[0]["user"]))
+        self.assertIn("key_takeaways", payloads[1]["user"][len(payloads[0]["user"]):])
+        self.assertIn("doc.summary_notes", payloads[1]["user"])
+
+    def test_doc_notes_alone_passes_the_gate(self):
+        merge = json.dumps({
+            "markdown": "combined", "chapters": [],
+            "doc": {
+                "overview": "总述。",
+                "summary_notes": ["小结一", "小结二"],
+                "sections": [{
+                    "title": "开篇", "start_ms": 0, "source": "semantic",
+                    "points": [{"text": "要点", "anchor_ms": 0}], "formulas": [],
+                }],
+            },
+        })
+        result, chat, payloads = self._run([merge])
+        self.assertEqual(chat.call_count, 2)  # 门过=零质量重试
+        self.assertEqual(result["deep_usage"]["merge_retries"], 0)
+        self.assertEqual(result["doc"]["summary_notes"], ["小结一", "小结二"])
+
+    def test_both_attempts_missing_ships_degraded_with_counter(self):
+        bad = json.dumps({"markdown": "combined", "chapters": []})
+        result, chat, payloads = self._run([bad])
+        self.assertEqual(chat.call_count, 3)
+        self.assertEqual(result["markdown"], "combined")  # 降级出货不整单失败
+        self.assertEqual(result["key_takeaways"], [])
+        self.assertEqual(result["deep_usage"]["takeaways_missing"], 1)
+        # 两次合并请求：第二次 user 带补产指令（单点重试证据）。
+        self.assertIn("doc.summary_notes", payloads[1]["user"])
+        self.assertNotIn("（上一响应缺少", payloads[0]["user"])
+
+    def test_summary_takeaways_missing_helper_is_shape_robust(self):
+        from courselens_worker.llm import summary_takeaways_missing
+
+        self.assertTrue(summary_takeaways_missing(None))
+        self.assertTrue(summary_takeaways_missing({}))
+        self.assertTrue(summary_takeaways_missing({"key_takeaways": [], "doc": {}}))
+        self.assertFalse(summary_takeaways_missing({"key_takeaways": ["要点"]}))
+        self.assertFalse(summary_takeaways_missing({"doc": {"summary_notes": ["小结"]}}))
+        # 空白条目=缺（诚实空态）。
+        self.assertTrue(summary_takeaways_missing({"key_takeaways": ["", "  "]}))
 
 
 class ChapterAnchorRescueTests(unittest.TestCase):
@@ -355,7 +441,8 @@ class UsageSinkTests(unittest.TestCase):
                 "latency_ms": 900, "thinking": None,
             })
             if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
-                return json.dumps({"markdown": "combined", "chapters": []})
+                # RXFIX-2：带要点面（过质量门，usage 账本钉不加质量重试调用）。
+                return json.dumps({"markdown": "combined", "chapters": [], "key_takeaways": ["要点"]})
             return json.dumps(_part("part"))
 
         sink: list[dict] = []
@@ -388,7 +475,8 @@ class UsageSinkTests(unittest.TestCase):
                 "latency_ms": 100, "thinking": None,
             })
             if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
-                return json.dumps({"markdown": "m", "chapters": []})
+                # RXFIX-2：带要点面（过质量门，遥测钉维持 merge_retries=0/llm_calls=2）。
+                return json.dumps({"markdown": "m", "chapters": [], "key_takeaways": ["要点"]})
             return json.dumps(_part("part"))
 
         with (

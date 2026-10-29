@@ -38,6 +38,7 @@ from courselens_worker.summary_contract import (
     merge_near_duplicate_titles,
     sane_formula_caption,
     sane_latex,
+    strip_introspective_parens,
     strip_meta_discourse,
     validate_summary_doc,
 )
@@ -309,6 +310,129 @@ class MetaDiscoursePins(unittest.TestCase):
             "判定：推导型（公式推导）。",
         ])
         self.assertEqual(strip_meta_discourse(md), md)
+
+
+class F9Fix1LeakStripPins(unittest.TestCase):
+    """F9-FIX-1 包①（判定头/内省泄漏上屏）钉面（2026-10-29）。
+
+    判据=F9-1-R2 评判道 44 讲全量重扫实录（7/44 讲判定头泄漏，两分支皆漏；
+    内省括注 1 讲）：全部实录形经 strip_meta_discourse 五形态闭集剥净（本道
+    定谳=存量泄漏为 WORKER-QUAL-1 17419761 之前的旧代产物，管线根因已修）。
+    本类把实测形态转产品侧钉测（防复发），并落新增内省括注剥除规则与其
+    阴性样本边界（编辑性括注零误伤）。"""
+
+    NL = "\n"
+
+    def _md(self, *segments: str) -> str:
+        return self.NL.join(segments)
+
+    # ---- 判定头实录形（脱敏改写，形态逐位对齐评判道 scan-full.json 证据）----
+
+    def test_derived_branch_paren_evidence_head_stripped(self):
+        # 452291/658063 实录形：推导型（括注）。证据：…。（两段连写首行）
+        md = (
+            "判定：推导型（量子力学微扰论、斯塔克效应、精细结构）。"
+            "证据：标题与内容含微扰、氢原子能级、选择定则等公式推导。"
+        ) + "\n\n# 课程笔记标题\n\n正文第一段。"
+        cleaned = strip_meta_discourse(md)
+        self.assertNotIn("判定：", cleaned)
+        self.assertNotIn("证据：", cleaned)
+        self.assertIn("# 课程笔记标题", cleaned)
+        self.assertIn("正文第一段。", cleaned)
+
+    def test_non_derived_branch_paren_head_stripped(self):
+        # 669510/663596 实录形：非推导型（括注）。无证据段变体。
+        md = (
+            "判定：非推导型（课程安排+概念梳理，无公式推导链证据）。"
+        ) + "\n\n## 课程安排与作业说明\n\n- 本讲共四次作业。"
+        cleaned = strip_meta_discourse(md)
+        self.assertNotIn("判定：", cleaned)
+        self.assertIn("## 课程安排与作业说明", cleaned)
+        self.assertIn("- 本讲共四次作业。", cleaned)
+
+    def test_semicolon_paired_head_stripped(self):
+        # 452296/679491 实录形：判定：推导型理工内容；证据：…。（分号配对形）
+        md = (
+            "判定：推导型理工内容；证据：分波法、玻恩近似、格林函数与氢原子能级推导。"
+        ) + "\n\n# 课程笔记标题"
+        cleaned = strip_meta_discourse(md)
+        self.assertNotIn("判定：", cleaned)
+        self.assertNotIn("证据：", cleaned)
+        self.assertIn("# 课程笔记标题", cleaned)
+
+    def test_all_f9_observed_heads_zero_residue(self):
+        # 防复发总钉：F9 实测四形合铸一篇，剥后头部判定/证据零残留。
+        md = self._md(
+            "判定：推导型（量子力学微扰论）。证据：标题与内容含公式推导。",
+            "判定：非推导型（课程安排+概念梳理）。",
+            "判定：推导型理工内容；证据：分波法与玻恩近似推导。",
+            "",
+            "# 课程笔记标题",
+            "",
+            "正文第一段。",
+        )
+        cleaned = strip_meta_discourse(md)
+        self.assertNotIn("判定：", cleaned)
+        self.assertNotIn("证据：", cleaned)
+        self.assertIn("# 课程笔记标题", cleaned)
+        self.assertIn("正文第一段。", cleaned)
+
+    # ---- F9-FIX-1 新增：内省括注剥除（452284 实录形）----
+
+    def test_introspective_paren_stripped(self):
+        md = (
+            "## 课程回顾\n\n"
+            "- 上讲引入了一维无限深势阱（此处有口语化表达，未形成完整结论）。\n\n"
+            "正文继续。"
+        )
+        cleaned = strip_introspective_parens(md)
+        self.assertNotIn("未形成完整结论", cleaned)
+        self.assertIn("- 上讲引入了一维无限深势阱。", cleaned)
+        self.assertIn("正文继续。", cleaned)
+
+    def test_introspective_paren_keyword_closed_set(self):
+        # 闭集四关键词逐一并钉（口语/未形成/未展开/听不清）。
+        for keyword in ("口语化表达，", "未形成完整结论", "未展开", "听不清"):
+            md = "要点（此处有" + keyword + "）。"
+            cleaned = strip_introspective_parens(md)
+            self.assertNotIn("此处有", cleaned, keyword)
+            self.assertTrue(cleaned.startswith("要点"), keyword)
+            self.assertTrue(cleaned.endswith("。"), keyword)
+
+    def test_editorial_clarification_parens_untouched(self):
+        # 阴性样本：编辑性澄清括注（F9 归打磨=内容有益）零误伤。
+        md = "波形在上升沿翻转（此处指上升沿），下一点讨论采样。"
+        self.assertEqual(strip_introspective_parens(md), md)
+        md2 = "本节讨论判定问题（此处有详细推导）。"
+        self.assertEqual(strip_introspective_parens(md2), md2)
+
+    def test_finalize_pipeline_composition_strips_both_families(self):
+        # 定稿链组合钉：判定头（strip_meta_discourse）+内省括注同串不漏。
+        md = (
+            "判定：推导型（公式推导）。\n\n"
+            "# 课程笔记标题\n\n"
+            "要点句（此处有口语化表达，未形成完整结论）后续正文。"
+        )
+        cleaned = strip_introspective_parens(strip_meta_discourse(md))
+        self.assertNotIn("判定：", cleaned)
+        self.assertNotIn("未形成完整结论", cleaned)
+        self.assertIn("# 课程笔记标题", cleaned)
+        self.assertEqual(cleaned.splitlines()[-1], "要点句后续正文。")
+
+    def test_doc_overview_introspective_stripped(self):
+        # doc overview 继承同款剥除（coerce_llm_doc 路径同权）。
+        doc = coerce_llm_doc({
+            "overview": "总述（此处有口语化表达，未形成完整结论）。本讲梳理能带。",
+            "sections": [{
+                "title": "板块", "start_ms": 0, "source": "semantic",
+                "points": [{"text": "要点", "anchor_ms": 0}],
+                "formulas": [],
+            }],
+        }, {0})
+        self.assertIsNotNone(doc)
+        overview = str(doc["overview"])
+        self.assertNotIn("未形成完整结论", overview)
+        self.assertIn("本讲梳理能带。", overview)
 
 
 class TermsContractPins(unittest.TestCase):

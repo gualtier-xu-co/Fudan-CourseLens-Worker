@@ -128,8 +128,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/glossary.py",
-        "sha256": "e459226163388a6b1260341084b0d67be93d350065bd899cc3d62d50d4e7b71c",
-        "size": 11277
+        "sha256": "78514f3c2383c3671ea6f02e7d9a5b285c2bf534e9de7f8b8586af02e8588dc4",
+        "size": 15256
       },
       {
         "mode": "100644",
@@ -152,8 +152,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/llm.py",
-        "sha256": "f0e2745ab1ec8adbc7b41db3fb3c7318f82d95e945f3559d86dc3572d34068ea",
-        "size": 174889
+        "sha256": "ed3823bdd4b077b380e40d7ffce7713697fe638acbb790023e48e93cc57fc3ea",
+        "size": 178648
       },
       {
         "mode": "100644",
@@ -194,8 +194,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/runner.py",
-        "sha256": "09b27a274da14485facc7e5934d39b25c22c25bc87d86244005b09ddcd0768bf",
-        "size": 73284
+        "sha256": "addd3b4bf5fd8aabd3831431726cddb509fce34332096560f3ff4764005b6b4c",
+        "size": 74211
       },
       {
         "mode": "100644",
@@ -248,8 +248,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/summary_contract.py",
-        "sha256": "ea9e0db000add01d61a32a0f066b97162713325d82c9059a1226919377dc9fc0",
-        "size": 42763
+        "sha256": "65e209768420a6672800b1ed880fd8af4f26159a96f45726f4acd60a265421c7",
+        "size": 43873
       },
       {
         "mode": "100644",
@@ -302,8 +302,8 @@
       {
         "mode": "100644",
         "path": "scripts/plan_summary_reprocess.py",
-        "sha256": "d5bca86b46c73c73b6f80bccb5a1fd4a4e59781e514f10db33aecb531112c7b4",
-        "size": 8803
+        "sha256": "bb1c76f426495476a026781cc58f06eb6df84eef4c5d2fb8e71970256ac04913",
+        "size": 10398
       },
       {
         "mode": "100644",
@@ -428,8 +428,8 @@
       {
         "mode": "100644",
         "path": "tests/test_course_knowledge.py",
-        "sha256": "f7dadd9c50818f227a88b5d599f0e7e6cdfbb1dbbf48a8ce07717ec0290580a1",
-        "size": 54525
+        "sha256": "bf4e4fe71480775c0c1669c6049e3b12bab8c8d92416dfedf3469d4ffea6d1e8",
+        "size": 55266
       },
       {
         "mode": "100644",
@@ -446,8 +446,8 @@
       {
         "mode": "100644",
         "path": "tests/test_glossary.py",
-        "sha256": "fe98016474eb27968ac2176f2a62bee91979a9f7488ec8f2b7ced7f9632f7ad8",
-        "size": 4420
+        "sha256": "aed374096440eafa41f564ee3bd331c775b7a52dc14988672e569842d99785fe",
+        "size": 11360
       },
       {
         "mode": "100644",
@@ -470,8 +470,8 @@
       {
         "mode": "100644",
         "path": "tests/test_llm_checkpoints.py",
-        "sha256": "00cf165ee622e564a53cdaa3e6c8444c50a44cecfc4c9c72bc5c8ba5294b72bc",
-        "size": 11889
+        "sha256": "8f8524c9ebb13ded124af94c8104331d970f4e455a66a537c6f0b7446b058590",
+        "size": 12078
       },
       {
         "mode": "100644",
@@ -482,8 +482,8 @@
       {
         "mode": "100644",
         "path": "tests/test_llm_transport_session.py",
-        "sha256": "73ba3d54c1a0c961b09b88b0b63a21f2aef6a3df2b9c34c9179cacbcbdaf2df7",
-        "size": 7679
+        "sha256": "616668352db00c18fb274135dc402f0b43ab7defc3a55b2df43fc39787227b27",
+        "size": 7815
       },
       {
         "mode": "100644",
@@ -518,8 +518,8 @@
       {
         "mode": "100644",
         "path": "tests/test_ocr.py",
-        "sha256": "c123db3bb97e70c3b484c736f3ec8712a5bf5a6202fc2b5dfbbd705b8bc3f3f3",
-        "size": 21256
+        "sha256": "3adc9148d274273b8b51a14cd5756a0cd348378385154d3d02583406f52eb371",
+        "size": 21727
       },
       {
         "mode": "100644",
@@ -566,8 +566,8 @@
       {
         "mode": "100644",
         "path": "tests/test_quality_judge.py",
-        "sha256": "96bd30c16caec4843f3ada706f98e7b564ee04bab97547ea2742f27ac18e039e",
-        "size": 52601
+        "sha256": "ca85bfbe483a884dcfba0bbb890db586af2328a68ab5e17b9cd5607189055bd1",
+        "size": 52793
       },
       {
         "mode": "100644",
@@ -662,14 +662,14 @@
       {
         "mode": "100644",
         "path": "tests/test_subtitle_summary_usage_ledger.py",
-        "sha256": "a0fd8aa680ee2a28551674dcffb5582c3626b718846e69fa6a22f79993273ef7",
-        "size": 8484
+        "sha256": "7464cb221bca6aa7e0e5a490148d7ee8d79e8d5c65208aad3be4cb82851caac8",
+        "size": 8534
       },
       {
         "mode": "100644",
         "path": "tests/test_summary_chain_hardening.py",
-        "sha256": "559dc0c0423e6344aaca10c08e9c12a8efe2f628998eec39187b2600ddd4e41b",
-        "size": 29559
+        "sha256": "3f72f9a4bf70b2c7b151369da18496e0588bef21c59fd202c02b223a8e2c6bb8",
+        "size": 34812
       },
       {
         "mode": "100644",
@@ -716,14 +716,14 @@
       {
         "mode": "100644",
         "path": "tests/test_v4nonthink.py",
-        "sha256": "fe5e6813f81340160f4bd3f9c2b5dd8b2965b91bc044261be34f3843f4997423",
-        "size": 24461
+        "sha256": "2578e19f8d9e641954a29b6e655daab062173002f8a1c2513265259e900db4cf",
+        "size": 24867
       },
       {
         "mode": "100644",
         "path": "tests/test_workerqual1_quality_gates.py",
-        "sha256": "3f6b814e1e428bee6a7a660447aeb5447e69c492b9180f73fad9aae6a487ad90",
-        "size": 26969
+        "sha256": "c86d633032fa6de1923de579a33c6b16e22dfde0c10508f2a889046b8ac55fc8",
+        "size": 33289
       },
       {
         "mode": "100644",
@@ -738,8 +738,8 @@
         "size": 10522
       }
     ],
-    "git_tree": "894a6f7a0201dd622a60377dfae00f4b26f8fc8e",
-    "tree_sha256": "7b539c886cf49de9de4d628c084205c6d86185a6e6638d341221194e650c267a"
+    "git_tree": "8afa6924a9c3726738b478f400dfb05cde425602",
+    "tree_sha256": "f702f6409eb43864ae8f2e2754db72e17b87e6aab9b955ff177f53a39ffa1396"
   },
   "protocol": {
     "supported_versions": [
@@ -748,8 +748,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "17bdd330a4678cb425a403e25074c07609f47e14",
+    "commit": "652a7edcf795ee993bde39a1b65154d7ded306ed",
     "repository": "gualtier-xu-co/Fudan-CourseLens-Private",
-    "worker_tree": "229793da5c499c8337ca57e5519ee25da47c6bd7"
+    "worker_tree": "e251f2b2e301cc9007d449aa0f614cfb07b3a8a0"
   }
 }

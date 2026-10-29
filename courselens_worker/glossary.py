@@ -4,6 +4,12 @@
 OCR 缺席时只退课程名。字幕里与词表词编辑距离≤1 的错拼变体——不在词表、
 不触发受保护形、全讲出现≥2 次——整讲统一替换回词表词（讲内一致性优先），
 被改写的段落标记闭集校对状态 ``applied-glossary``。无证据不成对、不替换。
+
+RXFIX-1（2026-10-29，37355 半器课型误替换根修）加两道准入守卫：讲内
+「优势形」（≥GLOSSARY_DOMINANT_FORM_MIN_OCCURRENCES 次=本讲真实词形）与
+「源语料保护形」（课件 OCR/课程名语料含该串=课程权威写法）一律不按错拼
+变体处理——修正确的、不伤原对的（真实损伤签名：电流→电平/电路→电平/
+效应→效应管/基极→栅极整讲系统性改写）。
 """
 
 from __future__ import annotations
@@ -25,6 +31,12 @@ _MIN_TERM_CHARS = 2
 _MAX_TERM_CHARS = 8
 _EDIT_RADIUS = 1
 _MIN_VARIANT_OCCURRENCES = 2
+# RXFIX-1（2026-10-29，37355 半器课型术语系统性误替换根修）：讲内「优势形」
+# 守卫阈值。实测损伤签名=正确术语在讲内高频（电流 382-384/电路 35/效应
+# 104 次仍被整讲替换成词表近形），而合法错拼变体通常 ≤3 次；讲内 ≥8 次的
+# 形即本讲真实词形，编辑距离再近也绝不改写（宁漏勿错=本模块既有哲学，
+# 错误替换的代价远高于漏纠：一次误替换毁整讲物理语义）。
+GLOSSARY_DOMINANT_FORM_MIN_OCCURRENCES = 8
 _TERM_RE = re.compile(r"[\u4e00-\u9fa5]{2,8}")
 # 高频停用串闭集：OCR 页眉页脚与常见虚词组合，不进词表。
 _STOPWORDS = frozenset({
@@ -33,6 +45,24 @@ _STOPWORDS = frozenset({
     "没有", "不是", "一下", "大家", "自己", "这个", "那么", "这些", "那些",
     "第几讲", "上一页", "下一页", "第一页", "课件", "讲义", "第页共",
 })
+
+
+class GlossaryTerms(tuple):
+    """词表元组 + 源语料证据底座（RXFIX-1）。
+
+    行为与普通元组逐位兼容（``in``/迭代/``==()`` 全不变）；多携带一个
+    ``source_corpus``=构造词表时的全部源文本（课件 OCR 页文本+课程名）。
+    配对侧用它做「源语料保护形」守卫：出现在课件语料里的串=课程真实
+    写法，绝不是错拼变体。普通元组（payload/env 词表、旧调用方、测试）
+    无此属性 → 守卫不生效 → 零行为变化。
+    """
+
+    source_corpus: str = ""
+
+    def __new__(cls, terms, source_corpus: str = "") -> "GlossaryTerms":
+        self = super().__new__(cls, terms)
+        self.source_corpus = str(source_corpus or "")
+        return self
 
 
 def _run_substring_counts(text: str, counts: Counter, *, min_freq: int | None = None) -> None:
@@ -51,10 +81,17 @@ def build_glossary(pages: list[dict[str, Any]] | None, course_title: str = "") -
     包含剪枝：重复句式语料里「上下文短语」与「真术语」频次难分，剪枝会误杀
     真术语；多留重叠候选只影响词表体积（封顶 200），不影响配对安全性——
     配对还要求变体全讲出现≥2 次且不触发受保护形。
+
+    RXFIX-1：返回 GlossaryTerms（附 source_corpus=全部页文本+课程名），
+    配对侧据此拦截「源语料保护形」与「讲内优势形」，根修最小对立体误替换
+    （电流→电平/基极→栅极族）。
     """
+    corpus_parts: list[str] = [str(course_title or "")] if str(course_title or "").strip() else []
     counts: Counter = Counter()
     for page in pages or []:
-        _run_substring_counts((page or {}).get("text"), counts)
+        page_text = str((page or {}).get("text") or "")
+        corpus_parts.append(page_text)
+        _run_substring_counts(page_text, counts)
     candidates = [
         term for term, freq in counts.items()
         if freq >= GLOSSARY_MIN_FREQ and term not in _STOPWORDS
@@ -65,7 +102,24 @@ def build_glossary(pages: list[dict[str, Any]] | None, course_title: str = "") -
         _run_substring_counts(course_title, title_counts)
         candidates = [term for term in title_counts if term not in _STOPWORDS]
     candidates.sort(key=lambda term: (-counts[term], -len(term), term))
-    return tuple(candidates[:GLOSSARY_MAX_TERMS])
+    return GlossaryTerms(candidates[:GLOSSARY_MAX_TERMS], "\n".join(corpus_parts))
+
+
+def _source_corpus(glossary: tuple[str, ...]) -> str:
+    """词表的源语料全文（GlossaryTerms 专用；普通元组=空=守卫不生效）。"""
+    return str(getattr(glossary, "source_corpus", "") or "")
+
+
+def _piece_blocked_as_variant(piece: str, source_corpus: str, occurrences: int) -> bool:
+    """RXFIX-1 配对守卫：该串不得按错拼变体处理（两道守卫命中任一即禁）。
+
+    ①优势形守卫：讲内出现 ≥GLOSSARY_DOMINANT_FORM_MIN_OCCURRENCES 次的
+    串=本讲真实词形（37355 实证：电流 382 次/效应 104 次仍被整讲改写）；
+    ②源语料守卫：串出现在课件 OCR/课程名语料=课程权威写法，绝不是变体。
+    """
+    if occurrences >= GLOSSARY_DOMINANT_FORM_MIN_OCCURRENCES:
+        return True
+    return bool(source_corpus) and piece in source_corpus
 
 
 def _within_edit_distance(left: str, right: str, radius: int = _EDIT_RADIUS) -> bool:
@@ -170,13 +224,18 @@ def resolve_course_examples(payload: dict[str, Any] | None = None) -> tuple[dict
 
 
 def apply_glossary(segments: list[dict[str, Any]], glossary: tuple[str, ...]) -> list[dict[str, Any]]:
-    """讲内一致的术语纠错；改动段标记 applied-glossary（第八校对态）。"""
+    """讲内一致的术语纠错；改动段标记 applied-glossary（第八校对态）。
+
+    RXFIX-1：配对准入加双守卫——讲内优势形（≥8 次）与源语料保护形（课件
+    OCR/课程名含该串）一律不按错拼变体处理（37355 术语系统性误替换根修）。
+    """
     if not glossary or not segments:
         return segments
     from .llm import _protected_change  # 迟绑定：llm 顶层已导入本模块
 
+    source_corpus = _source_corpus(glossary)
     # 第一遍：统计每个错拼变体的全讲出现次数；只接受能唯一映射到词表词的
-    # 串（等距多词=无证据不成对）。
+    # 串（等距多词=无证据不成对）；优势形/源语料形禁配对（RXFIX-1）。
     piece_terms: dict[str, set[str]] = {}
     piece_counts: Counter = Counter()
     for segment in segments:
@@ -187,7 +246,9 @@ def apply_glossary(segments: list[dict[str, Any]], glossary: tuple[str, ...]) ->
     trusted = {
         piece: next(iter(terms))
         for piece, terms in piece_terms.items()
-        if len(terms) == 1 and piece_counts[piece] >= _MIN_VARIANT_OCCURRENCES
+        if len(terms) == 1
+        and piece_counts[piece] >= _MIN_VARIANT_OCCURRENCES
+        and not _piece_blocked_as_variant(piece, source_corpus, piece_counts[piece])
     }
     if not trusted:
         return segments
@@ -216,14 +277,21 @@ def apply_glossary(segments: list[dict[str, Any]], glossary: tuple[str, ...]) ->
 _UNIFY_TEXT_MIN_OCCURRENCES = 2
 
 
-def unify_text_terms(text: str, glossary: tuple[str, ...]) -> str:
+def unify_text_terms(
+    text: str, glossary: tuple[str, ...], *, source_corpus: str | None = None
+) -> str:
     """单条文本的讲内术语变体统一（确定性、零 token、零外联）。
 
     只在中文连续段内配对（LaTeX/代码/英文天然不在替换面）；变体须唯一映射到
     词表词且全文出现≥2 次（一次出现宁留原样=宁漏勿错删）。glossary 空=原样
-    返回（零行为变化）。"""
+    返回（零行为变化）。
+
+    RXFIX-1：双守卫与 apply_glossary 同源——优势形（≥8 次）与源语料保护形
+    （课件/课程名含该串）一律不改写。``source_corpus`` 显式传参供 create_summary
+    透传（其内部已把词表展平成普通列表，属性会丢失）；缺省读词表自带属性。"""
     if not text or not glossary:
         return str(text or "")
+    corpus = str(source_corpus) if source_corpus is not None else _source_corpus(glossary)
     source = str(text)
     counts: Counter = Counter()
     piece_terms: dict[str, set[str]] = {}
@@ -234,7 +302,9 @@ def unify_text_terms(text: str, glossary: tuple[str, ...]) -> str:
     trusted = {
         piece: next(iter(terms))
         for piece, terms in piece_terms.items()
-        if len(terms) == 1 and counts[piece] >= _UNIFY_TEXT_MIN_OCCURRENCES
+        if len(terms) == 1
+        and counts[piece] >= _UNIFY_TEXT_MIN_OCCURRENCES
+        and not _piece_blocked_as_variant(piece, corpus, counts[piece])
     }
     if not trusted:
         return source

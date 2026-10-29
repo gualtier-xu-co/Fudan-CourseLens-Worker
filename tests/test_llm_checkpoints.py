@@ -134,6 +134,7 @@ class LLMCheckpointTests(unittest.TestCase):
         final = {
             "markdown": "combined",
             "chapters": [{"title": "chapter", "start_ms": 120000, "summary": "summary"}],
+            "key_takeaways": ["要点"],  # RXFIX-2 质量门：合并替身带要点面
         }
         checkpoints = []
         # 本钉面=窗口/合并 resume 语义（视图派生属 test_review_views.py），
@@ -168,7 +169,7 @@ class LLMCheckpointTests(unittest.TestCase):
         ]
         first_part = {"markdown": "kept part", "chapters": []}
         second_part = {"markdown": "re-run part", "chapters": []}
-        final = {"markdown": "combined", "chapters": []}
+        final = {"markdown": "combined", "chapters": [], "key_takeaways": ["要点"]}  # RXFIX-2 质量门
         packet_v2 = {
             "usable": True,
             "items": [
@@ -213,7 +214,7 @@ class LLMCheckpointTests(unittest.TestCase):
         first_part = {"markdown": "part one", "chapters": []}
         checkpoints = []
         with patch("courselens_worker.llm._chat",
-                   return_value=json.dumps({"markdown": "m", "chapters": []})):
+                   return_value=json.dumps({"markdown": "m", "chapters": [], "key_takeaways": ["要点"]})):  # RXFIX-2 质量门
             create_summary("secret", title="t", transcript=transcript, ppt_pages=[],
                            prior_checkpoint={"summary_completed_windows": 1,
                                              "summary_parts": [first_part]},

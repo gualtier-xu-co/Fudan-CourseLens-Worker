@@ -191,6 +191,22 @@ _META_PAREN_KW_RE = re.compile(
 )
 
 
+# F9-FIX-1 包①（内省括注剥除，452284 实录「（此处有口语化表达，未形成完整
+# 结论）」上屏正文）：模型对讲者口语的自评括注是处理管线内部话语，禁止上屏。
+# 闭集保守匹配=「此处」起头 + 自评关键词（口语/未形成/未展开/听不清）——
+# 编辑性澄清括注（「（此处指上升沿）」F9 评判 5 处/4 讲归打磨=内容有益零误伤）
+# 与其他「此处」括注（无自评关键词）一律不动。
+_INTROSPECTIVE_PAREN_RE = re.compile(
+    r"（此处[^（）()\n]*(?:口语|未形成|未展开|听不清)[^（）()\n]*）"
+)
+
+
+def strip_introspective_parens(markdown: Any) -> str:
+    """内省括注剥除（F9-FIX-1 包①）：模型自评括注（对讲者口语的元评论）
+    从正文剥离；闭集关键词守卫，编辑性澄清括注零误伤。"""
+    return _INTROSPECTIVE_PAREN_RE.sub("", str(markdown or ""))
+
+
 def _strip_keyword_paren_meta(line: str) -> str:
     """形四/五剥除：整行=元话语删行（含 H1/引用前缀形）；句号界定的前缀段
     只剥元话语段留正文；黏连无句号界定（「判定：X（Y）正文」）不动。"""
@@ -832,12 +848,16 @@ def coerce_llm_doc(
             stats.get("sections_near_dup_merged", 0) + near_dup_merged
         )
     # W5 元话语剥除（守卫层）：overview 承载自 markdown 首段，继承同款剥除。
+    # F9-FIX-1 包①：内省括注（模型自评元评论）同族不上屏。
     raw_overview_value = raw.get("overview")
     if isinstance(raw_overview_value, str):
-        raw_overview_value = strip_meta_discourse(raw_overview_value)
+        raw_overview_value = strip_introspective_parens(
+            strip_meta_discourse(raw_overview_value)
+        )
     elif isinstance(raw_overview_value, list):
         raw_overview_value = [
-            strip_meta_discourse(par) for par in raw_overview_value
+            strip_introspective_parens(strip_meta_discourse(par))
+            for par in raw_overview_value
         ]
     validated = validate_summary_doc({
         "overview": raw_overview_value if raw_overview_value is not None else "",
