@@ -345,6 +345,108 @@ class TakeawayQualityGateTests(unittest.TestCase):
         self.assertTrue(summary_takeaways_missing({"key_takeaways": ["", "  "]}))
 
 
+class TakeawayCarryoverTests(unittest.TestCase):
+    """V010-D1-FIX-1（P-9 重试保真，2026-10-29）：体量重试把要点面打空时，
+    末试确定性回填前次过门候选的要点面。
+
+    实景依据=669766 掷2（run 6157cd65 遥测）：attempt0 要点过门但 md 7966 破
+    地板 14692 → 仅 volume-retry；attempt1 md 38291 过门但要点 0（无
+    quality-retry 遥测=要点面是重试回归不是首试失败）→ 旧逻辑降级出货
+    takeaways_missing=1，学生拿到要点全空产物。r1 对照（同讲掷1）要点 6/5。
+    钉四条：r2 实景回填 / notes 面回填 / r1 对照零动作 / 双空诚实降级。"""
+
+    @staticmethod
+    def _transcript(minutes: int) -> list[dict]:
+        return [
+            {"start_ms": index * 60_000, "end_ms": (index + 1) * 60_000,
+             "text": f"第{index}分钟的内容。"}
+            for index in range(minutes)
+        ]
+
+    @staticmethod
+    def _thick(chars: int) -> str:
+        line = "本讲机制推导要点覆盖全部章节时间轴，内容充实无留白。"
+        return "".join(line[index % len(line)] for index in range(chars))
+
+    @classmethod
+    def _run(cls, merge_responses):
+        payloads: list[dict] = []
+
+        def fake_chat(api_key, messages, **kwargs):
+            if messages[0]["content"] != _SUMMARY_MERGE_PROMPT_TEACHING:
+                return json.dumps(_part("窗口笔记"))
+            payloads.append({"system": messages[0]["content"], "user": messages[1]["content"]})
+            return merge_responses[min(len(payloads) - 1, len(merge_responses) - 1)]
+
+        with patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False):
+            with patch("courselens_worker.llm._chat", side_effect=fake_chat) as chat:
+                result = create_summary(
+                    "k", title="t", transcript=cls._transcript(80), ppt_pages=[],
+                )
+        return result, chat, payloads
+
+    def test_volume_retry_regression_restores_prior_takeaways(self):
+        # r2 实景镜像：attempt0 要点过门+体量破门 → attempt1 体量过门+要点空。
+        thin = json.dumps({
+            "markdown": self._thick(800), "chapters": [], "key_takeaways": ["要点一", "要点二"],
+        })
+        thick_bare = json.dumps({"markdown": self._thick(6000), "chapters": []})
+        result, chat, payloads = self._run([thin, thick_bare])
+        self.assertEqual(chat.call_count, 3)  # 1 窗口 + 2 合并（第二次=体量重试）
+        self.assertEqual(payloads[1]["system"], payloads[0]["system"])
+        # 回填：要点面=前次过门事实，takeaways_missing 翻 0、salvaged 闭集留痕。
+        self.assertEqual(result["key_takeaways"], ["要点一", "要点二"])
+        self.assertEqual(result["deep_usage"]["takeaways_salvaged"], 1)
+        self.assertEqual(result["deep_usage"]["takeaways_missing"], 0)
+        self.assertEqual(result["deep_usage"]["md_volume_retries"], 1)
+        self.assertEqual(result["deep_usage"]["md_volume_degraded"], 0)
+        self.assertEqual(result["markdown"], self._thick(6000))
+
+    def test_notes_face_regression_restores_prior_summary_notes(self):
+        # notes 面镜像：attempt0 唯一非空面=doc.summary_notes；attempt1 保留
+        # 合法 doc 但 notes 空 → 回填进 doc，coerce 透传后仍非空。
+        valid_doc = {
+            "overview": "总述。",
+            "sections": [{
+                "title": "开篇", "start_ms": 0, "source": "semantic",
+                "points": [{"text": "要点", "anchor_ms": 0}], "formulas": [],
+            }],
+        }
+        thin = json.dumps({
+            "markdown": self._thick(800), "chapters": [],
+            "doc": {**valid_doc, "summary_notes": ["小结一", "小结二"]},
+        })
+        thick_bare = json.dumps({
+            "markdown": self._thick(6000), "chapters": [], "doc": dict(valid_doc),
+        })
+        result, chat, payloads = self._run([thin, thick_bare])
+        self.assertEqual(chat.call_count, 3)
+        self.assertEqual(result["doc"]["summary_notes"], ["小结一", "小结二"])
+        self.assertEqual(result["deep_usage"]["takeaways_salvaged"], 1)
+        self.assertEqual(result["deep_usage"]["takeaways_missing"], 0)
+
+    def test_takeaways_ok_throw_keeps_zero_salvage(self):
+        # r1 对照：单掷要点+体量双过门=零重试零回填（回填绝不无中生有）。
+        good = json.dumps({
+            "markdown": self._thick(6000), "chapters": [], "key_takeaways": ["要点一"],
+        })
+        result, chat, payloads = self._run([good])
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(result["key_takeaways"], ["要点一"])
+        self.assertEqual(result["deep_usage"]["takeaways_salvaged"], 0)
+        self.assertEqual(result["deep_usage"]["takeaways_missing"], 0)
+        self.assertEqual(result["deep_usage"]["merge_retries"], 0)
+
+    def test_both_empty_still_ships_honest_degraded(self):
+        # 诚实边界：全程无过门面 → 无回填源 → 降级计数如实为 1、salvaged=0。
+        bad = json.dumps({"markdown": self._thick(6000), "chapters": []})
+        result, chat, payloads = self._run([bad])
+        self.assertEqual(chat.call_count, 3)
+        self.assertEqual(result["key_takeaways"], [])
+        self.assertEqual(result["deep_usage"]["takeaways_missing"], 1)
+        self.assertEqual(result["deep_usage"]["takeaways_salvaged"], 0)
+
+
 class ChapterAnchorRescueTests(unittest.TestCase):
     """QSCOREFIX-1④（D-QS-9/12）：章节零锚本地拯救 + 重复标题去重。
 

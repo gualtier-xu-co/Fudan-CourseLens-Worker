@@ -1693,6 +1693,25 @@ def _merge_has_takeaways(candidate: Any) -> bool:
     return False
 
 
+def _takeaways_faces(candidate: Any) -> tuple[list[Any], list[Any]]:
+    """要点面双面快照（P-9 重试保真）：(key_takeaways 非空条目, doc.summary_notes
+    非空条目)。只收非空白条目，回填源=过门事实，绝不凭空造条。"""
+    if not isinstance(candidate, dict):
+        return ([], [])
+    takeaways = candidate.get("key_takeaways")
+    kt = [
+        item for item in (takeaways if isinstance(takeaways, list) else [])
+        if str(item or "").strip()
+    ]
+    doc = candidate.get("doc")
+    notes = doc.get("summary_notes") if isinstance(doc, dict) else None
+    sn = [
+        item for item in (notes if isinstance(notes, list) else [])
+        if str(item or "").strip()
+    ]
+    return (kt, sn)
+
+
 def summary_takeaways_missing(summary: dict[str, Any] | None) -> bool:
     """落库前的要点面降级判定（runner 转闭集警告，经 result_notices 上屏）。
 
@@ -2394,6 +2413,13 @@ def create_summary(
     merge_volume_retries = 0
     merge_volume_degraded = 0
     retry_nudges: list[str] = []
+    # V010-D1-FIX-1（P-9 重试保真，2026-10-29）：最近一次要点面过门候选的
+    # 要点面快照 (key_takeaways, doc.summary_notes)。体量重试（A1）把要点面
+    # 打空的实测形态（669766 掷2：attempt1 过体量门但要点 0，遥测仅
+    # volume-retry 无 quality-retry=attempt0 要点面本过门）→ 梯后确定性
+    # 回填，要点面不再因共梯重试回归而降级出货。
+    prior_takeaways: tuple[list[Any], list[Any]] | None = None
+    merge_takeaways_salvaged = 0
 
     def _drain_usage() -> None:
         # 每次窗口/合并调用（含失败尝试）后立即落账：HTTP 200 但 content 坏
@@ -2621,7 +2647,7 @@ def create_summary(
 
     def attempt_fn(attempt: int) -> dict[str, Any]:
         nonlocal merge_retries, merge_quality_degraded, merge_volume_degraded
-        nonlocal merge_volume_retries
+        nonlocal merge_volume_retries, prior_takeaways
         # TUNING-RXFIX-1（A1）：重试指令=末次失败门集合（要点面/体量可叠加，
         # 双缺时并串；retry_nudges 末项=上一掷失败集合，无记录兜底要点面指令）。
         # system 串逐位不动（替身路由/防膨胀钉同 RXFIX-2 纪律）。
@@ -2653,6 +2679,9 @@ def create_summary(
             candidate = _salvage_summary_object(raw)
         if _valid_summary_part(candidate):
             takeaways_ok = _merge_has_takeaways(candidate)
+            if takeaways_ok:
+                # P-9 重试保真：过门候选的要点面快照（非空面才记，末试回填源）。
+                prior_takeaways = _takeaways_faces(candidate)
             # TUNING-RXFIX-1（A1）：要点面过门才评体量门（要点面失败优先——
             # 该形态重试指令已含补产要求，单点梯不重复消耗）。
             gate = (
@@ -2702,6 +2731,20 @@ def create_summary(
     )
     if not _valid_summary_part(value):
         raise LLMError("summary merge response has an invalid shape")
+    # V010-D1-FIX-1（P-9 重试保真）：末试要点面空而此前有过门候选时，确定性
+    # 回填其要点面（669766 掷2 实测：体量重试把要点打空，旧逻辑降级出货=要点
+    # 静默归零）。回填源=真实过门产出，非凭空造条；doc_llm 路径 coerce_llm_doc
+    # 保留 summary_notes、兜底构建路径由 key_takeaways 派生 notes，双路径同修。
+    if not _merge_has_takeaways(value) and prior_takeaways is not None:
+        kt_face, notes_face = prior_takeaways
+        if kt_face:
+            value["key_takeaways"] = list(kt_face)
+        elif notes_face and isinstance(value.get("doc"), dict):
+            value["doc"] = {**value["doc"], "summary_notes": list(notes_face)}
+        if _merge_has_takeaways(value):
+            merge_quality_degraded = 0
+            merge_takeaways_salvaged = 1
+            _emit_telemetry("stage=summary-merge-takeaways-salvaged")
     # RXFIX-2：末试要点面仍空（含抢救路径）=降级出货闭集计数（runner 转警告）。
     if not _merge_has_takeaways(value):
         merge_quality_degraded = 1
@@ -2927,6 +2970,9 @@ def create_summary(
         "views_retries": view_stats["retries"],
         # RXFIX-2：要点面降级闭集计数（0/1）——runner 据此转闭集警告上屏。
         "takeaways_missing": merge_quality_degraded,
+        # V010-D1-FIX-1（P-9 重试保真）：要点面回填闭集计数（0/1）——体量重试
+        # 打空要点后被前次过门面拯救的掷次。诚实观测：salvaged=1 时下游零缺面。
+        "takeaways_salvaged": merge_takeaways_salvaged,
         # TUNING-RXFIX-1（A1）：体量门重试/降级闭集计数（0/1）——runner 据
         # md_volume_degraded 转闭集警告上屏（降级=本版较简可见，绝不静默）。
         "md_volume_retries": merge_volume_retries,
