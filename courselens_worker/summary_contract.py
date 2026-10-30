@@ -342,6 +342,187 @@ def merge_near_duplicate_titles(items: list[dict[str, Any]]) -> tuple[list[dict[
     return merged, merge_count
 
 
+# ---- V010-SEMGEN-1（F9-3 发现③生成侧根修，2026-10-30）：碎片章标题概念性守卫
+# 判据推导（禁拍脑袋，11 讲全量实证定谳）：真实缺陷形态=F9-3 评判道 685785 讲
+# doc.sections 20 条上屏章题中 19 条为 ASR 话语句/语气词碎片（「不好意思/我/是/
+# 大/并联嘛/所以…」族——章题被口头语当名词短语），而其余 10 讲 444 条规范章题
+# （「pn结频率特性与开关回顾/柯克效应（Kirk Effect）」族）全量零命中=零误伤。
+# 判据=三闭集形态学，全部条目有真实样例或 F9-3 处方正则背书：
+#   ①话语连接词/代词开头（所以/就是/那/因此/这样/我们/但它/不好意思…）；
+#   ②句末语气词（嘛/吧/啊/了/呢/哦/呀/咯/啦/呗——F9-3 处方正则嘛|吧|啊|了全量
+#     在册+同族扩展）；
+#   ③超短（≤4 有效字）且首字为代词/语气/应答闭集字（我/你/他/是/大/看/可…）。
+# F9-3 处方「≤4 字单句」在此收窄为闭集成员判定：裸长度门会误伤「熵/导数/极限」
+# 式合法短题（宁漏勿错删，与 dedupe「确定性规则不猜语义」同纪律）。
+# 处置=合并（碎片节吸收进前一节、无前者吸收进后节——内容零删改逐字保留、锚
+# 白名单值不丢形，与 enforce_chapter_count/W7 同式）；非拒收（丢内容）非降级
+# （doc.sections schema 无子节层）。合并残余的碎片题（全碎片讲次塌缩后仍碎）
+# =丢项（诚实空态，禁以碎片题上屏）。
+
+# 任意长度话语开头闭集：口头连接词/代词开头不可能是名词性章题（真实样例：
+# 「所以它会有一个这个基区」「我们可以清晰的看到」「因此在高频情况下」「但它
+# 这两者f贝塔跟f阿尔法相差」「刚才我们求的就是…」「这样的话两个边界都是…」
+# 「就是你能把它直接连起来」「不好意思」）。单字头 那/但 只与「但是/但它」等
+# 二字词并列在册，不看裸首字（防「可见光/不确定性原理」式误伤）。
+_FRAGMENT_LEADS_ANY = (
+    "不好意思", "所以", "就是", "就等于", "就算", "就叫", "就因为", "就这样",
+    "那", "那么", "因此", "这样", "但是", "但它", "我们", "你们", "他们",
+    "它们", "刚才", "然后", "首先", "其次", "另外", "此外", "于是", "不过",
+    "零到",
+)
+# 超短题（≤4 有效字）才启用的代词/语气词首字闭集——只收「不可能起头名词性
+# 章题」的代词与叹词：F9-3 处方正则的可/大/对/行/真/是/不/看 等字在此**收窄
+# 排除**（「大数据/有理数/可见光/行列式/真空/对数」式合法短题实证反例，宁漏
+# 勿错删）；裸单字层（len==1）另行收全（见下一常量）。
+_FRAGMENT_LEADS_SHORT = (
+    "我", "你", "他", "她", "它", "嗯", "啊", "哼", "哦", "呗",
+)
+# 裸单字题（整题仅 1 有效字）碎片闭集：685785 讲真实碎片「我/是/大」在册；
+# 合法裸单字题=领域名词（「熵」），不在本闭集即保留。
+_FRAGMENT_BARE_SINGLE = (
+    "我", "你", "他", "她", "它", "是", "大", "看", "对", "行",
+    "嗯", "啊", "哼", "哦", "呗", "好", "没", "有",
+)
+# 句末语气词闭集（真实样例：「并联嘛」「…除以这个 IL 啊」「…发到群里了」；
+# F9-3 处方嘛|吧|啊|了+同族扩展）。
+_FRAGMENT_TAIL_PARTICLES = ("嘛", "吧", "啊", "了", "呢", "哦", "呀", "咯", "啦", "呗")
+_FRAGMENT_TITLE_SHORT_CHARS = 4
+
+
+def is_fragment_title(title: Any) -> bool:
+    """章题碎片判据（F9-3 发现③生成侧守卫的单一权威谓词）。
+
+    判据与推导见本段头注；纯函数零依赖。空题=False（空题由形状门处理，
+    不归本谓词管）。"""
+    text = str(title or "").strip()
+    if not text:
+        return False
+    if text.startswith(_FRAGMENT_LEADS_ANY):
+        return True
+    if text[-1] in _FRAGMENT_TAIL_PARTICLES:
+        return True
+    effective = "".join(ch for ch in text if ch.isalnum())
+    if len(effective) <= _FRAGMENT_TITLE_SHORT_CHARS and (
+        effective[:1] in _FRAGMENT_LEADS_SHORT
+    ):
+        return True
+    if len(effective) == 1 and effective in _FRAGMENT_BARE_SINGLE:
+        return True
+    return False
+
+
+def merge_fragment_entries(
+    entries: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    """碎片章题条目合并（就地语义；返回 (新列表, 吸收次数, 残余丢弃次数)）。
+
+    判据=is_fragment_title（F9-3 发现③守卫，推导见常量段头注）。碎片条目
+    吸收进前一条目（无前者=吸收进后一条）：doc sections 拼接 ``points``/
+    ``formulas`` 列表、chapters 拼接 ``summary`` 串（帽
+    ``_CHAPTER_MERGED_SUMMARY_CAP``），title/start_ms 保非碎片邻居（start_ms
+    取两侧较早=时间轴单调不回翻），``example`` 单例取先者缺省继后（schema
+    约束禁虚构）——与 enforce_chapter_count/W7 近重复合并同式同纪律（内容零
+    删改、锚白名单值不丢形）。全碎片讲次塌缩后仍碎的残余条目=丢项计数（诚实
+    空态，禁碎片题上屏）。输入须已按 start_ms 升序。"""
+    merged: list[dict[str, Any]] = []
+    absorbed = 0
+    dropped = 0
+    pending_leading: list[dict[str, Any]] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        if not is_fragment_title(title):
+            if pending_leading:
+                # 开头碎片无前者可吸收=并入本条（保本条题名，start 取更早）。
+                first = pending_leading[0]
+                item = dict(item)
+                for list_key in ("points", "formulas"):
+                    if isinstance(item.get(list_key), list) or any(
+                        isinstance(p.get(list_key), list) for p in pending_leading
+                    ):
+                        item[list_key] = list(item.get(list_key) or []) + [
+                            part
+                            for p in pending_leading
+                            for part in (p.get(list_key) or [])
+                        ]
+                if not item.get("example"):
+                    for p in pending_leading:
+                        if p.get("example"):
+                            item["example"] = p["example"]
+                            break
+                if int(first.get("start_ms") or 0) < int(item.get("start_ms") or 0):
+                    item["start_ms"] = int(first.get("start_ms") or 0)
+                pending_leading = []
+            merged.append(item)
+            continue
+        pending = dict(item)
+        if merged:
+            previous = merged[-1]
+            for list_key in ("points", "formulas"):
+                if isinstance(pending.get(list_key), list):
+                    previous[list_key] = list(previous.get(list_key) or []) + list(
+                        pending[list_key]
+                    )
+            pending_summary = str(pending.get("summary") or "").strip()
+            if pending_summary:
+                combined = (
+                    str(previous.get("summary") or "").strip() + "；" + pending_summary
+                ).strip("；")
+                previous["summary"] = combined[:_CHAPTER_MERGED_SUMMARY_CAP]
+            if not previous.get("example") and pending.get("example"):
+                previous["example"] = pending["example"]
+            absorbed += 1
+        else:
+            pending_leading.append(pending)
+    if pending_leading:
+        # 尾部/全程碎片且无后继邻居=残余丢项（诚实空态）。
+        dropped += len(pending_leading)
+    return merged, absorbed, dropped
+
+
+def rederive_inherited_point_anchors(
+    doc: dict[str, Any] | None,
+    anchor_text_pool: list[tuple[int, str]] | None,
+) -> tuple[dict[str, Any] | None, dict[str, int]]:
+    """doc points 节首继承锚重推导（F9-3 候修 Top2 锚点质量包后处理件）。
+
+    根因（F9-3 探针②实证，讲级现患 11/11）：合并输入只携带章节起点毫秒、
+    prompt 指令「anchor_ms 取输入 start_ms」→ 模型只能发射章节起点=节首继承
+    形态（points 与节 start_ms 全等 25.0%、相邻同锚连续对 43.7%）。修法=
+    确定性重推导（零新调用、零提示词改动——提示词通道走不通：合并输入无
+    segment 级时间戳，改指令无数据可指）：节首继承锚（锚==节 start_ms）或
+    相邻连续同锚对（同节连续同锚 >1 对的后项）以 point 文本对转写锚池重推导
+    （``_derive_doc_anchor_ms`` 同源同阈 Dice，fail-closed）——重推导命中且异
+    于原值=替换计数；推导不达阈值或落回原值=保留原锚计数（宁锚粗勿锚错，
+    与 RR-QWIN-1 同纪律）。就地修改，返回 (doc, 闭集计数)。``pool`` 空=逐位
+    原样（零回归面）。"""
+    stats = {"points_anchor_rederived": 0, "points_anchor_inherited_kept": 0}
+    if not isinstance(doc, dict) or not anchor_text_pool:
+        return doc, stats
+    for section in doc.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        section_start = section.get("start_ms")
+        previous_anchor: Any = None
+        for point in section.get("points") or []:
+            if not isinstance(point, dict):
+                continue
+            anchor = point.get("anchor_ms")
+            inherited = anchor == section_start or anchor == previous_anchor
+            if not inherited:
+                previous_anchor = anchor
+                continue
+            derived = _derive_doc_anchor_ms(str(point.get("text") or ""), anchor_text_pool)
+            if derived is not None and derived != anchor:
+                point["anchor_ms"] = derived
+                stats["points_anchor_rederived"] += 1
+                anchor = derived
+            else:
+                stats["points_anchor_inherited_kept"] += 1
+            previous_anchor = anchor
+    return doc, stats
+
 
 def _clean_text(value: Any, cap: int) -> str:
     return str(value or "").strip()[:cap]
@@ -596,12 +777,18 @@ def _find_block_boundary(
 
 
 def _block_title(chapters: list[dict[str, Any]], block_text: str) -> tuple[str, str]:
-    """板块名=幻灯片标题优先（期 0=LLM 章节名按时间落入）、转写短语兜底。"""
+    """板块名=幻灯片标题优先（期 0=LLM 章节名按时间落入）、转写短语兜底。
+
+    兜底短语过碎片章题守卫（F9-3 发现③同款谓词）：转写头句是话语句
+    （「所以…」族）时宁取通用名不以碎片上屏——chapters_v2 今日不消费，
+    本守卫=未来切消费面前的同族前置清洗（V010-SEMGEN-1）。"""
     for chapter in chapters:
         title = _clean_text(chapter.get("title"), _TITLE_CAP)
         if title:
             return title, _clean_text(chapter.get("summary"), _SUMMARY_CAP)
     head = _clean_text(block_text, _TITLE_CAP).split("。", 1)[0].split("，", 1)[0]
+    if is_fragment_title(head):
+        head = ""
     return (head or "本讲内容"), _clean_text(block_text, 160)
 
 
@@ -887,6 +1074,23 @@ def coerce_llm_doc(
         stats["sections_near_dup_merged"] = (
             stats.get("sections_near_dup_merged", 0) + near_dup_merged
         )
+    # W8 碎片章标题守卫（F9-3 发现③生成侧根修，V010-SEMGEN-1）：ASR 话语句/
+    # 语气词碎片不得以正式章题上屏——碎片节吸收进前节（无前者并入后节），残余
+    # 丢项计数（判据推导见 is_fragment_title 段头注；685785 讲 19/20 命中、
+    # 10 讲对照 444 条零误伤实证）。
+    sections, frag_absorbed, frag_dropped = merge_fragment_entries(sections)
+    if stats is not None:
+        if frag_absorbed:
+            stats["sections_fragment_merged"] = (
+                stats.get("sections_fragment_merged", 0) + frag_absorbed
+            )
+        if frag_dropped:
+            stats["sections_fragment_dropped"] = (
+                stats.get("sections_fragment_dropped", 0) + frag_dropped
+            )
+    if not sections:
+        _bump("sections_empty")
+        return None
     # W5 元话语剥除（守卫层）：overview 承载自 markdown 首段，继承同款剥除。
     # F9-FIX-1 包①：内省括注（模型自评元评论）同族不上屏。
     raw_overview_value = raw.get("overview")

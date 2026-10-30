@@ -800,5 +800,336 @@ class EnforceDocSectionCapUnitTests(unittest.TestCase):
         self.assertEqual(starts, sorted(starts))
 
 
+# ---- V010-SEMGEN-1（F9-3 发现③生成侧根修+候修 Top2 锚点质量包）钉 -------------
+# 判据推导=summary_contract 碎片守卫段头注（11 讲全量实证：685785 讲 19/20 命中
+# +10 讲对照 444 条零误伤）；本组钉用合成形态等价样例（脱敏纪律：真实讲次碎片
+# 题不入库，仅锁判据形态学）。变异验证配方=摘 is_fragment_title 闭集判定→恰本
+# 组红→还原绿（车道结果文件留档）。
+
+
+class FragmentTitleGuardTests(unittest.TestCase):
+    """碎片章题守卫钉：判据谓词+双链合并（chapters/doc sections）+诚实空态。"""
+
+    def test_predicate_fragment_family_matches(self):
+        from courselens_worker.summary_contract import is_fragment_title
+        fragments = [
+            "不好意思", "并联嘛", "我", "是", "大", "所以这个电阻会更大",
+            "我们可以清晰的看到", "因此在高频情况下", "这样的话两个边界都是已知的",
+            "就是你能把它直接连起来", "但它这两者相差很多", "刚才我们求的就是它",
+            "那前面已经讲清楚了", "零到最大值进行积分", "卷子发到群里了",
+        ]
+        for title in fragments:
+            self.assertTrue(is_fragment_title(title), title)
+
+    def test_predicate_nominal_titles_pass(self):
+        # 10 讲对照零误伤钉：名词性短题（含单字术语/超短题）绝不误判。
+        from courselens_worker.summary_contract import is_fragment_title
+        nominals = [
+            "熵", "导数", "极限", "习题讲解", "绪论", "可见光与紫外光",
+            "不确定性原理", "共射极输入输出特性", "柯克效应", "反向穿透电流ICEO",
+            "Ebers-Moll方程与实际晶体管模型", " pn结频率特性 ", "就业指导",
+        ]
+        for title in nominals:
+            self.assertFalse(is_fragment_title(title), title)
+
+    def test_merge_absorbs_fragment_into_previous_zero_content_loss(self):
+        from courselens_worker.summary_contract import merge_fragment_entries
+        entries = [
+            {"title": "等效电路", "start_ms": 0, "summary": "等效电路的定义。",
+             "points": [{"text": "甲点", "anchor_ms": 0}], "formulas": [],
+             "example": {"text": "先例"}},
+            {"title": "并联嘛", "start_ms": 60_000, "summary": "并联的情形。",
+             "points": [{"text": "乙点", "anchor_ms": 60_000}],
+             "formulas": [{"latex": "Z=Z_1+Z_2", "anchor_ms": 60_000}],
+             "example": {"text": "后例"}},
+        ]
+        merged, absorbed, dropped = merge_fragment_entries(entries)
+        self.assertEqual((absorbed, dropped), (1, 0))
+        self.assertEqual(len(merged), 1)
+        first = merged[0]
+        self.assertEqual(first["title"], "等效电路")  # 保非碎片邻居题名
+        self.assertEqual(first["start_ms"], 0)  # 时间轴单调（取较早）
+        self.assertEqual(
+            [point["text"] for point in first["points"]], ["甲点", "乙点"])
+        self.assertEqual(first["formulas"][0]["latex"], "Z=Z_1+Z_2")
+        self.assertEqual(first["example"]["text"], "先例")  # 单例取先者缺省继后
+
+    def test_merge_leading_fragment_absorbs_into_next(self):
+        from courselens_worker.summary_contract import merge_fragment_entries
+        entries = [
+            {"title": "不好意思", "start_ms": 0, "summary": "开场。",
+             "points": [{"text": "开场点", "anchor_ms": 0}], "formulas": []},
+            {"title": "等效电路", "start_ms": 60_000, "summary": "等效电路。",
+             "points": [{"text": "正点", "anchor_ms": 60_000}], "formulas": []},
+        ]
+        merged, absorbed, dropped = merge_fragment_entries(entries)
+        self.assertEqual((absorbed, dropped), (0, 0))
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["title"], "等效电路")
+        self.assertEqual(merged[0]["start_ms"], 0)  # 保更早起点
+        self.assertEqual(
+            [point["text"] for point in merged[0]["points"]], ["正点", "开场点"])
+
+    def test_merge_all_fragment_residue_drops_honest_empty(self):
+        from courselens_worker.summary_contract import merge_fragment_entries
+        entries = [
+            {"title": "我", "start_ms": 0, "summary": "", "points": [], "formulas": []},
+            {"title": "大", "start_ms": 60_000, "summary": "", "points": [], "formulas": []},
+        ]
+        merged, absorbed, dropped = merge_fragment_entries(entries)
+        self.assertEqual((merged, absorbed, dropped), ([], 0, 2))
+
+    def test_coerce_llm_doc_fragment_sections_never_reach_output(self):
+        from courselens_worker.summary_contract import coerce_llm_doc
+        raw = {
+            "overview": "总述。",
+            "sections": [
+                {"start_ms": 0, "title": "等效电路", "source": "semantic",
+                 "points": [{"text": "阻抗由串并联决定", "anchor_ms": 0}],
+                 "formulas": []},
+                {"start_ms": 60_000, "title": "并联嘛", "source": "semantic",
+                 "points": [{"text": "并联时总阻抗下降", "anchor_ms": 60_000}],
+                 "formulas": []},
+            ],
+            "terms": [], "summary_notes": [],
+        }
+        stats: dict[str, int] = {}
+        doc = coerce_llm_doc(raw, {0, 60_000}, anchor_text_pool=[], drop_stats=stats)
+        self.assertIsNotNone(doc)
+        self.assertEqual(len(doc["sections"]), 1)
+        self.assertEqual(doc["sections"][0]["title"], "等效电路")
+        self.assertEqual(stats.get("sections_fragment_merged"), 1)
+
+    def test_coerce_llm_doc_all_fragment_yields_none(self):
+        from courselens_worker.summary_contract import coerce_llm_doc
+        raw = {
+            "overview": "总述。",
+            "sections": [
+                {"start_ms": 0, "title": "我", "source": "semantic",
+                 "points": [{"text": "点", "anchor_ms": 0}], "formulas": []},
+            ],
+            "terms": [], "summary_notes": [],
+        }
+        doc = coerce_llm_doc(raw, {0}, anchor_text_pool=[])
+        self.assertIsNone(doc)  # 诚实空态：全碎片=不产 doc（禁碎片题上屏）
+
+
+class PointAnchorRederiveTests(unittest.TestCase):
+    """锚点质量包后处理钉（F9-3 候修 Top2）：节首继承/连续同锚确定性重推导。"""
+
+    def test_inherited_and_consecutive_dup_anchors_rederive(self):
+        from courselens_worker.summary_contract import (
+            rederive_inherited_point_anchors,
+        )
+        pool = [
+            (0, "等效电路的阻抗由元件的串并联关系决定。"),
+            (30_000, "并联的时候总的阻抗会下降到比任何一个元件都小。"),
+        ]
+        doc = {"sections": [{
+            "start_ms": 0, "title": "等效电路", "source": "semantic",
+            "points": [
+                # 节首继承（锚==节 start）且文本与 30s 段强重叠 → 重推导替换。
+                {"text": "并联的时候总的阻抗会下降到比任何一个元件都小", "anchor_ms": 0},
+                # 连续同锚对后项且无证据 → 保留计数（宁锚粗勿锚错）。
+                {"text": "完全无关的表述", "anchor_ms": 0},
+                # 非继承锚 → 零触碰。
+                {"text": "并联的时候总的阻抗会下降到比任何一个元件都小", "anchor_ms": 30_000},
+            ],
+            "formulas": [],
+        }]}
+        result, stats = rederive_inherited_point_anchors(doc, pool)
+        points = result["sections"][0]["points"]
+        self.assertEqual(points[0]["anchor_ms"], 30_000)
+        self.assertEqual(points[1]["anchor_ms"], 0)  # 推导不达=保留原值
+        self.assertEqual(points[2]["anchor_ms"], 30_000)
+        self.assertEqual(
+            stats,
+            {"points_anchor_rederived": 1, "points_anchor_inherited_kept": 1},
+        )
+
+    def test_empty_pool_is_identity(self):
+        from courselens_worker.summary_contract import (
+            rederive_inherited_point_anchors,
+        )
+        doc = {"sections": [{"start_ms": 0, "title": "甲", "source": "semantic",
+                             "points": [{"text": "甲点", "anchor_ms": 0}],
+                             "formulas": []}]}
+        result, stats = rederive_inherited_point_anchors(doc, [])
+        self.assertIs(result, doc)
+        self.assertEqual(stats["points_anchor_rederived"], 0)
+        self.assertIsNone(
+            rederive_inherited_point_anchors(None, anchor_text_pool=None)[0])
+
+    def test_create_summary_end_to_end_counters(self):
+        # 生成链集成钉：碎片章题双链合并+节首继承重推导计数随 deep_usage 归档。
+        # 锚面设计：碎片章/节 start_ms 与点锚全取转写白名单值（0/30000）——
+        # 白名单外条目在既有锚拯救门先行丢项（既有钉覆盖），本钉只锁守卫增量。
+        transcript = [
+            {"start_ms": 0, "end_ms": 30_000,
+             "text": "等效电路的阻抗由元件的串并联关系决定。"},
+            {"start_ms": 30_000, "end_ms": 60_000,
+             "text": "并联的时候总的阻抗会下降到比任何一个元件都小。"},
+        ]
+        merge_payload = {
+            "markdown": "合并笔记",
+            "chapters": [
+                {"title": "等效电路", "start_ms": 0, "summary": "等效电路的定义。"},
+                {"title": "并联嘛", "start_ms": 30_000, "summary": "并联的情形。"},
+            ],
+            "key_takeaways": ["并联时总阻抗会下降", "期中考试安排需要注意"],
+            "assessment_events": [
+                {"category": "exam", "title": "期中考试安排",
+                 "quote": "期中考试的卷子发到群里了", "due_hint": "十一月中旬"},
+            ],
+            "doc": {
+                "overview": "总述。",
+                "sections": [
+                    {"start_ms": 0, "title": "等效电路", "source": "semantic",
+                     "points": [
+                         {"text": "并联的时候总的阻抗会下降到比任何一个元件都小",
+                          "anchor_ms": 0},
+                     ], "formulas": []},
+                    {"start_ms": 30_000, "title": "并联嘛", "source": "semantic",
+                     "points": [{"text": "并联的情形说明", "anchor_ms": 30_000}],
+                     "formulas": []},
+                ],
+                "terms": [], "summary_notes": [],
+            },
+        }
+
+        def fake_chat(api_key, messages, **kwargs):
+            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
+                return json.dumps(merge_payload)
+            # events 引句必须落在窗笔记原文（N5A-P2 校验），窗文本承载引句。
+            return json.dumps(_part("窗口笔记：期中考试的卷子发到群里了"))
+
+        with (
+            patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False),
+            patch("courselens_worker.llm._chat", side_effect=fake_chat),
+        ):
+            result = create_summary(
+                "k", title="t", transcript=transcript, ppt_pages=[])
+        # 碎片章题双链守卫：chapters 与 doc.sections 都不以碎片题上屏。
+        self.assertEqual(
+            [item["title"] for item in result["chapters"]], ["等效电路"])
+        self.assertEqual(
+            [item["title"] for item in result["doc"]["sections"]], ["等效电路"])
+        # 锚点质量：point 节首继承锚重推导到论断段（30s）；无证据后项保留。
+        points = result["doc"]["sections"][0]["points"]
+        self.assertEqual(points[0]["anchor_ms"], 30_000)
+        self.assertEqual(points[1]["anchor_ms"], 30_000)  # 推导不达=保留
+        deep = result["deep_usage"]
+        self.assertEqual(deep["chapters_fragment_merged"], 1)
+        self.assertEqual(deep["doc_section_fragment_merged"], 1)
+        self.assertEqual(deep["point_anchor_rederived"], 1)
+        self.assertEqual(deep["point_anchor_inherited_kept"], 1)
+        # takeaway transcript-first：论断段锚（30s）胜出章节起点。
+        self.assertEqual(result["takeaway_anchors"][0], 30_000)
+        # null 事务白名单抽检：event 引句有词汇证据=事务类豁免计数。
+        self.assertEqual(result["takeaway_anchors"][1], None)
+        self.assertEqual(deep["takeaway_anchor_null_transactional"], 1)
+        self.assertEqual(deep["takeaway_anchor_null_content"], 0)
+
+
+class TakeawayAnchorTranscriptFirstTests(unittest.TestCase):
+    """锚点质量包生成侧钉（F9-3 候修 Top2）：takeaway 锚 transcript-first，
+    字幕证据缺失回退章节池（null 不增），漂移抽检计数归档。"""
+
+    def test_transcript_evidence_beats_chapter_start(self):
+        # F9-3 探针②形态重放：takeaway 文本回声章题时旧行为锚=章节起点；
+        # transcript-first 后论断所在字幕段（30s）胜出（禁继承节首）。
+        transcript = [
+            {"start_ms": 0, "end_ms": 30_000,
+             "text": "开场先回顾上次课的作业情况。"},
+            {"start_ms": 30_000, "end_ms": 60_000,
+             "text": "凝胶化出现在临界转化率附近这是本节关键结论。"},
+        ]
+        merge_payload = {
+            "markdown": "合并笔记",
+            "chapters": [
+                {"title": "凝胶化出现在临界转化率附近", "start_ms": 0,
+                 "summary": "凝胶化出现在临界转化率附近。"},
+            ],
+            "key_takeaways": ["凝胶化出现在临界转化率附近"],
+            "assessment_events": [],
+        }
+
+        def fake_chat(api_key, messages, **kwargs):
+            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
+                return json.dumps(merge_payload)
+            return json.dumps(_part("窗口笔记"))
+
+        with (
+            patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False),
+            patch("courselens_worker.llm._chat", side_effect=fake_chat),
+        ):
+            result = create_summary(
+                "k", title="t", transcript=transcript, ppt_pages=[])
+        self.assertEqual(result["takeaway_anchors"], [30_000])
+        self.assertEqual(result["deep_usage"]["takeaway_anchor_chapter_fallback"], 0)
+
+    def test_chapter_pool_fallback_when_transcript_lacks_evidence(self):
+        transcript = [
+            {"start_ms": 0, "end_ms": 30_000, "text": "完全无关的一段闲聊。"},
+        ]
+        merge_payload = {
+            "markdown": "合并笔记",
+            "chapters": [
+                {"title": "凝胶化", "start_ms": 45_000,
+                 "summary": "凝胶化现象与临界转化率。"},
+            ],
+            "key_takeaways": ["凝胶化现象与临界转化率"],
+            "assessment_events": [],
+        }
+
+        def fake_chat(api_key, messages, **kwargs):
+            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
+                return json.dumps(merge_payload)
+            return json.dumps(_part("窗口笔记"))
+
+        with (
+            patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False),
+            patch("courselens_worker.llm._chat", side_effect=fake_chat),
+        ):
+            result = create_summary(
+                "k", title="t", transcript=transcript,
+                ppt_pages=[{"created_sec": 45}])
+        # 字幕无证据 → 回退章节池（锚不缺=诚实降级路径保留）+计数归档。
+        self.assertEqual(result["takeaway_anchors"], [45_000])
+        self.assertEqual(result["deep_usage"]["takeaway_anchor_chapter_fallback"], 1)
+        # null 抽检：本例锚非 null → 两类 null 计数均零。
+        self.assertEqual(result["deep_usage"]["takeaway_anchor_null_content"], 0)
+        self.assertEqual(
+            result["deep_usage"]["takeaway_anchor_null_transactional"], 0)
+
+    def test_content_null_counted_for_drift_probe(self):
+        transcript = [
+            {"start_ms": 0, "end_ms": 30_000, "text": "今天我们从基本概念开始讲起。"},
+        ]
+        merge_payload = {
+            "markdown": "合并笔记",
+            "chapters": [],
+            "key_takeaways": ["与本讲字幕毫无交集的孤立结论"],
+            "assessment_events": [],
+        }
+
+        def fake_chat(api_key, messages, **kwargs):
+            if messages[0]["content"] == _SUMMARY_MERGE_PROMPT_TEACHING:
+                return json.dumps(merge_payload)
+            return json.dumps(_part("窗口笔记"))
+
+        with (
+            patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False),
+            patch("courselens_worker.llm._chat", side_effect=fake_chat),
+        ):
+            result = create_summary(
+                "k", title="t", transcript=transcript, ppt_pages=[])
+        self.assertEqual(result["takeaway_anchors"], [None])
+        # 无事件词汇证据 → 内容类 null 计数（漂移抽检钩子，fail-closed 不编锚）。
+        self.assertEqual(result["deep_usage"]["takeaway_anchor_null_content"], 1)
+        self.assertEqual(
+            result["deep_usage"]["takeaway_anchor_null_transactional"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

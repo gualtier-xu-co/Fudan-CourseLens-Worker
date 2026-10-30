@@ -30,7 +30,9 @@ from .summary_contract import (
     build_summary_doc,
     coerce_llm_doc,
     enforce_chapter_count,
+    merge_fragment_entries,
     merge_near_duplicate_titles,
+    rederive_inherited_point_anchors,
     strip_introspective_parens,
     strip_meta_discourse,
     strip_separator_junk,
@@ -2826,6 +2828,13 @@ def create_summary(
     # 线性电源：结构与原理」连排实测），Dice≥0.75 逐对合并（保先者锚，摘要
     # 拼接），合并次数随遥测归档。
     chapters, chapters_near_dup_merged = merge_near_duplicate_titles(chapters)
+    # V010-SEMGEN-1（F9-3 发现③生成侧根修）：碎片章标题守卫在近重复合并后、
+    # 数量帽前收口——ASR 话语句/语气词碎片（685785 讲 19/20 实证形态）吸收进
+    # 前章（无前者并入后章），残余丢项诚实计数（判据推导=summary_contract
+    # is_fragment_title 段头注；10 讲对照 444 条零误伤）。
+    chapters, chapters_fragment_merged, chapters_fragment_dropped = (
+        merge_fragment_entries(chapters)
+    )
     # TUNING-RXFIX-1：时长计算单源上提至合并梯前（A1 门取数），此处沿用。
     chapters_before_cap = len(chapters)
     chapters = enforce_chapter_count(chapters, duration_ms)
@@ -2878,14 +2887,45 @@ def create_summary(
     # RR-QWIN-1 Q1：takeaway 逐条时间戳锚，与 key_takeaways 等长对齐。锚值
     # 只取 valid_anchors 白名单（chapters 已过校验、字幕段 start_ms 天然合
     # 法）；None=没有足够把握，客户端不渲染锚而非报错。
-    anchor_candidates = [
+    # V010-SEMGEN-1（F9-3 候修 Top2 锚点质量包）：transcript-first 锚定——
+    # 原池=chapters(题+摘)+字幕段并列取 Dice 最优，takeaway 文本回声章题/章摘
+    # 时章节起点胜出=节首继承形态（F9-3 探针②实证：takeaway 锚=doc 节首
+    # 30.0%、个案 669766 锚=章首毫秒全等而字幕实为前一话题）。修法=先仅对
+    # 字幕段派生（论断所在 segment 起点，禁继承节首）；无字幕证据再回退原章
+    # 节池（null 不增=诚实降级路径保留），回退次数闭集计数随遥测归档。
+    anchor_candidates_chapters = [
         (int(item["start_ms"]), f"{item.get('title') or ''} {item.get('summary') or ''}")
         for item in chapters
     ]
-    anchor_candidates.extend(
-        (int(item.get("start_ms") or 0), str(item.get("text") or "")) for item in transcript
-    )
-    takeaway_anchors = [_takeaway_anchor_ms(text, anchor_candidates) for text in takeaways]
+    takeaway_anchors: list[int | None] = []
+    takeaway_anchor_chapter_fallback = 0
+    for takeaway_text in takeaways:
+        anchor = _takeaway_anchor_ms(takeaway_text, anchor_text_pool)
+        if anchor is None:
+            anchor = _takeaway_anchor_ms(takeaway_text, anchor_candidates_chapters)
+            if anchor is not None:
+                takeaway_anchor_chapter_fallback += 1
+        takeaway_anchors.append(anchor)
+    # F9-3 候修 Top2 抽检钩子（漂移观测，零行为变化）：null 锚按事务类白名单
+    # 分类——与 assessment_events（考核/作业）文本有词汇证据=null 可豁免（事务
+    # 类本无字幕论断可指）；纯内容类 null=计数上遥测（修复轮可测门：≤2/60，
+    # 超标即下一轮重处理复查信号）。fail-closed 不变：null 恒不编锚。
+    takeaway_anchor_null_content = 0
+    takeaway_anchor_null_transactional = 0
+    _null_event_pool = [
+        (index, (
+            f"{item.get('category') or ''} {item.get('title') or ''} "
+            f"{item.get('quote') or ''}"
+        ))
+        for index, item in enumerate(events)
+    ]
+    for takeaway_text, anchor in zip(takeaways, takeaway_anchors):
+        if anchor is not None:
+            continue
+        if _null_event_pool and _takeaway_anchor_ms(takeaway_text, _null_event_pool) is not None:
+            takeaway_anchor_null_transactional += 1
+        else:
+            takeaway_anchor_null_content += 1
     # 多源知识：只有引用了包内 citation 的知识点才会落地；坏引用整条丢弃。
     citations = dict(packet.get("citations") or {}) if packet is not None else {}
     knowledge_points, point_meta = validate_knowledge_points(
@@ -3002,6 +3042,31 @@ def create_summary(
     # enforce_chapter_count 同式同施加点纪律；659766/681269 51/52 章超帽产出
     # 的代码不对称根修）。合并次数随遥测归档（闭集计数器）。
     doc, doc_sections_cap_merged = _enforce_doc_section_cap(doc, duration_ms)
+    # V010-SEMGEN-1（F9-3 候修 Top2 锚点质量包后处理件）：doc points 节首继承
+    # 锚确定性重推导（数量帽后再推导=最终形状上收口；推导详情与 fail-closed
+    # 语义=summary_contract.rederive_inherited_point_anchors docstring）。
+    doc, point_anchor_stats = rederive_inherited_point_anchors(doc, anchor_text_pool)
+    # V010-SEMGEN-1（F9-3 发现③+候修 Top2）守卫与锚点质量闭集计数：碎片章题
+    # 守卫（chapters/doc 双链）+锚点重推导+transcript-first 回退+null 事务白
+    # 名单抽检（漂移观测，零内容）。doc 链变量在此已定义，故以 update 挂账。
+    deep_usage.update({
+        "chapters_fragment_merged": chapters_fragment_merged,
+        "doc_section_fragment_merged": int(
+            doc_drop_stats.get("sections_fragment_merged") or 0
+        ),
+        "doc_section_fragment_dropped": int(
+            doc_drop_stats.get("sections_fragment_dropped") or 0
+        ),
+        "point_anchor_rederived": int(
+            point_anchor_stats.get("points_anchor_rederived") or 0
+        ),
+        "point_anchor_inherited_kept": int(
+            point_anchor_stats.get("points_anchor_inherited_kept") or 0
+        ),
+        "takeaway_anchor_chapter_fallback": takeaway_anchor_chapter_fallback,
+        "takeaway_anchor_null_content": takeaway_anchor_null_content,
+        "takeaway_anchor_null_transactional": takeaway_anchor_null_transactional,
+    })
     _emit_telemetry(
         f"stage=summary windows={len(sources)}/{len(sources)} "
         f"resumed={completed} evidence_windows={len(evidence_windows)} "
