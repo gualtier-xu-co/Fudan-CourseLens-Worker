@@ -342,10 +342,12 @@ class RunnerSeamTests(unittest.TestCase):
 
         def fake_summary(api_key, *, title, transcript, ppt_pages, prior_checkpoint, checkpoint,
                          evidence_packet=None, course_context=None, usage_sink=None,
-                         progress=None, slide_pack=None):
+                         progress=None, slide_pack=None, glossary=None):
             # evidence_packet/course_context 是 N7A 的加性参数：显式接住以钉住调用签名。
             # usage_sink 是 RR-ACCOUNT2-1 的加性参数：任务级 token 账本由 runner 汇总。
             # slide_pack 是 V010-SLIDEALIGN-1 的加性参数：课件第二源（试点）。
+            # glossary 是 RXESCAPE-1 的加性参数：summary 面词表与 learning_pack 面
+            # 同源（OCR 词表随 extra 合入），显式接住以钉住调用签名。
             return {"model": "deepseek-chat", "markdown": "笔记", "chapters": chapters}
 
         with patch("courselens_worker.ocr.process_slides", side_effect=fake_slides), \

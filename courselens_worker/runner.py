@@ -708,6 +708,7 @@ def _process_materialized_job(
         )
     elif kind in {"summary", "chapters"}:
         from .course_knowledge import normalize_evidence_packet
+        from .glossary import build_glossary
         from .lecture_ir import build_lecture_ir
         from .llm import LLMError, create_summary, summary_md_volume_degraded, summary_takeaways_missing
         from .ocr import process_slides
@@ -759,7 +760,14 @@ def _process_materialized_job(
             summary_args["evidence_packet"] = packet
         if payload.get("course_context") is not None:
             summary_args["course_context"] = payload.get("course_context")
-        glossary = _merged_course_terms(payload)
+        # RXESCAPE-1（2026-10-30）：summary 面词表与 learning_pack 面同源——
+        # OCR 词表随 extra 合入（GlossaryTerms 携 source_corpus），unify 源语
+        # 料保护形守卫在本面生效。此前 summary 分支只传 payload/env 词表（普
+        # 通元组、空语料），课件 OCR 权威写法（电中性区族）对机械 unify 不可
+        # 见=守卫盲区；同结构注入/守卫纪律见 learning_pack 分支 pack_terms。
+        glossary = _merged_course_terms(
+            payload, build_glossary(pages, str(payload.get("title") or ""))
+        )
         if glossary:
             # V4NONTHINK-1 件6：摘要窗口/合并输入携带课程术语表（笔记写法保险）。
             summary_args["glossary"] = glossary

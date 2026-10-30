@@ -16,7 +16,7 @@ from typing import Any, Callable
 import requests
 
 from .formats import normalize_segments
-from .glossary import apply_glossary, unify_text_terms
+from .glossary import apply_glossary, filter_prompt_terms, unify_text_terms
 from .retry import LadderExhausted, LadderFailure, run_ladder
 from .slide_alignment import assign_pack_windows
 from .subtitle_clean import CLEAN_MAX_OPS_PER_SEGMENT, validate_tier2_dels
@@ -1809,6 +1809,12 @@ _WINDOW_TEACHING_SUFFIX = (
     "公式一律用 LaTeX 记写：行内 \\(…\\)、独立 \\[…\\]，禁用单个 $ 包裹。"
 )
 
+# RXESCAPE-1（2026-10-30）：md 正文术语片段伪影闭集（deep_usage 漏斗计数用，
+# 判据权威面=probe gate_F 词对族全扫）。只收实证伤型的确定性碎片形——
+# 「电中性区」被近形课件词片段「电平」改写为「电平性区」（685785 实证）；
+# 「电平」本身是合法术语（数字课逻辑电平），绝不入闭集（正当使用零误伤）。
+_MD_TERM_FRAGMENT_CLOSED_SET = ("电平性区",)
+
 
 def _window_date_guard_suffix(transcript: Any) -> str:
     """ASR-CORRECT-R1：总结窗日期存疑后缀（确定性守卫，零新 LLM 调用）。
@@ -2394,7 +2400,14 @@ def create_summary(
         str(item.get("text") or "") for item in transcript if isinstance(item, dict)
     )
     if summary_evidence_text:
-        terms_prompt = [term for term in terms if term in summary_evidence_text]
+        # RXFIX-3：门与注入面同源 terms_prompt——全零证词表不带 glossary 键
+        # （RXESCAPE-1 再滤近形影子词：转写偶证（<8 次）但与转写优势形词
+        # 编辑距离 ≤1 的课件词（电平 vs 电流族）不得以「权威写法」入表——
+        # 重灾三讲的生成侧替换通道；机械 unify 兜底面自有三重守卫不受影响）。
+        terms_prompt = list(filter_prompt_terms(
+            (term for term in terms if term in summary_evidence_text),
+            summary_evidence_text,
+        ))
     else:
         terms_prompt = terms
     # SUMMARY-FIX-1：思考档显式决策（缺省 disabled，env 闭集覆写）；思考档
@@ -3066,6 +3079,15 @@ def create_summary(
         "takeaway_anchor_chapter_fallback": takeaway_anchor_chapter_fallback,
         "takeaway_anchor_null_content": takeaway_anchor_null_content,
         "takeaway_anchor_null_transactional": takeaway_anchor_null_transactional,
+        # RXESCAPE-1（2026-10-30，SEMGEN 漏斗随形）：md 正文术语片段伪影闭集
+        # 观测计数（纯计数零内容）。判据权威面=probe gate_F（词对族+转写对照
+        # 全扫）；此处只挂最窄碎片伪影闭集作生成侧漂移挂账——685785 实证伤型
+        # =「电中性区」被近形课件词片段改写为「电平性区」（机械面已根修，此
+        # 计数守残余漂移可见性，非零即车道复查信号）。
+        "md_term_fragment_hits": sum(
+            str(value.get("markdown") or "").count(fragment)
+            for fragment in _MD_TERM_FRAGMENT_CLOSED_SET
+        ),
     })
     _emit_telemetry(
         f"stage=summary windows={len(sources)}/{len(sources)} "

@@ -13,6 +13,7 @@ from courselens_worker.glossary import (
     GLOSSARY_MAX_TERMS,
     apply_glossary,
     build_glossary,
+    filter_prompt_terms,
     unify_text_terms,
 )
 
@@ -271,3 +272,110 @@ def test_rxfix3_no_evidence_text_zero_behavior_change():
     assert unify_text_terms(dominant_text, tuple(glossary)) == dominant_text
     genuine_text = "傅里叶变換出现两次傅里叶变換。"
     assert unify_text_terms(genuine_text, tuple(genuine_glossary)).count("傅里叶变换") == 2
+
+
+# ---- RXESCAPE-1（2026-10-30；685785 残留伤型=滑窗片段伪影+注入影子词根修验收面）----
+
+
+def test_rxescape1_embedded_fragment_blocks_rewrite():
+    """零证片段守卫：piece 只以「更长真实词的内部片段」存在（每次出现前后紧
+    邻汉字、无串边界）→ 禁改写，无论目标词转写零证（685785 实证：电中性区
+    →电平性区，「电中」/「电平」转写双 0）还是偶证（653998 活体复掷实证：
+    光电转换→光电平换，「电转」0 证而「电平」转写 2 次）——嵌入形态本身即
+    判据。既有优势形守卫（转写 0<8）与方向守卫（piece 0 证不触发）在该形
+    态双双不设防，RXESCAPE-1 收口。"""
+    md = "在耗尽层外电中性区以扩散方式衰减。\n又一处电中性区按扩散长度衰减。"
+    evidence = "电流流过电路，载流子扩散。" * 5  # 无「电中」亦无「电平」
+    out = unify_text_terms(md, ("电平",), evidence_text=evidence)
+    assert out == md, out
+    assert "电平性区" not in out
+    # 653998 活体复掷伤型：目标词转写偶证（2 次<8），片段伪影仍拦。
+    md2 = "光电转换把光变成电。硅基光电转换效率高。"
+    evidence2 = "逻辑电平切换。" + "电流流过电路。" * 5  # 电平 2 次有证
+    out2 = unify_text_terms(md2, ("电平",), evidence_text=evidence2)
+    assert out2 == md2, out2
+    assert "电平换" not in out2
+
+
+def test_rxescape1_boundary_occurrence_keeps_legit_repair():
+    """合法纠错向不受零证片段守卫影响：变体在文本中存在串边界出现（行首/
+    标点后）→ 非内部伪影，照常统一（教师未说出的课件权威词形照常修复）；
+    变体只以嵌入形存在（mid-prose 无边界）→ 守卫拦（宁漏勿错）。"""
+    evidence = "文本0文本1文本2文本3"  # 双方转写均零证
+    md = "厄早效应两见：厄早效应、厄早效应。"
+    out = unify_text_terms(md, ("厄利效应",), evidence_text=evidence)
+    assert out.count("厄利效应") == 3, out
+    md2 = "由厄早效应主导机制，经厄早效应放大输出。"
+    out2 = unify_text_terms(md2, ("厄利效应",), evidence_text=evidence)
+    assert out2 == md2, out2
+
+
+def test_rxescape1_dual_zero_spares_legit_glyph_repair():
+    """合法纠错向不受零证片段守卫影响：字形变体（变換）零证、目标（变换）
+    转写有证 → 照常统一（与 685785 伤型的判别特征=目标词转写证据）。"""
+    md = "傅里叶变換出现两次傅里叶变換。"
+    evidence = "傅里叶变换是线性算子，傅里叶变换可分离。"
+    out = unify_text_terms(md, ("变换",), evidence_text=evidence)
+    assert out.count("傅里叶变换") == 2, out
+
+
+def test_rxescape1_no_evidence_callers_zero_behavior_change():
+    """evidence_text 缺省（None）调用方逐位零行为变化——零证片段/语料兜底守卫
+    只在转写证据面生效（旧调用方/旧测试兼容）。"""
+    md = "在耗尽层外电中性区按扩散长度衰减，电中性区重复两次。"
+    # 无证据面：旧行为原样保留（机械配对面不在本守卫射程）。
+    out = unify_text_terms(md, ("电平",))
+    assert isinstance(out, str)
+
+
+def test_rxescape1_speech_corpus_fallback_protects_spoken_words():
+    """语料兜底守卫（653998 掷2 活体实证）：无课件语料时转写即保护语料——
+    老师真实说出的词形（电源/电池/电光，转写 4/2/5 次均低于优势形阈值）绝
+    不被低证近形课件词「电平」（转写偶证 2 次）改正；「电平转换/太阳能电平/
+    电平电压」族 31 处残留即此通道。合法纠错不受影响：变体从不在转写中。"""
+    md = "电源电压为 VDD。太阳能电池把光变成电。做电光转换。"
+    evidence = "电源" * 4 + "电池" * 2 + "电光" * 5 + "电平" * 2
+    out = unify_text_terms(md, ("电平",), evidence_text=evidence)
+    assert out == md, out
+    assert "电平" not in out
+    # 对照：变体（变換）不在转写中 → 照常统一（语音 ground truth 语义）。
+    md2 = "傅里叶变換出现两次傅里叶变換。"
+    evidence2 = "傅里叶变换是重点。" + "电源" * 8
+    out2 = unify_text_terms(md2, ("变换",), evidence_text=evidence2)
+    assert out2.count("傅里叶变换") == 2, out2
+
+
+def test_rxescape1_filter_prompt_terms_shadowed_slide_word_dropped():
+    """注入影子过滤：电平（转写 2 次）被编辑距离 1 的转写优势形近形词电流
+    （150 次）影子 → 不入「术语写法以 glossary 表为准」权威清单；自身优势形
+    （电流/变换 ≥8 次）恒保留。37355 重灾三讲的生成侧替换通道收口。"""
+    terms = ("电流", "电平", "变换")
+    evidence = "电流。" * 150 + "变换。" * 15 + "电平。" * 2
+    kept = filter_prompt_terms(terms, evidence)
+    assert kept == ("电流", "变换"), kept
+
+
+def test_rxescape1_filter_prompt_terms_shadow_from_transcript_piece():
+    """影子候选含转写自身优势形（不限于表内兄弟）——653998 活体实证伤型：
+    payload 课程记忆词表含「电平」而缺「电流」，仅查表内兄弟漏影，「电平」
+    以权威名义入表=模型侧 58 处近形清洗通道。电流非表内词仍影之。"""
+    terms = ("电平", "器件")
+    evidence = "电流。" * 150 + "电平。" * 2 + "器件。" * 5
+    kept = filter_prompt_terms(terms, evidence)
+    assert kept == ("器件",), kept
+
+
+def test_rxescape1_filter_prompt_terms_dominant_slide_word_not_shadowed():
+    """影子过滤零误伤：电平被真实大量讲出（≥8 次）时与电流同表保留——正当
+    使用「电平」的课（数字/逻辑课型）注入面零变化。"""
+    terms = ("电流", "电平")
+    evidence = "电流。" * 20 + "电平。" * 20
+    kept = filter_prompt_terms(terms, evidence)
+    assert set(kept) == set(terms), kept
+
+
+def test_rxescape1_filter_prompt_terms_empty_evidence_passthrough():
+    """evidence 空=原样返回（零行为变化）。"""
+    terms = ("电流", "电平")
+    assert filter_prompt_terms(terms, "") == terms
+    assert filter_prompt_terms((), "电流电流") == ()

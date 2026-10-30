@@ -37,6 +37,12 @@ _MIN_VARIANT_OCCURRENCES = 2
 # 形即本讲真实词形，编辑距离再近也绝不改写（宁漏勿错=本模块既有哲学，
 # 错误替换的代价远高于漏纠：一次误替换毁整讲物理语义）。
 GLOSSARY_DOMINANT_FORM_MIN_OCCURRENCES = 8
+# RXESCAPE-1（2026-10-30，685785 残留伤型根修）：提示词注入面近形影子过滤比
+# ——低证课件词自身转写 <8 次且存在编辑距离 ≤1 的转写优势形近形词（≥8 次且
+# ≥4 倍于己）时不入「术语写法以 glossary 表为准」权威清单（37355 实证：
+# 电平〔转写 2 次〕vs 电流〔150 次〕同表注入=模型侧近形「规范化」偏置通道；
+# 4 倍比与优势形阈值同源，宁漏勿错）。
+_GLOSSARY_PROMPT_SHADOW_RATIO = 4
 _TERM_RE = re.compile(r"[\u4e00-\u9fa5]{2,8}")
 # 高频停用串闭集：OCR 页眉页脚与常见虚词组合，不进词表。
 _STOPWORDS = frozenset({
@@ -135,6 +141,32 @@ def _within_edit_distance(left: str, right: str, radius: int = _EDIT_RADIUS) -> 
     while index < len(short) and short[index] == long[index]:
         index += 1
     return short[index:] == long[index + 1:]
+
+
+def _is_han(char: str) -> bool:
+    return "\u4e00" <= char <= "\u9fff"
+
+
+def _piece_always_embedded(piece: str, text: str) -> bool:
+    """RXESCAPE-1 零证片段守卫的形态判据：piece 在 text 中的每次出现都前后
+    紧邻汉字（无一处处于中文串边界=行首/行尾/标点/拉丁邻接）→ 该串只是更长
+    真实词的内部片段（「电中性区」中的「电中」），不是词，绝不按错拼变体
+    改写。存在任一边界出现 → 非伪影（正常词形），由既有守卫裁量。"""
+    if not piece or not text:
+        return False
+    start = 0
+    seen = False
+    while True:
+        index = text.find(piece, start)
+        if index < 0:
+            break
+        seen = True
+        left = text[index - 1] if index > 0 else ""
+        right = text[index + len(piece)] if index + len(piece) < len(text) else ""
+        if not (_is_han(left) and _is_han(right)):
+            return False
+        start = index + 1
+    return seen
 
 
 def _candidate_variants(segment_text: str, glossary: tuple[str, ...]):
@@ -306,13 +338,29 @@ def unify_text_terms(
     不触发。``evidence_text`` 缺省 None=零行为变化（兼容旧调用方与测试）。"""
     if not text or not glossary:
         return str(text or "")
-    corpus = str(source_corpus) if source_corpus is not None else _source_corpus(glossary)
+    corpus = str(source_corpus) if source_corpus else _source_corpus(glossary)
     evidence = str(evidence_text or "")
+    # RXESCAPE-1（2026-10-30，653998 掷2 活体实证补强）：无课件语料（payload/
+    # env 词表、transcript-only 讲）时以讲内转写为保护语料兜底——老师真实说出
+    # 的词形绝不被低证近形课件词「改正」。掷2 残留 31 处即此通道：电源/电池/
+    # 电光/电路族全部转写有证（4/2/5/5 次）而低于优势形阈值、目标「电平」转
+    # 写偶证 2 次令方向守卫失效、真实词形带串边界令片段守卫失效。合法纠错不
+    # 受影响：OCR 字形变体/模型错拼（变換、厄早效应）从不在转写中出现=不受
+    # 保护，照常统一（语音= ground truth，词形纠错只修「没被说出来的写法」）。
+    if not corpus and evidence:
+        corpus = evidence
     source = str(text)
     counts: Counter = Counter()
     piece_terms: dict[str, set[str]] = {}
     for run in re.findall(r"[\u4e00-\u9fa5]{2,}", source):
         for piece, term in _candidate_variants(run, glossary):
+            # RXESCAPE-1（2026-10-30，653998 掷2 重放实证）：摘要面只做同长替换
+            # 配对——插入/删除向（piece 比 term 长 1，如「极型层→型层」删「极」、
+            # 「转换→换」类）在本面只产生长词内部伪影删除，无实证合法纠错形
+            # （本面合法修复全部同长：变換→变换/厄早效应→厄利效应/电子→电平）；
+            # 字幕面 apply_glossary 保留插入/删除（ASR 漏字向，其自有守卫裁量）。
+            if len(piece) != len(term):
+                continue
             piece_terms.setdefault(piece, set()).add(term)
             counts[piece] += run.count(piece)
     evidence_counts: dict[str, int] = {}
@@ -337,6 +385,18 @@ def unify_text_terms(
             # RXFIX-3 ③方向守卫：口语有证词不被转写零证词「改正」。
             if evidence_counts.get(piece, 0) > 0 and evidence_counts.get(term, 0) == 0:
                 continue
+            # RXESCAPE-1 ④零证片段守卫：piece 在被统一文本中的每次出现都严格
+            # 嵌入更长中文串（前后紧邻汉字、无一处处于串边界）=滑窗内部伪影，
+            # 禁改写。典型伤型=课件近形词的内部片段改写正确词——685785 实证：
+            # 电中性区→电平性区×2（piece「电中」转写 0 次）；653998 活体复掷
+            # 再实证（2026-10-30 22:1x 掷）：光电转换→光电平换（piece「电转」
+            # 、「电平」转写偶证 2 次——嵌入形态本身即判据，不要求双零证）。
+            # 既有优势形（<8）与方向守卫（piece 0 证不触发）对该形态不设防。
+            # 合法纠错向不受影响：字形/近形变体（变換→变换、厄早效应→厄利效
+            # 应）在文本中存在串边界出现（行首/标点/拉丁邻接），守卫不触发——
+            # 判别特征=伪影只以嵌入形存在（宁漏勿错：纯嵌入形的真变体让渡）。
+            if _piece_always_embedded(piece, source):
+                continue
         trusted[piece] = term
     if not trusted:
         return source
@@ -344,3 +404,59 @@ def unify_text_terms(
     for piece, term in trusted.items():
         replaced = replaced.replace(piece, term)
     return replaced
+
+
+def _evidence_dominant_pieces(evidence: str, glossary_set: set[str]) -> dict[str, int]:
+    """转写内出现 ≥GLOSSARY_DOMINANT_FORM_MIN_OCCURRENCES 次的词形闭集
+    （RXESCAPE-1 注入影子用）。影子候选不限于词表内近形——653998 活体实证
+    （2026-10-30 22:1x 掷）：payload 课程记忆词表含「电平」而缺「电流」，
+    仅查表内兄弟漏影，「电平」以权威名义入表=模型侧 58 处近形清洗通道。"""
+    counts: Counter = Counter()
+    for run in re.findall(r"[\u4e00-\u9fa5]{2,}", evidence):
+        for size in range(_MIN_TERM_CHARS, _MAX_TERM_CHARS + 1):
+            for start in range(0, len(run) - size + 1):
+                counts[run[start:start + size]] += 1
+    return {
+        piece: count
+        for piece, count in counts.items()
+        if count >= GLOSSARY_DOMINANT_FORM_MIN_OCCURRENCES and piece not in glossary_set
+    }
+
+
+def filter_prompt_terms(terms, evidence_text: str | None) -> tuple[str, ...]:
+    """提示词注入面的近形影子词过滤（RXESCAPE-1，模型侧偏置通道收口）。
+
+    背景：注入面把词表以「术语写法以 glossary 表为准」的权威清单带给生成
+    模型；与讲内优势口语词编辑距离 ≤1 的低证课件词（37355 实证：电平〔转写
+    2 次〕vs 电流〔150 次〕）会被模型当成「权威写法」对口语词做近形「规范
+    化」——重灾三讲的生成侧替换即此通道（RXFIX-3 只滤了转写零证词，转写偶
+    证的近形课件词仍入表）。影子候选=①词表内编辑距离 ≤1 的转写优势形兄弟，
+    ②转写自身 ≥GLOSSARY_DOMINANT_FORM_MIN_OCCURRENCES 次的词形（653998 活
+    体实证：payload 词表含「电平」缺「电流」，仅查表内兄弟漏影）。自身即优
+    势形（≥8 次）的词恒保留；被影子剔除只损失「权威写法提示」收益、无改写
+    方向（保守侧=宁漏勿错；副作用=与高频常用词近形的低证术语让渡注入，
+    如「变换」vs 高频「变化」，由守卫与 gate_F 监控）。机械 unify 兜底面
+    不受影响（其自有优势形/方向/零证片段三重守卫）。``evidence_text`` 空=
+    原样返回（零行为变化）。
+    """
+    term_list = [str(term).strip() for term in (terms or ()) if str(term).strip()]
+    evidence = str(evidence_text or "")
+    if not term_list or not evidence:
+        return tuple(term_list)
+    counts = {term: evidence.count(term) for term in term_list}
+    dominant_pieces = _evidence_dominant_pieces(evidence, set(term_list))
+
+    def _shadowed(term: str) -> bool:
+        if counts[term] >= GLOSSARY_DOMINANT_FORM_MIN_OCCURRENCES:
+            return False
+        threshold = _GLOSSARY_PROMPT_SHADOW_RATIO * counts[term]
+        for sibling in term_list:
+            if sibling != term and counts[sibling] >= GLOSSARY_DOMINANT_FORM_MIN_OCCURRENCES \
+                    and counts[sibling] >= threshold and _within_edit_distance(term, sibling):
+                return True
+        for piece, count in dominant_pieces.items():
+            if count >= threshold and _within_edit_distance(term, piece):
+                return True
+        return False
+
+    return tuple(term for term in term_list if not _shadowed(term))

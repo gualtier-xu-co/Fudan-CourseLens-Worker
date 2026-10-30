@@ -696,5 +696,48 @@ class ChainReplayPins(unittest.TestCase):
         self.assertEqual(len(result["doc"]["sections"][0]["points"]), 1)
 
 
+class Rxescape1FragmentFunnelPins(unittest.TestCase):
+    """RXESCAPE-1（2026-10-30）：deep_usage.md_term_fragment_hits 漏斗计数钉。
+
+    生成侧漂移挂账（SEMGEN 漏斗随形）：md 正文出现「电平性区」族碎片伪影
+    （685785 实证伤型=「电中性区」被近形课件词片段改写）即计数非零=车道复
+    查信号；正当使用「电平」（数字课逻辑电平）零误伤计数恒零。判据权威面=
+    probe gate_F 词对族全扫，此处只锁生成侧计数器本身。"""
+
+    def _run_md(self, markdown: str) -> dict:
+        window_part = {"markdown": "## 机制\n窗口内容。", "chapters": []}
+
+        def fake_chat(api_key, messages, **kwargs):
+            if messages[0]["content"].startswith(_SUMMARY_MERGE_PROMPT):
+                return json.dumps({
+                    "markdown": markdown,
+                    "chapters": [],
+                    "key_takeaways": ["要点"],
+                }, ensure_ascii=False)
+            return json.dumps(window_part, ensure_ascii=False)
+
+        with patch.dict(os.environ, ENV_PINS, clear=False):
+            with patch("courselens_worker.llm._chat", side_effect=fake_chat):
+                return create_summary(
+                    "k", title="t",
+                    transcript=[
+                        {"start_ms": i * 1000, "end_ms": (i + 1) * 1000, "text": f"文本{i}"}
+                        for i in range(10)
+                    ],
+                    ppt_pages=[],
+                )
+
+    def test_fragment_artifact_counts_nonzero(self):
+        result = self._run_md(
+            "耗尽层外电平性区以扩散衰减。又一处电平性区。"
+        )
+        self.assertEqual(result["deep_usage"]["md_term_fragment_hits"], 2)
+
+    def test_legit_ping_yong_zero_hits(self):
+        # 「电平」本身是合法术语（逻辑电平）——零误伤是本计数器的红线。
+        result = self._run_md("逻辑电平为高。输入电平翻转。")
+        self.assertEqual(result["deep_usage"]["md_term_fragment_hits"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
