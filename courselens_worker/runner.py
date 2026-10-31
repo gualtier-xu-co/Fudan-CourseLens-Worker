@@ -283,6 +283,47 @@ def _apply_display_cleaning_stage(
     )
 
 
+def _apply_segment_clean_stage(value: dict[str, Any]) -> None:
+    """A7-ROUTER-P1 段级确定性清洗（A3-SUBREAD-2 C1-C4 实证规则）。
+
+    落 transcribe 之后、term 深校对之前：garble/filler/闲聊尾段不烧 term
+    深校对 token。只删段并段、不改字（忠实层：raw_* 与证据键不动；C3 并段
+    保留首段证据身份）；判据与参数全部来自 A3 实证（segment_clean 模块头
+    成文），纯确定性零 LLM。遥测仅计数。
+    """
+    from .segment_clean import clean_segments
+
+    cleaned, stats = clean_segments(value.get("segments") or [])
+    value["segments"] = cleaned
+    print(
+        f"stage=segment-clean "
+        f"c4_script_dropped={stats.get('c4_dropped', 0)} "
+        f"c3_dup_dropped={stats.get('c3_dropped', 0)} "
+        f"c2_filler_dropped={stats.get('c2_dropped', 0)} "
+        f"c1_tail_dropped={stats.get('c1_dropped', 0)}",
+        flush=True,
+    )
+
+
+def _apply_segment_flag_stage(value: dict[str, Any]) -> None:
+    """A7-ROUTER-P1 终界闭集标记（A3 C4b/C6/C7：只标不删不改文）。
+
+    键 ``low_confidence_en``/``merge_candidate``/``long_gap_ms`` 经导入面
+    sanitize_evidence_metadata 有界留存（未知安全加性键通道），供重清洗批
+    评估与播放器跳转消费。遥测仅计数。
+    """
+    from .segment_clean import flag_segments
+
+    stats = flag_segments(value.get("segments") or [])
+    print(
+        f"stage=segment-flag "
+        f"c4b_low_confidence={stats.get('c4b_flagged', 0)} "
+        f"c6_merge_candidate={stats.get('c6_flagged', 0)} "
+        f"c7_long_gap={stats.get('c7_flagged', 0)}",
+        flush=True,
+    )
+
+
 def safe_worker_error_detail(error: BaseException) -> str:
     """Return an optional closed-set reason without importing compute deps."""
     from .source import SourceSecurityError, safe_source_error_code
@@ -665,6 +706,7 @@ def _process_materialized_job(
             progress=progress,
             checkpoint=checkpoint_writer,
         )
+        _apply_segment_clean_stage(value)
         _apply_term_stage(
             value,
             api_key=api_key,
@@ -676,6 +718,7 @@ def _process_materialized_job(
         )
         _apply_ct_punc_stage(value, warnings=warnings)
         _apply_display_cleaning_stage(value, clean_plan)
+        _apply_segment_flag_stage(value)
         outputs = {
             "subtitle": {
                 "mode": value["mode"],
@@ -1005,6 +1048,7 @@ def _process_materialized_job(
                 progress=progress,
                 checkpoint=subtitle_checkpoint,
             )
+            _apply_segment_clean_stage(value)
             # G7：ASR 段产出的闭集警告（如 proofread_degraded）并入结果警告，
             # 随既有 result_notices 通道上屏，绝不静默丢弃。
             for _warning in value.get("warnings") or []:
@@ -1022,6 +1066,7 @@ def _process_materialized_job(
                 progress=progress,
             )
             _apply_ct_punc_stage(value, warnings=warnings)
+            _apply_segment_flag_stage(value)
             # RR-ACCOUNT2-1：字幕任务的真实 token 随结果上报（prompt+completion
             # 与 deep_usage/answer 同口径；增量聚合防组合任务分支互相覆盖）。
             metrics["deepseek_tokens"] = metrics.get("deepseek_tokens", 0) + sum(

@@ -23,6 +23,17 @@ from typing import Any
 GLOSSARY_MAX_TERMS = 200
 GLOSSARY_MIN_FREQ = 3
 GLOSSARY_APPLIED_STATUS = "applied-glossary"
+# A7-ROUTER-P1（2026-10-31，课程字幕细读修复路由拍一）：ASR 直配词典注入面。
+# 行形=「错形1/错形2→正确」；``#`` 注释行与空行跳过；正确侧带 ``*``（A3
+# 分级约定的语境分派旗标）、多靶（第二个 →）、任意侧为空 → 该行不入自动
+# 面（fail-closed）。与 TERM_GLOSSARY_FILE 同源同权：操作员人工分级的高置
+# 信闭集（错形在本课域无合法用法才入），零词表证据链依赖（词表空仍生效）。
+ASR_DICT_ENV = "COURSELENS_ASR_DICT_FILE"
+ASR_DICT_APPLIED_STATUS = "applied-asr-dict"
+_ASR_DICT_SPLIT = "→"
+# 纯 ASCII 词形（字母/数字/空格/省字号/连字符）：按整词边界、大小写不敏感
+# 替换（防 "rub" 命中 "Rubby" 内部）；含 CJK 或其他字符的错形按精确串替换。
+_ASR_ASCII_FORM_RE = re.compile(r"[A-Za-z0-9 .'\-]+")
 # SUBTITLE-DEEP-1：术语闭集的运行时注入面。课程术语表可经 job payload 的可选
 # ``glossary`` 键（客户端接线留桩，缺省缺席=旧行为）或操作员环境变量文件
 # （每行一词）进入术语位深校对与热词文件；两者都缺席时术语层整体跳过。
@@ -255,13 +266,116 @@ def resolve_course_examples(payload: dict[str, Any] | None = None) -> tuple[dict
     return tuple(resolved)
 
 
+def resolve_asr_dict() -> tuple[tuple[str, str], ...]:
+    """Resolve the ASR direct-replacement dictionary from the operator env file.
+
+    逐行解析「错形1/错形2→正确」；去重保序后过闭环/对撞守卫——错形∈任何对
+    的正确侧、或正确侧∈任何对的错形 → 相关对整对弃用（替换不得成链/互毁，
+    双向混淆对如「A→B」与「B→A」自动双双出局）。文件缺席/不可读/无有效行
+    → 空元组（调用方零行为变化）。
+    """
+    path = os.environ.get(ASR_DICT_ENV, "").strip()
+    if not path:
+        return ()
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ()
+    raw_pairs: list[tuple[str, str]] = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.count(_ASR_DICT_SPLIT) != 1:
+            continue  # 多靶（A→B/C 语境歧义）/畸形行 → 不入自动面
+        wrong_side, target = (part.strip() for part in line.split(_ASR_DICT_SPLIT))
+        if not wrong_side or not target or target.endswith("*"):
+            continue  # 语境分派旗标（A3 分级）：禁入自动词典
+        if "/" in target:
+            continue  # 正确侧含 / = 多靶歧义（A→B/C 形）→ 不入自动面
+        for wrong_form in wrong_side.split("/"):
+            wrong_form = wrong_form.strip()
+            if wrong_form:
+                raw_pairs.append((wrong_form, target))
+    deduped: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for pair in raw_pairs:
+        if pair not in seen:
+            seen.add(pair)
+            deduped.append(pair)
+    if not deduped:
+        return ()
+    wrongs = {wrong for wrong, _ in deduped}
+    targets = {target for _, target in deduped}
+    return tuple(
+        (wrong, target)
+        for wrong, target in deduped
+        if wrong not in targets
+        and target not in wrongs
+        and wrong not in target  # 自含守卫：错形⊂正确侧（阈值损→阈值损失形）
+        # 的对禁入——替换后错形仍存在于正确侧内部（非幂等+复制伪影）。
+    )
+
+
+def _replace_dict_form(text: str, wrong: str, target: str) -> str:
+    """单对替换：纯 ASCII 词形按整词边界+大小写不敏感；其余精确串替换。"""
+    if _ASR_ASCII_FORM_RE.fullmatch(wrong):
+        return re.sub(
+            rf"\b{re.escape(wrong)}\b", target, text, flags=re.IGNORECASE
+        )
+    return text.replace(wrong, target)
+
+
+def _apply_asr_dict_pass(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """ASR 直配词典替换（A7-ROUTER-P1）：逐段逐对替换，受保护形变化回退。
+
+    守卫链（宁脏勿错，与主通道同源）：①受保护形多重集变化即该对回退
+    （_protected_change 无 alternate 硬门——公式/数字/否定面永不入确定性
+    替换，此类修复归 term 深校对 LLM 通道）；②纯 ASCII 错形整词边界守卫；
+    ③加载期闭环/对撞守卫（resolve_asr_dict）。改动段标记
+    ``applied-asr-dict``（词表通道随后改写时以其状态覆盖，单段单状态）。
+    词典空 → 原样返回（同一列表对象，零行为变化）。
+    """
+    pairs = resolve_asr_dict()
+    if not pairs:
+        return segments
+    from .llm import _protected_change  # 迟绑定：llm 顶层已导入本模块
+
+    output: list[dict[str, Any]] = []
+    for segment in segments:
+        text = str(segment.get("text") or "")
+        replaced = text
+        for wrong, target in pairs:
+            candidate = _replace_dict_form(replaced, wrong, target)
+            if candidate == replaced:
+                continue
+            if _protected_change(replaced, candidate, ""):
+                continue
+            replaced = candidate
+        if replaced == text:
+            output.append(segment)
+            continue
+        updated = dict(segment)
+        updated["text"] = replaced
+        updated["correction"] = ASR_DICT_APPLIED_STATUS
+        output.append(updated)
+    return output
+
+
 def apply_glossary(segments: list[dict[str, Any]], glossary: tuple[str, ...]) -> list[dict[str, Any]]:
     """讲内一致的术语纠错；改动段标记 applied-glossary（第八校对态）。
 
     RXFIX-1：配对准入加双守卫——讲内优势形（≥8 次）与源语料保护形（课件
     OCR/课程名含该串）一律不按错拼变体处理（37355 术语系统性误替换根修）。
+
+    A7-ROUTER-P1（2026-10-31）：ASR 直配词典（env ``COURSELENS_ASR_DICT_FILE``，
+    操作员人工分级高置信闭集）在词表通道之前先行；词典与词表证据链相互
+    独立（词表空、词典有 → 词典照常生效；词典空 → 与旧路径逐位等价）。
     """
-    if not glossary or not segments:
+    if not segments:
+        return segments
+    segments = _apply_asr_dict_pass(segments)
+    if not glossary:
         return segments
     from .llm import _protected_change  # 迟绑定：llm 顶层已导入本模块
 
@@ -460,3 +574,91 @@ def filter_prompt_terms(terms, evidence_text: str | None) -> tuple[str, ...]:
         return False
 
     return tuple(term for term in term_list if not _shadowed(term))
+
+
+# TERMGEN1-1（2026-10-31，A4 总结细读定谳的生成侧新族错转输出修复门）：md 定稿
+# 闭集词对修复。判据依据=night1031-a4sumread findings.json dim2_terms 逐讲实证
+# +本道 classify.py 活体复测（转写/注入表/产物三面频次）。两类守卫：
+#   always   —— 错形为本课域无任何合法用法的伪词形/错术语搭配（反相偏置/反相
+#              饱和电流/反相关断=字幕级映射过用已把错形写进转写，转写守卫对它
+#              们失效，故无证据门、按搭配级无条件修复；其余为纯伪词形）；
+#   evidence —— 错形在合法汉语中可能另有用法（物件/原型层/路设等），修复须过
+#              R5 计数证据双向门：错形转写零证 且 正形转写 ≥2 次（老师真说出
+#              的正形=修复方向的讲内证据；证据缺席=只漏不修，宁漏勿错）。
+# 边界纪律：pattern 一律带负向先行（防合法超串误伤：条件原理/条件原子/路设计/
+# 原次序/层效应），长度长者优先（人稳定义 先于 稳定义）；本面只修 md 生成产物，
+# 绝不回写字幕转写（字幕面守卫语义不变）。
+GENERATION_TERM_REPAIR_PAIRS: tuple[tuple[str, str, str], ...] = (
+    # —— always：错术语搭配（字幕级「反向→反相」映射过用的产物残留；搭配级
+    #    在任何课域都非合法术语，无条件修复）——
+    ("反相饱和电流", "反向饱和电流", "always"),
+    ("反相饱和", "反向饱和", "always"),
+    ("反相偏置", "反向偏置", "always"),
+    ("反相关断", "反向关断", "always"),
+    # —— always：纯伪词形（错形在任何汉语语境无合法用法）——
+    ("电平性区", "电中性区", "always"),
+    ("人稳定义", "人为定义", "always"),
+    ("稳定义", "的定义", "always"),
+    ("反相对", "相对", "always"),
+    ("条件原(?!理|始|则|化|子)", "条件下", "always"),
+    ("晶体器", "晶体管", "always"),
+    ("层效电路", "等效电路", "always"),
+    ("电体器", "电容器", "always"),
+    ("反体器", "反相器", "always"),
+    ("逻体器件", "逻辑器件", "always"),
+    ("隧穿体器件", "隧穿器件", "always"),
+    ("探体器", "探测器", "always"),
+    ("发体器件", "发光器件", "always"),
+    ("激体器", "激光器", "always"),
+    # —— evidence：错形另有合法用法，修复须过 R5 双向计数门 ——
+    ("物件", "器件", "evidence"),
+    ("原型层", "原子层", "evidence"),
+    ("原次(?!序)", "层次", "evidence"),
+    ("设构", "结构", "evidence"),
+    ("路设(?!计|施|置)", "路径", "evidence"),
+    ("优比", "有比", "evidence"),
+    ("台成电", "台积电", "evidence"),
+    ("成电率", "成品率", "evidence"),
+    ("电平转换", "电光转换", "evidence"),
+)
+# 检测专供（gate_F 权威面已挂；修复面明确不碰——修复目标语境依赖或合法词，
+# 自动修复会伤正当用法）：稳定值/伽马数/存器/半导〔非体〕/成电〔非集成电路〕/
+# 体器〔孤形〕/重掺〔非重掺杂语境〕/下降〔下标位〕/迁移〔相移位〕/做得〔做成·
+# 得到位〕/电平衡/科克·柯格效应族。漏网由 probe gate_F 扩面观测，不静默。
+_EVIDENCE_RIGHT_MIN_OCCURRENCES = 2
+
+
+def repair_generation_term_forms(
+    text: str, evidence_text: str | None
+) -> tuple[str, list[dict[str, Any]]]:
+    """生成产物 md 的术语错转闭集修复（TERMGEN1-1；确定性、零 token、零外联）。
+
+    只作用于生成产物定稿面（学生阅读面），与字幕面 apply_glossary /
+    unify_text_terms 的转写守卫语义互不影响。``evidence_text``=本讲转写全文
+    （R5 计数证据法：错形转写零证+正形转写有证才修 evidence 对；老师真实说出
+    的词形永不因闭集修复被改）。返回 (修复后文本, 逐对修复计数清单)；无命中=
+    原样返回（零行为变化）。检测专供族不入本面（见上注释）。
+    """
+    source = str(text or "")
+    if not source:
+        return source, []
+    evidence = str(evidence_text or "")
+    repairs: list[dict[str, Any]] = []
+    repaired = source
+    for wrong, right, mode in GENERATION_TERM_REPAIR_PAIRS:
+        if mode == "evidence":
+            if not evidence:
+                continue
+            wrong_re = re.compile(wrong)
+            if len(wrong_re.findall(evidence)) or \
+                    len(re.findall(re.escape(right), evidence)) < _EVIDENCE_RIGHT_MIN_OCCURRENCES:
+                continue
+            pattern = wrong_re
+        else:
+            pattern = re.compile(wrong)
+        hits = len(pattern.findall(repaired))
+        if not hits:
+            continue
+        repaired = pattern.sub(right, repaired)
+        repairs.append({"wrong": wrong, "right": right, "count": hits})
+    return repaired, repairs

@@ -379,3 +379,242 @@ def test_rxescape1_filter_prompt_terms_empty_evidence_passthrough():
     terms = ("电流", "电平")
     assert filter_prompt_terms(terms, "") == terms
     assert filter_prompt_terms((), "电流电流") == ()
+
+
+# ---- A7-ROUTER-P1：ASR 直配词典（env 注入面）双向变异 ------------------------
+
+
+def _write_dict(tmp_path, lines):
+    path = tmp_path / "asr_dict.txt"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return str(path)
+
+
+def test_asr_dict_parse_guards(tmp_path, monkeypatch):
+    """行形守卫：* 语境旗标/多靶/注释/自含（错形⊂正确侧）全不入自动面。"""
+    from courselens_worker.glossary import resolve_asr_dict
+
+    path = _write_dict(
+        tmp_path,
+        [
+            "# 注释行",
+            "半造体/半导提→半导体",  # 有效
+            "二三值→二进制*",  # 语境旗标 → 排除
+            "电门→电容/电阻",  # 多靶歧义 → 排除
+            "肖特基 ok",  # 核验注记 → 排除
+            "阈值损→阈值损失",  # 自含（错形⊂正确侧）→ 排除
+            "garbled",  # 无 → → 排除
+            "",
+        ],
+    )
+    monkeypatch.setenv("COURSELENS_ASR_DICT_FILE", path)
+    assert resolve_asr_dict() == (("半造体", "半导体"), ("半导提", "半导体"))
+
+
+def test_asr_dict_collision_guard_drops_chains(tmp_path, monkeypatch):
+    """闭环/对撞守卫：错形∈他对正确侧、或正确侧∈他对错形 → 相关对整对弃用。"""
+    from courselens_worker.glossary import resolve_asr_dict
+
+    path = _write_dict(
+        tmp_path,
+        [
+            "甲错→乙正",
+            "乙正→丙正",  # 甲错→乙正 的正确侧是本对错形 → 双双出局
+        ],
+    )
+    monkeypatch.setenv("COURSELENS_ASR_DICT_FILE", path)
+    assert resolve_asr_dict() == ()
+
+
+def test_asr_dict_replaces_and_marks(tmp_path, monkeypatch):
+    """错形拦截向：直配替换生效、闭集状态落键；词表空仍生效（独立性）。"""
+    from courselens_worker.glossary import ASR_DICT_APPLIED_STATUS, apply_glossary
+
+    path = _write_dict(
+        tmp_path,
+        [
+            "半造体/半导提→半导体",
+            "ristu→RISC",
+        ],
+    )
+    monkeypatch.setenv("COURSELENS_ASR_DICT_FILE", path)
+    segments = [
+        {"segment_id": 0, "text": "这是半造体的第一性原理"},
+        {"segment_id": 1, "text": "ristu 架构的寄存器堆"},
+        {"segment_id": 2, "text": "半导体工艺没有变化"},
+    ]
+    output = apply_glossary(segments, ())
+    assert output[0]["text"] == "这是半导体的第一性原理"
+    assert output[0]["correction"] == ASR_DICT_APPLIED_STATUS
+    assert output[1]["text"] == "RISC 架构的寄存器堆"
+    assert output[2]["text"] == "半导体工艺没有变化"  # 零误伤：正确形不碰
+    assert "correction" not in output[2]
+
+
+def test_asr_dict_ascii_word_boundary_and_case(tmp_path, monkeypatch):
+    """ASCII 词形整词边界+大小写不敏感；嵌入形态零误伤。"""
+    from courselens_worker.glossary import apply_glossary
+
+    path = _write_dict(tmp_path, ["ristu→RISC"])
+    monkeypatch.setenv("COURSELENS_ASR_DICT_FILE", path)
+    segments = [
+        {"segment_id": 0, "text": "Ristu 指令集"},
+        {"segment_id": 1, "text": "cristux 是别的词"},
+    ]
+    output = apply_glossary(segments, ())
+    assert output[0]["text"] == "RISC 指令集"
+    assert output[1]["text"] == "cristux 是别的词"
+
+
+def test_asr_dict_protected_form_guard(tmp_path, monkeypatch):
+    """受保护形守卫：替换引入公式/否定面=该对回退，原文保留（宁脏勿错）。"""
+    from courselens_worker.glossary import apply_glossary
+
+    path = _write_dict(
+        tmp_path,
+        [
+            "乙甲→乙+甲",  # 正确侧含运算符（受保护形）→ 确定性面禁改
+            "不导态→导态",  # 错形含否定字（受保护形）→ 回退
+        ],
+    )
+    monkeypatch.setenv("COURSELENS_ASR_DICT_FILE", path)
+    segments = [
+        {"segment_id": 0, "text": "这里乙甲相加"},
+        {"segment_id": 1, "text": "管子处于不导态"},
+    ]
+    output = apply_glossary(segments, ())
+    assert output[0]["text"] == "这里乙甲相加"
+    assert output[1]["text"] == "管子处于不导态"
+
+
+def test_asr_dict_absent_zero_behavior(monkeypatch):
+    """env 缺席=零行为变化（旧路径逐位等价）。"""
+    from courselens_worker.glossary import apply_glossary
+
+    monkeypatch.delenv("COURSELENS_ASR_DICT_FILE", raising=False)
+    segments = [{"segment_id": 0, "text": "这是半造体的讲解"}]
+    output = apply_glossary(segments, ())
+    assert output == segments
+
+
+def test_asr_dict_idempotent(tmp_path, monkeypatch):
+    """幂等：替换后错形不再存在，二跑零变化。"""
+    from courselens_worker.glossary import apply_glossary
+
+    path = _write_dict(tmp_path, ["半造体→半导体"])
+    monkeypatch.setenv("COURSELENS_ASR_DICT_FILE", path)
+    segments = [{"segment_id": 0, "text": "半造体和半造体的界面"}]
+    once = apply_glossary(segments, ())
+    twice = apply_glossary(once, ())
+    assert [row["text"] for row in twice] == ["半导体和半导体的界面"]
+    assert [row["text"] for row in apply_glossary(twice, ())] == [
+        "半导体和半导体的界面"
+    ]
+
+
+def test_asr_dict_malformed_file_tolerated(tmp_path, monkeypatch):
+    """文件不可读/空文件 → 空词典零行为变化（fail-closed）。"""
+    from courselens_worker.glossary import resolve_asr_dict
+
+    monkeypatch.setenv("COURSELENS_ASR_DICT_FILE", str(tmp_path / "missing.txt"))
+    assert resolve_asr_dict() == ()
+    empty = tmp_path / "empty.txt"
+    empty.write_text("", encoding="utf-8")
+    monkeypatch.setenv("COURSELENS_ASR_DICT_FILE", str(empty))
+    assert resolve_asr_dict() == ()
+
+
+# ---- TERMGEN1-1（2026-10-31；A4 定谳生成侧新族错转输出修复门验收面）----
+# 复现向：always 伪词形/错搭配无条件修复＋evidence 对计数证据门双向；
+# 误伤向：正当用法（反相器/逻辑电平/稳定定义/条件原理/路设计/层效应）零触碰。
+
+
+def test_termgen1_always_pairs_repair_artifact_forms():
+    from courselens_worker.glossary import repair_generation_term_forms
+
+    md = (
+        "扩散区近似认为电平性。N 型区为电平性区。"
+        "实际晶体器做 SPICE 模型。反相偏置下反相饱和电流很小。"
+        "T 型层效电路。小注入条件原。在此条件原。有效半宽稳定义，"
+        "√2 是人稳定义。隧穿体器件与逻体器件。"
+    )
+    repaired, repairs = repair_generation_term_forms(md, "")
+    assert "电平性区" not in repaired and "电中性区" in repaired
+    assert "晶体器" not in repaired and "晶体管" in repaired
+    assert "反相偏置" not in repaired and "反向偏置" in repaired
+    assert "反向饱和电流" in repaired
+    assert "等效电路" in repaired
+    assert repaired.count("条件下") == 2
+    assert "人为定义" in repaired and "的定义" in repaired
+    wrongs = {item["wrong"] for item in repairs}
+    assert "电平性区" in wrongs and "晶体器" in wrongs
+
+
+def test_termgen1_longest_first_no_partial_damage():
+    from courselens_worker.glossary import repair_generation_term_forms
+
+    # 人稳定义 必须先于 稳定义 修复（短对先修会把 人稳定义 打成人定义）
+    repaired, _ = repair_generation_term_forms("√2 是人稳定义的结果。", "")
+    assert repaired == "√2 是人为定义的结果。"
+
+
+def test_termgen1_evidence_pair_requires_both_sides_evidence():
+    from courselens_worker.glossary import repair_generation_term_forms
+
+    # 误伤向①：老师真说过 物件（转写有证）→ 修复禁触（语料兜底语义）
+    md = "《半导体物件原理》与从物件原理到制造工艺。"
+    repaired, repairs = repair_generation_term_forms(
+        md, "这个物件啊它就是壳料。器件的封装原理是重点。器件还讲热阻。"
+    )
+    assert repaired == md and repairs == []
+    # 复现向：物件转写零证＋器件转写强证 → 修复放行
+    repaired, repairs = repair_generation_term_forms(
+        md, "半导体器件原理是本课主线。器件制造工艺也考。"
+    )
+    assert "物件" not in repaired and repairs and repairs[0]["count"] == 2
+    # 误伤向②：正形转写零证（证据缺席）→ 宁漏勿错不修
+    repaired, repairs = repair_generation_term_forms(md, "本讲讲封装。")
+    assert repaired == md and repairs == []
+
+
+def test_termgen1_evidence_gate_guards_digital_level_shifting():
+    from courselens_worker.glossary import repair_generation_term_forms
+
+    # 数字课「电平转换」正当用法（电光转换无证）→ 零误伤
+    md = "电平转换电路用于接口。"
+    repaired, repairs = repair_generation_term_forms(md, "电平转换要讲三次。器件。器件。")
+    assert repaired == md and repairs == []
+    # 光电课语境（电平转换转写零证＋电光转换有证）→ 修复放行
+    repaired, repairs = repair_generation_term_forms(
+        md, "电光转换效率是重点。电光转换还考计算。器件。"
+    )
+    assert "电光转换电路" in repaired and repairs
+
+
+def test_termgen1_boundary_lookaheads_protect_legit_superstrings():
+    from courselens_worker.glossary import repair_generation_term_forms
+
+    md = "边界条件原理与条件原子层。修路设计与路设置。恢复原次序。层效应明显。"
+    repaired, repairs = repair_generation_term_forms(
+        md, "层次化设计讲了。路径分解也讲了。层次和路径是考点。"
+    )
+    assert repaired == md and repairs == []
+
+
+def test_termgen1_legit_inverting_usages_untouched():
+    from courselens_worker.glossary import repair_generation_term_forms
+
+    # 反相器/反相输入端=正当术语（不在修复词对内），零误伤
+    md = "反相器与反相输入端构成放大级。"
+    repaired, repairs = repair_generation_term_forms(md, "")
+    assert repaired == md and repairs == []
+
+
+def test_termgen1_empty_and_idempotent_paths():
+    from courselens_worker.glossary import repair_generation_term_forms
+
+    assert repair_generation_term_forms("", "") == ("", [])
+    md = "反相偏置。"
+    once, repairs = repair_generation_term_forms(md, "")
+    twice, repairs2 = repair_generation_term_forms(once, "")
+    assert twice == "反向偏置。" and repairs2 == []

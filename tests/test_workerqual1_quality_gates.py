@@ -727,16 +727,23 @@ class Rxescape1FragmentFunnelPins(unittest.TestCase):
                     ppt_pages=[],
                 )
 
-    def test_fragment_artifact_counts_nonzero(self):
+    def test_fragment_artifact_repaired_and_counted(self):
+        # TERMGEN1-1（2026-10-31）：修复门把「电平性区→电中性区」（always 对，
+        # 伪词形）收口后，碎片漏斗转残余观测（修复后残留恒零），修复量改挂
+        # md_term_repair_hits=生成侧漂移挂账主计数器。
         result = self._run_md(
             "耗尽层外电平性区以扩散衰减。又一处电平性区。"
         )
-        self.assertEqual(result["deep_usage"]["md_term_fragment_hits"], 2)
+        self.assertEqual(result["markdown"].count("电平性区"), 0)
+        self.assertIn("电中性区", result["markdown"])
+        self.assertEqual(result["deep_usage"]["md_term_fragment_hits"], 0)
+        self.assertEqual(result["deep_usage"]["md_term_repair_hits"], 2)
 
     def test_legit_ping_yong_zero_hits(self):
-        # 「电平」本身是合法术语（逻辑电平）——零误伤是本计数器的红线。
+        # 「电平」本身是合法术语（逻辑电平）——零误伤是两个计数器的共同红线。
         result = self._run_md("逻辑电平为高。输入电平翻转。")
         self.assertEqual(result["deep_usage"]["md_term_fragment_hits"], 0)
+        self.assertEqual(result["deep_usage"]["md_term_repair_hits"], 0)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ from typing import Any, Callable
 import requests
 
 from .formats import normalize_segments
-from .glossary import apply_glossary, filter_prompt_terms, unify_text_terms
+from .glossary import apply_glossary, filter_prompt_terms, repair_generation_term_forms, unify_text_terms
 from .retry import LadderExhausted, LadderFailure, run_ladder
 from .slide_alignment import assign_pack_windows
 from .subtitle_clean import CLEAN_MAX_OPS_PER_SEGMENT, validate_tier2_dels
@@ -2786,6 +2786,13 @@ def create_summary(
         # RXFIX-3：讲内转写全文=优势形/方向守卫证据底座（老师真实词形以转写为准）。
         evidence_text=summary_evidence_text,
     )
+    # TERMGEN1-1（2026-10-31）：生成侧新族错转输出修复门（A4 定谳词对闭集；
+    # always=伪词形/错搭配无条件修复，evidence=R5 计数双向门〔错形转写零证+
+    # 正形转写 ≥2〕）。只修 md 阅读面，零 LLM；检测专供族不入修复面，由
+    # probe gate_F 扩面观测。修复计数进 deep_usage 漏斗（非零=上游漂移挂账）。
+    value["markdown"], _md_term_repairs = repair_generation_term_forms(
+        str(value.get("markdown") or ""), summary_evidence_text
+    )
     if progress is not None:
         progress("summary", len(sources) + 1, len(sources) + 1)
     valid_anchors = {int(item.get("start_ms") or 0) for item in transcript}
@@ -3088,6 +3095,10 @@ def create_summary(
             str(value.get("markdown") or "").count(fragment)
             for fragment in _MD_TERM_FRAGMENT_CLOSED_SET
         ),
+        # TERMGEN1-1（2026-10-31）：新族错转修复门计数（逐对明细在
+        # _md_term_repairs；此处只挂总量=生成侧漂移挂账，非零即上游注入面
+        # 复查信号。检测专供族不计入=其残留由 probe gate_F 扩面观测）。
+        "md_term_repair_hits": sum(int(item.get("count") or 0) for item in _md_term_repairs),
     })
     _emit_telemetry(
         f"stage=summary windows={len(sources)}/{len(sources)} "
